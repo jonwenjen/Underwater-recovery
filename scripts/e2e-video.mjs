@@ -168,6 +168,34 @@ function dumpDiagnostics(label) {
   }
 }
 
+
+/**
+ * Wait until the app has finished whatever it is doing.
+ *
+ * Fixed sleeps are flaky on CI: the runner is slower than the dev box, a
+ * re-grab is two frames plus an auto re-derive, and a sleep that is "usually
+ * enough" fails once in a while. Watch the busy indicator instead, and give up
+ * loudly rather than asserting on a half-finished render.
+ */
+const settle = async (what, budgetMs = 45000) => {
+  const t0 = Date.now();
+  let sawBusy = false;
+  for (;;) {
+    const busy = await evaluate(
+      `!document.getElementById('vbusy').classList.contains('hidden')`,
+    ).catch(() => false);
+    if (busy) sawBusy = true;
+    else if (sawBusy) return;
+    if (Date.now() - t0 > budgetMs) {
+      throw new Error(`timed out after ${budgetMs}ms waiting for: ${what}`);
+    }
+    // If the work was so quick the indicator never showed, stop waiting after
+    // a short beat rather than burning the whole budget.
+    if (!sawBusy && Date.now() - t0 > 2500) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+};
+
 /* ---------------------------------------------------------------- preview */
 
 let prev;
@@ -272,11 +300,11 @@ if (delta < 6) fail('preview shows the SOURCE frame — the pipeline is not appl
   })()`;
   const before = await evaluate(grab);
   await evaluate(`document.getElementById('vcmp').click()`);
-  await new Promise(r => setTimeout(r, 4000));
+  await settle('preview re-grab in source mode');
   const sourceView = await evaluate(grab);
   const label = await evaluate(`document.getElementById('vcmp').textContent`);
   await evaluate(`document.getElementById('vcmp').click()`);
-  await new Promise(r => setTimeout(r, 6000));
+  await settle('preview re-grab in recovered mode');
   const recovered = await evaluate(grab);
   console.log(`preview toggle: recovered ${before} -> original ${sourceView} -> recovered ${recovered}  (button now "${label}")`);
   const dSrc = Math.abs(sourceView[0]-before[0]) + Math.abs(sourceView[1]-before[1]) + Math.abs(sourceView[2]-before[2]);
@@ -314,7 +342,7 @@ if (delta < 6) fail('preview shows the SOURCE frame — the pipeline is not appl
   // Entering pick mode swaps the preview to the SOURCE frame, and that grab is
   // async. Wait for it, or we scan the recovered frame and tap a spot that is
   // near black in the source.
-  await new Promise(r => setTimeout(r, 6000));
+  await settle('pick mode switching to the source frame');
   const showingSource = await evaluate(`(() => {
     const cv = document.getElementById('vcv');
     const d = cv.getContext('2d').getImageData(0,0,cv.width,cv.height).data;
@@ -348,7 +376,7 @@ if (delta < 6) fail('preview shows the SOURCE frame — the pipeline is not appl
     return best;
   })()`);
 
-  await new Promise(r => setTimeout(r, 7000));
+  await settle('re-grade after the video anchor');
   const note = await evaluate(`document.getElementById('vanchorNote').textContent.trim()`);
   const after = await evaluate(`(() => {
     const cv = document.getElementById('vcv');
@@ -464,7 +492,7 @@ if (Math.abs(photo.sliderMoved.before.r - photo.sliderMoved.after.r) < 1)
     cv.dispatchEvent(new MouseEvent('click', { bubbles: true,
       clientX: box.left + (best.x / cv.width) * box.width,
       clientY: box.top + (best.y / cv.height) * box.height }));
-    await new Promise(r2 => setTimeout(r2, 6000));
+    await new Promise(r2 => setTimeout(r2, 9000));
     const d2 = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
     let s2=0,n2=0; for (let i=0;i<d2.length;i+=4){ s2 += d2[i]- (d2[i+1]+d2[i+2])/2; n2++; }
     return { before, after: s2/n2, note: document.getElementById('anchorNote').textContent.trim(), px: best };
