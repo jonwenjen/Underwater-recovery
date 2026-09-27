@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Underwater Recovery — 在瀏覽器本機自動恢復水下照片的偏藍偏綠、缺乏暖色、水霧低對比與細節模糊。"
+    />
+    <title>Underwater Recovery — 水下畫面恢復</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>🌊 Underwater Recovery</h1>
+        <p class="sub">
+          水下照片自動恢復：去偏藍偏綠、補回紅黃暖色、去水霧、找回細節。<br />
+          全部在你的瀏覽器本機運算，照片不會上傳到任何伺服器。
+        </p>
+      </header>
+
+      <section id="drop" class="drop">
+        <input type="file" id="file" accept="image/*" multiple hidden />
+        <p class="big">把照片拖進來，或點此選擇</p>
+        <p class="small">支援 JPG / PNG / WebP，可一次多張。影片請先截圖再上傳。</p>
+      </section>
+
+      <div class="queue hidden" id="queue"></div>
+
+      <main class="work hidden" id="work">
+        <div class="viewer" id="viewer">
+          <canvas id="cv"></canvas>
+          <div class="handle" id="handle"><span></span></div>
+          <div class="tag left">原圖</div>
+          <div class="tag right">恢復後</div>
+          <div class="busy hidden" id="busy">處理中…</div>
+        </div>
+
+        <aside class="panel">
+          <div class="diagnosis" id="diag"></div>
+
+          <div class="presets">
+            <button data-preset="auto" class="on">自動判斷</button>
+            <button data-preset="blue">深藍海水</button>
+            <button data-preset="green">綠水／湖</button>
+            <button data-preset="murky">混濁近攝</button>
+            <button data-preset="shallow">淺水自然</button>
+          </div>
+
+          <label class="row toggle">
+            <input type="checkbox" id="auto" checked /> 依照片自動調整各項參數
+          </label>
+
+          <div class="sliders" id="sliders"></div>
+
+          <button id="reset" class="ghost">全部重設</button>
+          <div class="actions">
+            <button id="download" class="primary">下載這張</button>
+            <button id="downloadAll">下載全部</button>
+          </div>
+        </aside>
+      </main>
+
+      <section class="how" id="how">
+        <h2>它做了什麼</h2>
+        <ol>
+          <li><b>白平衡</b>：把 LAB 的 a/b 色度均值拉回中性，去掉整體偏藍／偏綠。</li>
+          <li><b>紅色復原</b>：依 Jaffe–McGlamery 吸收模型（紅光衰減最快）對紅色頻道做指數擴張，補回珊瑚、潛水衣的暖色。</li>
+          <li><b>去水霧</b>：暗通道先驗（Dark Channel Prior）估計透射率並細化，還原被散射吞掉的對比。</li>
+          <li><b>局部對比</b>：CLAHE 只作用在亮度 L，避免飽和度爆掉與色塊假影。</li>
+          <li><b>細節</b>：unsharp mask 補回被散射糊掉的邊緣。</li>
+          <li><b>色階與 gamma</b>：拉回黑點／白點並調整中間調，最後微調飽和度。</li>
+        </ol>
+        <h2>已知限制</h2>
+        <p>
+          單張照片被水吸收掉的紅色資訊在物理上已經不存在，復原出來的是「合理推測」而非原始資料。
+          深度學習模型（UIEB / Water-Net 類）效果通常更好，但需要伺服器或大型推論環境；
+          本工具刻意做成純前端、離線、不上傳。混濁水與強逆光仍會有殘留色偏，可用右側面板手動微調。
+        </p>
+      </section>
+
+      <footer>MIT License · 演算法參考 Jaffe–McGlamery、He et al. (DCP)、Zuiderveld (CLAHE)</footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

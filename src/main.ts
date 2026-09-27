@@ -1,0 +1,532 @@
+import './style.css';
+import { DEFAULT_PARAMS, analyse, autoParams } from './pipeline';
+import type { Analysis, Params } from './pipeline';
+import RecoveryWorker from './worker?worker';
+
+/* ------------------------------------------------------------- app state */
+
+interface Item {
+  name: string;
+  bitmap: ImageBitmap;
+  original: ImageData;
+  result: ImageData | null;
+  analysis: Analysis;
+  w: number;
+  h: number;
+}
+
+const MAX_EDGE = 1600; // processing cap; keeps the worker responsive
+
+const items: Item[] = [];
+let current = 0;
+let params: Params = { ...DEFAULT_PARAMS };
+let split = 0.5;
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
+  document.getElementById(id) as T;
+
+const drop = $('drop');
+const fileInput = $<HTMLInputElement>('file');
+const work = $('work');
+const queueEl = $('queue');
+const cv = $<HTMLCanvasElement>('cv');
+const ctx = cv.getContext('2d')!;
+const handle = $('handle');
+const busy = $('busy');
+const diag = $('diag');
+const sliderHost = $('sliders');
+
+/* --------------------------------------------------------------- presets */
+
+const PRESETS: Record<string, Partial<Params>> = {
+  auto: {},
+  blue: {
+    redStrength: 0.9,
+    warm: 12,
+    greenBias: -6,
+    dehazeStrength: 0.9,
+    claheClip: 2.2,
+    sharpenAmount: 0.7,
+    gamma: 1.16,
+    saturation: 1.22,
+  },
+  green: {
+    redStrength: 0.7,
+    warm: 4,
+    greenBias: -22,
+    dehazeStrength: 0.8,
+    claheClip: 2.4,
+    sharpenAmount: 0.6,
+    gamma: 1.12,
+    saturation: 1.1,
+  },
+  murky: {
+    redStrength: 0.5,
+    warm: 6,
+    greenBias: 4,
+    dehazeStrength: 1,
+    claheClip: 3,
+    sharpenAmount: 0.9,
+    gamma: 1.22,
+    saturation: 0.95,
+  },
+  shallow: {
+    redStrength: 0.25,
+    warm: 0,
+    greenBias: 0,
+    dehazeStrength: 0.35,
+    claheClip: 1.4,
+    sharpenAmount: 0.4,
+    gamma: 1.02,
+    saturation: 1.08,
+  },
+};
+
+const SLIDERS: {
+  key: keyof Params;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+}[] = [
+  { key: 'redStrength', label: '紅色復原', min: 0, max: 1, step: 0.01 },
+  { key: 'warm', label: '暖色（去藍）', min: -50, max: 50, step: 1 },
+  { key: 'greenBias', label: '洋紅（去綠）', min: -50, max: 50, step: 1 },
+  { key: 'dehazeStrength', label: '去水霧', min: 0, max: 1, step: 0.01 },
+  { key: 'claheClip', label: '局部對比 CLAHE', min: 0, max: 5, step: 0.1 },
+  { key: 'sharpenAmount', label: '細節銳化', min: 0, max: 1.5, step: 0.01 },
+  { key: 'gamma', label: 'Gamma', min: 0.7, max: 1.6, step: 0.01 },
+  { key: 'saturation', label: '飽和度', min: 0, max: 1.6, step: 0.01 },
+  { key: 'wbStrength', label: '白平衡強度', min: 0, max: 1, step: 0.01 },
+];
+
+const fmt = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(2));
+
+function buildSliders() {
+  sliderHost.innerHTML = '';
+  for (const s of SLIDERS) {
+    const row = document.createElement('label');
+    row.className = 'row';
+    row.innerHTML = `<span>${s.label}</span><output></output>`;
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(s.min);
+    input.max = String(s.max);
+    input.step = String(s.step);
+    input.value = String(params[s.key]);
+    const out = row.querySelector('output')!;
+    const show = () => (out.textContent = fmt(params[s.key] as number));
+    input.addEventListener('input', () => {
+      (params[s.key] as number) = parseFloat(input.value);
+      show();
+      schedule();
+    });
+    row.appendChild(input);
+    sliderHost.appendChild(row);
+    show();
+  }
+}
+
+function syncSliders() {
+  const rows = sliderHost.querySelectorAll('.row');
+  SLIDERS.forEach((s, i) => {
+    const el = rows[i].querySelector('input') as HTMLInputElement;
+    el.value = String(params[s.key]);
+    el.parentElement!.querySelector('output')!.textContent = fmt(
+      params[s.key] as number,
+    );
+  });
+}
+
+/* ---------------------------------------------------------------- worker */
+
+const worker = new RecoveryWorker();
+let seq = 0;
+const pending = new Map<number, (r: ImageData) => void>();
+let timer: number | undefined;
+let inflight = false;
+const dirty = new Set<number>();
+
+worker.onmessage = (ev: MessageEvent) => {
+  const { id, buffer, width, height } = ev.data as {
+    id: number;
+    buffer: ArrayBuffer;
+    width: number;
+    height: number;
+  };
+  const cb = pending.get(id);
+  pending.delete(id);
+  cb?.(new ImageData(new Uint8ClampedArray(buffer), width, height));
+};
+
+function schedule() {
+  dirty.add(current);
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(flush, 120) as unknown as number;
+}
+
+function flush() {
+  if (inflight || dirty.size === 0) return;
+  const idx = dirty.values().next().value as number;
+  dirty.delete(idx);
+  const it = items[idx];
+  if (!it) return;
+  inflight = true;
+  busy.classList.remove('hidden');
+  const id = ++seq;
+  const copy = it.original.data.slice().buffer;
+  pending.set(id, (res) => {
+    it.result = res;
+    inflight = false;
+    busy.classList.add('hidden');
+    if (idx === current) draw();
+    else renderQueue();
+    if (dirty.size) flush();
+  });
+  worker.postMessage(
+    { id, width: it.w, height: it.h, buffer: copy, params: { ...params } },
+    [copy],
+  );
+}
+
+/* --------------------------------------------------------------- drawing */
+
+function draw() {
+  const it = items[current];
+  if (!it) return;
+  const res = it.result ?? it.original;
+  const x = Math.round(cv.width * split);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  drawHalf(it.original, 0, x);
+  // putImageData ignores its destination rect, so halves go through temp canvases
+  drawHalf(res, x, cv.width - x);
+  handle.style.left = `${(split * 100).toFixed(2)}%`;
+  renderDiag();
+  renderQueue();
+}
+
+function drawHalf(src: ImageData, from: number, width: number) {
+  if (width <= 0) return;
+  const half = cropped(src, from, width);
+  const tmp = document.createElement('canvas');
+  tmp.width = width;
+  tmp.height = src.height;
+  tmp.getContext('2d')!.putImageData(half, 0, 0);
+  ctx.drawImage(tmp, from, 0);
+}
+
+/** Extract a [from, from+width) column band from an ImageData. */
+function cropped(src: ImageData, from: number, width: number): ImageData {
+  const out = new ImageData(width, src.height);
+  for (let y = 0; y < src.height; y++) {
+    const s = (y * src.width + from) * 4;
+    out.data.set(src.data.subarray(s, s + width * 4), y * width * 4);
+  }
+  return out;
+}
+
+function renderDiag() {
+  const a = items[current]?.analysis;
+  if (!a) return;
+  const pct = Math.round(a.isUnderwater * 100);
+  const verdict =
+    pct > 65 ? '強烈水下偏色' : pct > 35 ? '輕度水下偏色' : '幾乎沒有水下特徵';
+  diag.innerHTML = `
+    <div class="score ${pct > 35 ? 'hit' : ''}">
+      <b>${pct}%</b><span>${verdict}</span>
+    </div>
+    <dl>
+      <div><dt>藍綠偏移</dt><dd>${a.blueDominance.toFixed(0)}</dd></div>
+      <div><dt>色度 a / b</dt><dd>${a.meanA.toFixed(0)} / ${a.meanB.toFixed(0)}</dd></div>
+      <div><dt>對比度</dt><dd>${a.contrast.toFixed(3)}</dd></div>
+      <div><dt>平均亮度</dt><dd>${a.meanLuma.toFixed(0)}</dd></div>
+    </dl>`;
+}
+
+function renderQueue() {
+  queueEl.innerHTML = '';
+  items.forEach((it, i) => {
+    const b = document.createElement('button');
+    b.className = 'thumb' + (i === current ? ' on' : '');
+    b.title = it.name;
+    const c = document.createElement('canvas');
+    const scale = 64 / Math.max(it.w, it.h);
+    c.width = Math.max(1, Math.round(it.w * scale));
+    c.height = Math.max(1, Math.round(it.h * scale));
+    c.getContext('2d')!.drawImage(it.bitmap, 0, 0, c.width, c.height);
+    b.appendChild(c);
+    b.addEventListener('click', () => select(i));
+    const x = document.createElement('i');
+    x.className = 'x';
+    x.textContent = '×';
+    x.addEventListener('click', (e) => {
+      e.stopPropagation();
+      items.splice(i, 1);
+      if (!items.length) {
+        work.classList.add('hidden');
+        queueEl.classList.add('hidden');
+        return;
+      }
+      if (current >= items.length) current = items.length - 1;
+      select(current);
+    });
+    b.appendChild(x);
+    queueEl.appendChild(b);
+  });
+  queueEl.classList.toggle('hidden', items.length === 0);
+  $<HTMLButtonElement>('downloadAll').textContent = `下載全部 (${items.filter((i) => i.result).length})`;
+}
+
+function select(i: number) {
+  current = i;
+  work.classList.remove('hidden');
+  cv.width = items[i].w;
+  cv.height = items[i].h;
+  draw();
+  flush();
+}
+
+/* ---------------------------------------------------------------- intake */
+
+async function loadFile(f: File): Promise<Item> {
+  const bmp = await createImageBitmap(f);
+  const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width * scale);
+  const h = Math.round(bmp.height * scale);
+  let bitmap = bmp;
+  if (scale < 1) {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d')!.drawImage(bmp, 0, 0, w, h);
+    bitmap = await createImageBitmap(c);
+  }
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const cx = c.getContext('2d', { willReadFrequently: true })!;
+  cx.drawImage(bitmap, 0, 0);
+  const original = cx.getImageData(0, 0, w, h);
+  return { name: f.name, bitmap, original, result: null, analysis: analyse(original), w, h };
+}
+
+async function addFiles(files: FileList | File[]) {
+  let firstNew: Item | null = null;
+  for (const f of Array.from(files)) {
+    if (!f.type.startsWith('image/')) continue;
+    try {
+      const it = await loadFile(f);
+      items.push(it);
+      firstNew = firstNew ?? it;
+    } catch (err) {
+      console.error('failed to load', f.name, err);
+    }
+  }
+  if (firstNew) select(items.indexOf(firstNew));
+}
+
+function toBlob(): Promise<Blob | null> {
+  return new Promise((res) => cv.toBlob(res, 'image/png'));
+}
+
+function triggerDownload(blob: Blob, filename: string) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+const suffixed = (name: string) => name.replace(/\.[^.]+$/, '') + '-recovered.png';
+
+async function downloadCurrent() {
+  if (!items[current]?.result) return;
+  const blob = await toBlob();
+  if (blob) triggerDownload(blob, suffixed(items[current].name));
+}
+
+async function downloadAll() {
+  const c = document.createElement('canvas');
+  const cx = c.getContext('2d')!;
+  for (const it of items) {
+    if (!it.result) continue;
+    c.width = it.w;
+    c.height = it.h;
+    cx.putImageData(it.result, 0, 0);
+    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/png'));
+    if (blob) triggerDownload(blob, suffixed(it.name));
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+/* ----------------------------------------------------------------- wiring */
+
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  if (fileInput.files?.length) addFiles(fileInput.files);
+});
+for (const ev of ['dragenter', 'dragover'])
+  drop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    drop.classList.add('over');
+  });
+for (const ev of ['dragleave', 'drop'])
+  drop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    drop.classList.remove('over');
+  });
+drop.addEventListener('drop', (e) => {
+  const dt = (e as DragEvent).dataTransfer;
+  if (dt?.files.length) addFiles(dt.files);
+});
+window.addEventListener('paste', (e) => {
+  const list = (e as ClipboardEvent).clipboardData?.items;
+  if (!list) return;
+  const files: File[] = [];
+  for (const it of list)
+    if (it.type.startsWith('image/')) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  if (files.length) addFiles(files);
+});
+
+handle.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const move = (ev: PointerEvent) => {
+    const r = cv.getBoundingClientRect();
+    split = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+    draw();
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+});
+
+$('auto').addEventListener('change', (e) => {
+  params.auto = (e.target as HTMLInputElement).checked;
+  schedule();
+});
+
+document.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((b) => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('[data-preset]').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    const key = b.dataset.preset!;
+    params = {
+      ...DEFAULT_PARAMS,
+      ...PRESETS[key],
+      auto: key === 'auto' ? true : ($('auto') as HTMLInputElement).checked,
+    };
+    syncSliders();
+    schedule();
+  });
+});
+
+$('reset').addEventListener('click', () => {
+  params = { ...DEFAULT_PARAMS };
+  ($('auto') as HTMLInputElement).checked = true;
+  document.querySelectorAll('[data-preset]').forEach((x, i) =>
+    x.classList.toggle('on', i === 0),
+  );
+  syncSliders();
+  schedule();
+});
+
+$('download').addEventListener('click', downloadCurrent);
+$('downloadAll').addEventListener('click', downloadAll);
+
+buildSliders();
+
+/* ------------------------------------------------- test / automation hook */
+
+function channelStats(d: Uint8ClampedArray) {
+  let r = 0,
+    g = 0,
+    b = 0,
+    l = 0,
+    l2 = 0;
+  const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) {
+    r += d[i];
+    g += d[i + 1];
+    b += d[i + 2];
+    const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    l += y;
+    l2 += y * y;
+  }
+  return {
+    r: r / n,
+    g: g / n,
+    b: b / n,
+    contrast: Math.sqrt(Math.max(0, l2 / n - (l / n) ** 2)),
+  };
+}
+
+Object.assign(window as unknown as Record<string, unknown>, {
+  __uw: {
+    async loadDataURL(url: string) {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      const x = c.getContext('2d', { willReadFrequently: true })!;
+      x.drawImage(img, 0, 0);
+      const original = x.getImageData(0, 0, c.width, c.height);
+      const bitmap = await createImageBitmap(c);
+      const item: Item = {
+        name: 'test.png',
+        bitmap,
+        original,
+        result: null,
+        analysis: analyse(original),
+        w: c.width,
+        h: c.height,
+      };
+      items.push(item);
+      select(items.length - 1);
+      await new Promise<void>((res) => {
+        const iv = setInterval(() => {
+          if (item.result) {
+            clearInterval(iv);
+            res();
+          }
+        }, 50);
+      });
+      return { analysis: item.analysis, params };
+    },
+    stats() {
+      const it = items[0];
+      if (!it?.result) return null;
+      return { before: channelStats(it.original.data), after: channelStats(it.result.data) };
+    },
+    setParams(p: Partial<Params>) {
+      params = { ...params, ...p };
+      syncSliders();
+      return flushAndWait();
+    },
+    reset() {
+      items.length = 0;
+      current = 0;
+    },
+  },
+});
+
+function flushAndWait(): Promise<void> {
+  schedule();
+  return new Promise((res) => {
+    const iv = setInterval(() => {
+      if (!inflight && dirty.size === 0 && items[0]?.result) {
+        clearInterval(iv);
+        res();
+      }
+    }, 50);
+  });
+}
+
+export { autoParams };
