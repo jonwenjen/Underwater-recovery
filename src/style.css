@@ -373,6 +373,126 @@ button.ghost {
   gap: 8px;
 }
 
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------ tabs */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin: 22px 0 4px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+}
+
+.tabs button {
+  font-size: 0.95rem;
+  padding: 8px 18px;
+  border-radius: 999px;
+}
+
+.tabs button.on {
+  background: rgba(52, 211, 238, 0.18);
+  border-color: var(--accent);
+  color: #eafcff;
+}
+
+/* ----------------------------------------------------------------- video */
+
+.vleft {
+  min-width: 0;
+}
+
+.vleft .viewer canvas {
+  cursor: default;
+}
+
+.tag.solo {
+  left: 10px;
+  right: auto;
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.transport input[type='range'] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.transport .time {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.82rem;
+  color: var(--fg-dim);
+  min-width: 42px;
+  text-align: right;
+}
+
+.transport button {
+  min-width: 108px;
+}
+
+.note {
+  margin: 10px 0 0;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--fg-dim);
+}
+
+.ptitle {
+  margin: 18px 0 8px;
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.row select {
+  grid-column: 1 / -1;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.progress {
+  margin: 12px 0;
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+}
+
+.progress .bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  margin-bottom: 5px;
+}
+
+.progress .bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+@media (max-width: 900px) {
+  .transport {
+    flex-wrap: wrap;
+  }
+}
+
 /* ------------------------------------------------------------------- how */
 
 .how {

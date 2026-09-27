@@ -1,7 +1,19 @@
 import './style.css';
-import { DEFAULT_PARAMS, analyse, autoParams } from './pipeline';
+import { analyse, DEFAULT_PARAMS } from './pipeline';
 import type { Analysis, Params } from './pipeline';
+import { buildControls, PRESETS } from './controls';
 import RecoveryWorker from './worker?worker';
+
+// Video support pulls in mediabunny (~150 kB gzip). Load it on demand so
+// someone who only touches photos never downloads it.
+import type { VideoMeta } from './video';
+
+type VideoModule = typeof import('./video');
+let videoMod: VideoModule | null = null;
+async function loadVideoModule(): Promise<VideoModule> {
+  if (!videoMod) videoMod = await import('./video');
+  return videoMod;
+}
 
 /* ------------------------------------------------------------- app state */
 
@@ -19,7 +31,6 @@ const MAX_EDGE = 1600; // processing cap; keeps the worker responsive
 
 const items: Item[] = [];
 let current = 0;
-let params: Params = { ...DEFAULT_PARAMS };
 let split = 0.5;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -34,109 +45,19 @@ const ctx = cv.getContext('2d')!;
 const handle = $('handle');
 const busy = $('busy');
 const diag = $('diag');
-const sliderHost = $('sliders');
 
-/* --------------------------------------------------------------- presets */
+/* ------------------------------------------------- shared photo controls */
 
-const PRESETS: Record<string, Partial<Params>> = {
-  auto: {},
-  blue: {
-    redStrength: 0.9,
-    warm: 12,
-    greenBias: -6,
-    dehazeStrength: 0.9,
-    claheClip: 2.2,
-    sharpenAmount: 0.7,
-    gamma: 1.16,
-    saturation: 1.22,
-  },
-  green: {
-    redStrength: 0.7,
-    warm: 4,
-    greenBias: -22,
-    dehazeStrength: 0.8,
-    claheClip: 2.4,
-    sharpenAmount: 0.6,
-    gamma: 1.12,
-    saturation: 1.1,
-  },
-  murky: {
-    redStrength: 0.5,
-    warm: 6,
-    greenBias: 4,
-    dehazeStrength: 1,
-    claheClip: 3,
-    sharpenAmount: 0.9,
-    gamma: 1.22,
-    saturation: 0.95,
-  },
-  shallow: {
-    redStrength: 0.25,
-    warm: 0,
-    greenBias: 0,
-    dehazeStrength: 0.35,
-    claheClip: 1.4,
-    sharpenAmount: 0.4,
-    gamma: 1.02,
-    saturation: 1.08,
-  },
-};
-
-const SLIDERS: {
-  key: keyof Params;
-  label: string;
-  min: number;
-  max: number;
-  step: number;
-}[] = [
-  { key: 'redStrength', label: '紅色復原', min: 0, max: 1, step: 0.01 },
-  { key: 'warm', label: '暖色（去藍）', min: -50, max: 50, step: 1 },
-  { key: 'greenBias', label: '洋紅（去綠）', min: -50, max: 50, step: 1 },
-  { key: 'dehazeStrength', label: '去水霧', min: 0, max: 1, step: 0.01 },
-  { key: 'claheClip', label: '局部對比 CLAHE', min: 0, max: 5, step: 0.1 },
-  { key: 'sharpenAmount', label: '細節銳化', min: 0, max: 1.5, step: 0.01 },
-  { key: 'gamma', label: 'Gamma', min: 0.7, max: 1.6, step: 0.01 },
-  { key: 'saturation', label: '飽和度', min: 0, max: 1.6, step: 0.01 },
-  { key: 'wbStrength', label: '白平衡強度', min: 0, max: 1, step: 0.01 },
-];
-
-const fmt = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(2));
-
-function buildSliders() {
-  sliderHost.innerHTML = '';
-  for (const s of SLIDERS) {
-    const row = document.createElement('label');
-    row.className = 'row';
-    row.innerHTML = `<span>${s.label}</span><output></output>`;
-    const input = document.createElement('input');
-    input.type = 'range';
-    input.min = String(s.min);
-    input.max = String(s.max);
-    input.step = String(s.step);
-    input.value = String(params[s.key]);
-    const out = row.querySelector('output')!;
-    const show = () => (out.textContent = fmt(params[s.key] as number));
-    input.addEventListener('input', () => {
-      (params[s.key] as number) = parseFloat(input.value);
-      show();
-      schedule();
-    });
-    row.appendChild(input);
-    sliderHost.appendChild(row);
-    show();
-  }
-}
-
-function syncSliders() {
-  const rows = sliderHost.querySelectorAll('.row');
-  SLIDERS.forEach((s, i) => {
-    const el = rows[i].querySelector('input') as HTMLInputElement;
-    el.value = String(params[s.key]);
-    el.parentElement!.querySelector('output')!.textContent = fmt(
-      params[s.key] as number,
-    );
-  });
-}
+// Preset buttons live inside the photo panel now; the video panel has its own
+// set, so scope the query to this pane.
+const photoPane = $('photoPane');
+const photoControls = buildControls(
+  $('sliders'),
+  photoPane.querySelector('.presets') as HTMLElement,
+  $<HTMLInputElement>('auto'),
+  () => schedule(),
+);
+const params = () => photoControls.params;
 
 /* ---------------------------------------------------------------- worker */
 
@@ -184,7 +105,7 @@ function flush() {
     if (dirty.size) flush();
   });
   worker.postMessage(
-    { id, width: it.w, height: it.h, buffer: copy, params: { ...params } },
+    { id, width: it.w, height: it.h, buffer: copy, params: { ...params() } },
     [copy],
   );
 }
@@ -406,40 +327,16 @@ handle.addEventListener('pointerdown', (e) => {
   window.addEventListener('pointerup', up);
 });
 
-$('auto').addEventListener('change', (e) => {
-  params.auto = (e.target as HTMLInputElement).checked;
-  schedule();
-});
-
-document.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((b) => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('[data-preset]').forEach((x) => x.classList.remove('on'));
-    b.classList.add('on');
-    const key = b.dataset.preset!;
-    params = {
-      ...DEFAULT_PARAMS,
-      ...PRESETS[key],
-      auto: key === 'auto' ? true : ($('auto') as HTMLInputElement).checked,
-    };
-    syncSliders();
-    schedule();
-  });
-});
-
 $('reset').addEventListener('click', () => {
-  params = { ...DEFAULT_PARAMS };
-  ($('auto') as HTMLInputElement).checked = true;
-  document.querySelectorAll('[data-preset]').forEach((x, i) =>
+  photoPane.querySelectorAll('[data-preset]').forEach((x, i) =>
     x.classList.toggle('on', i === 0),
   );
-  syncSliders();
+  photoControls.set({ ...DEFAULT_PARAMS });
   schedule();
 });
 
 $('download').addEventListener('click', downloadCurrent);
 $('downloadAll').addEventListener('click', downloadAll);
-
-buildSliders();
 
 /* ------------------------------------------------- test / automation hook */
 
@@ -498,7 +395,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
           }
         }, 50);
       });
-      return { analysis: item.analysis, params };
+      return { analysis: item.analysis, params: params() };
     },
     stats() {
       const it = items[0];
@@ -506,13 +403,34 @@ Object.assign(window as unknown as Record<string, unknown>, {
       return { before: channelStats(it.original.data), after: channelStats(it.result.data) };
     },
     setParams(p: Partial<Params>) {
-      params = { ...params, ...p };
-      syncSliders();
+      photoControls.set({ ...params(), ...p });
       return flushAndWait();
     },
     reset() {
       items.length = 0;
       current = 0;
+    },
+    /** Test hook: run the real video export and describe the output bytes. */
+    async exportVideo(file: File, opts: { maxEdge: number; format: 'mp4' | 'webm' }) {
+      const mod = await loadVideoModule();
+      const { blob, name } = await mod.exportVideo(file, {
+        params: videoParams(),
+        maxEdge: opts.maxEdge,
+        format: opts.format,
+      });
+      const head = new Uint8Array(await blob.slice(0, 64).arrayBuffer());
+      return {
+        name,
+        size: blob.size,
+        type: blob.type,
+        head: Array.from(head),
+        // hand the bytes back so the harness can re-probe them
+        b64: await new Promise<string>((res) => {
+          const fr = new FileReader();
+          fr.onload = () => res(String(fr.result).split(',')[1]);
+          fr.readAsDataURL(blob);
+        }),
+      };
     },
   },
 });
@@ -529,4 +447,220 @@ function flushAndWait(): Promise<void> {
   });
 }
 
-export { autoParams };
+export { PRESETS };
+
+/* ------------------------------------------------------------------ tabs */
+
+$('tabPhotos').addEventListener('click', () => switchTab('photo'));
+$('tabVideo').addEventListener('click', () => switchTab('video'));
+
+function switchTab(which: 'photo' | 'video') {
+  const isPhoto = which === 'photo';
+  $('tabPhotos').classList.toggle('on', isPhoto);
+  $('tabVideo').classList.toggle('on', !isPhoto);
+  $('tabPhotos').setAttribute('aria-selected', String(isPhoto));
+  $('tabVideo').setAttribute('aria-selected', String(!isPhoto));
+  $('photoPane').classList.toggle('hidden', !isPhoto);
+  $('videoPane').classList.toggle('hidden', isPhoto);
+  if (!isPhoto) {
+    preview?.pause();
+    void loadVideoModule();
+  }
+}
+
+/* ----------------------------------------------------------------- video */
+
+const vdrop = $('vdrop');
+const vfile = $<HTMLInputElement>('vfile');
+const vwork = $('vwork');
+const vcv = $<HTMLCanvasElement>('vcv');
+const vbusy = $('vbusy');
+const vseek = $<HTMLInputElement>('vseek');
+const vtime = $('vtime');
+const vnote = $('vnote');
+const vprogress = $('vprogress');
+const vbar = $('vbar');
+const vstat = $('vstat');
+const vexportBtn = $<HTMLButtonElement>('vexport');
+const vdiag = $('vdiag');
+const vres = $<HTMLSelectElement>('vres');
+const vformat = $<HTMLSelectElement>('vformat');
+const videoPane = $('videoPane');
+
+const videoControls = buildControls(
+  $('vsliders'),
+  videoPane.querySelector('.presets') as HTMLElement,
+  $<HTMLInputElement>('vauto'),
+  () => void refreshPreviewFrame(),
+);
+
+let videoFile: File | null = null;
+let videoMeta: VideoMeta | null = null;
+type Preview = import('./video').VideoPreview;
+let preview: Preview | null = null;
+let exporting = false;
+const cancelFlag = { cancelled: false };
+
+const videoParams = () => videoControls.params;
+
+const clock = (s: number) => {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${String(sec).padStart(2, '0')}`;
+};
+
+vdrop.addEventListener('click', () => vfile.click());
+vfile.addEventListener('change', () => {
+  const f = vfile.files?.[0];
+  if (f) void loadVideo(f);
+});
+for (const ev of ['dragenter', 'dragover'])
+  vdrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    vdrop.classList.add('over');
+  });
+for (const ev of ['dragleave', 'drop'])
+  vdrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    vdrop.classList.remove('over');
+  });
+vdrop.addEventListener('drop', (e) => {
+  const f = (e as DragEvent).dataTransfer?.files?.[0];
+  if (f) void loadVideo(f);
+});
+
+async function loadVideo(f: File) {
+  vdrop.classList.add('hidden');
+  vbusy.classList.remove('hidden');
+  vnote.textContent = '讀取中…';
+  try {
+    const mod = await loadVideoModule();
+    const meta = await mod.probeVideo(f);
+    videoFile = f;
+    videoMeta = meta;
+    mod.resetVideoAnalysis();
+    preview?.dispose();
+    preview = new mod.VideoPreview(f, vcv);
+    await preview.ready();
+    vwork.classList.remove('hidden');
+    vnote.textContent =
+      `${meta.width}×${meta.height} · ${clock(meta.duration)}` +
+      (meta.hasAudio ? ' · 含音軌（匯出時原樣保留）' : ' · 無音軌');
+    vseek.max = '1000';
+    $('vcodec').textContent = '預覽為降解析度近似畫面；匯出才是完整品質的離線逐幀結果。';
+    await refreshPreviewFrame();
+  } catch (err) {
+    vnote.textContent = `無法讀取：${(err as Error).message}`;
+    vdrop.classList.remove('hidden');
+  } finally {
+    vbusy.classList.add('hidden');
+  }
+}
+
+let seekTimer: number | undefined;
+vseek.addEventListener('input', () => {
+  if (!preview || !videoMeta || !videoMeta.duration) return;
+  if (seekTimer) clearTimeout(seekTimer);
+  const t = (parseInt(vseek.value, 10) / 1000) * videoMeta.duration;
+  vtime.textContent = clock(t);
+  seekTimer = setTimeout(() => void grabAt(t), 180) as unknown as number;
+});
+
+async function grabAt(t: number) {
+  if (!preview) return;
+  vbusy.classList.remove('hidden');
+  try {
+    await preview.grab(t, videoParams());
+    if (videoMeta) renderVideoDiag(videoMeta);
+  } finally {
+    vbusy.classList.add('hidden');
+  }
+}
+
+function renderVideoDiag(meta: VideoMeta) {
+  vdiag.innerHTML = `
+    <div class="score">
+      <b>${meta.width}×${meta.height}</b><span>${clock(meta.duration)}</span>
+    </div>
+    <dl>
+      <div><dt>音軌</dt><dd>${meta.hasAudio ? '有（保留）' : '無'}</dd></div>
+      <div><dt>預覽解析度</dt><dd>≤ 480p</dd></div>
+    </dl>`;
+}
+
+async function refreshPreviewFrame() {
+  if (!preview) return;
+  await grabAt(Math.max(preview.currentTime, 0));
+}
+
+$('vplay').addEventListener('click', async () => {
+  if (!preview) return;
+  const btn = $('vplay');
+  if (btn.dataset.playing === '1') {
+    preview.pause();
+    btn.dataset.playing = '0';
+    btn.textContent = '▶ 播放預覽';
+    return;
+  }
+  btn.dataset.playing = '1';
+  btn.textContent = '⏸ 暫停';
+  await preview.play(videoParams(), (t: number) => {
+    vtime.textContent = clock(t);
+    if (videoMeta?.duration) {
+      vseek.value = String(Math.round((t / videoMeta.duration) * 1000));
+    }
+  });
+  btn.dataset.playing = '0';
+  btn.textContent = '▶ 播放預覽';
+});
+
+$('vreset').addEventListener('click', () => {
+  videoPane.querySelectorAll('[data-preset]').forEach((x, i) =>
+    x.classList.toggle('on', i === 0),
+  );
+  videoControls.set({ ...DEFAULT_PARAMS });
+  void refreshPreviewFrame();
+});
+
+$('vexport').addEventListener('click', async () => {
+  if (!videoFile || exporting) return;
+  exporting = true;
+  cancelFlag.cancelled = false;
+  const btn = vexportBtn;
+  btn.disabled = true;
+  $('vcancel').classList.remove('hidden');
+  vprogress.classList.remove('hidden');
+  vbar.style.width = '0%';
+  vstat.textContent = '0%';
+  try {
+    const mod = await loadVideoModule();
+    const { blob, name } = await mod.exportVideo(videoFile, {
+      params: videoParams(),
+      maxEdge: parseInt(vres.value, 10),
+      format: vformat.value as 'mp4' | 'webm',
+      signal: cancelFlag,
+      onProgress: (p: number, note: string) => {
+        vbar.style.width = `${(p * 100).toFixed(1)}%`;
+        vstat.textContent = `${Math.round(p * 100)}%`;
+        if (note) vnote.textContent = note;
+      },
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+    vnote.textContent = `完成：${name}`;
+  } catch (err) {
+    vnote.textContent = `匯出失敗：${(err as Error).message}`;
+  } finally {
+    exporting = false;
+    btn.disabled = false;
+    $('vcancel').classList.add('hidden');
+  }
+});
+
+$('vcancel').addEventListener('click', () => {
+  cancelFlag.cancelled = true;
+  vnote.textContent = '取消中…';
+});

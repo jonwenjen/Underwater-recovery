@@ -1,7 +1,7 @@
 # 🌊 Underwater Recovery
 
-Automatic recovery of underwater photos, running entirely in your browser.
-Fixes the four things that go wrong underwater:
+Automatic recovery of underwater **photos and video**, running entirely in your
+browser. Fixes the four things that go wrong underwater:
 
 | Problem | What the app does |
 |---|---|
@@ -11,7 +11,8 @@ Fixes the four things that go wrong underwater:
 | Blurry fine detail | CLAHE on the luminance plane + edge-aware unsharp mask |
 
 **No server, no upload, no account.** Every pixel is processed in a Web Worker
-in the tab. Nothing leaves your machine.
+in the tab. Nothing leaves your machine. Video is decoded, graded and re-encoded
+locally via WebCodecs; the file is never sent anywhere.
 
 ## Quick start
 
@@ -20,6 +21,9 @@ npm install
 npm run dev      # http://localhost:5173
 npm test         # numeric pipeline tests (no browser needed)
 npm run build    # typecheck + production bundle
+
+# video end-to-end test (drives a throwaway headless Chrome, never your own)
+node scripts/e2e-video.mjs http://localhost:4173/Underwater-recovery/ clip.mp4 out.mp4
 ```
 
 ## Using it
@@ -32,6 +36,37 @@ them. Pick a preset or let auto mode tune itself, then adjust any stage by hand.
 - **深藍海水 / 綠水 / 混濁近攝 / 淺水自然** — fixed starting points for common
   conditions. Tweak from there.
 - Batch: drop many files, switch between them in the strip, then 下載全部.
+
+## Video
+
+The 影片 tab takes MP4 / WebM / MOV and runs the *same* pipeline over every frame,
+with the same presets and sliders. Audio is passed through untouched.
+
+- **Preview** is a scrub bar, not live playback. The graded pipeline runs at
+  roughly 45 ms per 640×360 frame, so real-time preview is not reachable in
+  JavaScript — you get a still frame at the playhead plus the real parameters.
+- **Export** decodes, grades and re-encodes offline with a progress bar and a
+  cancel button. Cost is roughly linear in frames: expect about a minute for a
+  10-second 720p 30 fps clip.
+- Parameters are analysed **once**, from the first few frames, and held for the
+  whole clip. Per-frame auto-analysis flickers, because underwater statistics
+  swing with every passing shadow.
+- Choose the output size (720p / 1080p / 1440p / 2160p / original) and MP4 or
+  WebM. Frames are resampled to the target size *before* grading, so a 4K source
+  is not processed at 4K.
+
+Implementation notes worth knowing if you touch this code:
+
+- `src/video.ts` owns decode/encode. `src/video.worker.ts` owns the per-frame
+  grading. `src/controls.ts` is the shared slider/preset builder.
+- mediabunny does **not** pre-scale samples before calling the `process`
+  callback, and the encoder takes its dimensions from the sample you return — so
+  the scale happens by hand inside the callback. Passing `width`/`height` alone
+  silently does nothing.
+- A `VideoSample` is not a `CanvasImageSource`; draw it with `sample.draw(...)`.
+- `quality` must be a `Quality` instance (`QUALITY_HIGH`), not a string. The
+  pipeline sharpens, and sharpening amplifies compression artefacts, so this is
+  not cosmetic.
 
 ## How the pipeline works
 
@@ -91,7 +126,11 @@ regression guards that caught real bugs during development:
   turbid water still fights you. The sliders are there for that.
 - Images are processed at up to 1600 px on the long edge; the original file is
   not written back.
-- Video is out of scope — export a frame first.
+- Video re-encodes rather than stream-copying the video track, so quality is
+  re-quantised. Audio is copied, not re-encoded. Codec support follows
+  WebCodecs: H.264 everywhere, VP9/AV1 where the browser offers them.
+- Export runs on the main thread's worker pool and will keep a laptop busy for
+  the length of the export. There is no GPU path.
 
 ## References
 

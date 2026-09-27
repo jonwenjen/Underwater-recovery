@@ -13,5 +13,8 @@
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   },
-  "description": "Browser-local automatic recovery of underwater photos"
+  "description": "Browser-local automatic recovery of underwater photos",
+  "dependencies": {
+    "mediabunny": "^1.60.0"
+  }
 }
