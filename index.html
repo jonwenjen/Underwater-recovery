@@ -6,192 +6,139 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Underwater Recovery — 在瀏覽器本機自動恢復水下照片與影片的偏藍偏綠、缺乏暖色、水霧低對比與細節模糊。"
+      content="Underwater Recovery Studio — GPU 即時預覽的水下照片與影片還原：自動追蹤畫面調整白平衡、紅色補償、去水霧與局部對比，並提供專業手動控制。全部在瀏覽器本機運算。"
     />
-    <title>Underwater Recovery — 水下畫面恢復</title>
-    <link rel="stylesheet" href="/src/style.css" />
+    <meta name="theme-color" content="#06121f" />
+    <title>Underwater Recovery Studio — 水下畫面即時還原</title>
   </head>
   <body>
     <div class="app">
-      <header>
-        <h1>🌊 Underwater Recovery</h1>
-        <p class="sub">
-          水下照片與影片自動恢復：去偏藍偏綠、補回紅黃暖色、去水霧、找回細節。<br />
-          全部在你的瀏覽器本機運算，檔案不會上傳到任何伺服器。
-        </p>
+      <header class="top">
+        <div class="brand">
+          <h1>🌊 Underwater Recovery <span class="tag-studio">Studio</span></h1>
+          <p class="sub">GPU 即時預覽 · 自動追蹤畫面 · 專業調整 · 檔案不離開你的裝置</p>
+        </div>
+        <div class="top-actions">
+          <input type="file" id="file" accept="image/*,video/*" multiple hidden />
+          <button id="open" class="primary">開啟照片／影片</button>
+        </div>
       </header>
 
-      <nav class="tabs" role="tablist">
-        <button id="tabPhotos" class="on" role="tab" aria-selected="true">照片</button>
-        <button id="tabVideo" role="tab" aria-selected="false">影片</button>
-      </nav>
-
-      <!-- ------------------------------------------------------------ photos -->
-      <section id="photoPane">
-        <section id="drop" class="drop">
-          <input type="file" id="file" accept="image/*" multiple hidden />
-          <p class="big">把照片拖進來，或點此選擇</p>
-          <p class="small">支援 JPG / PNG / WebP，可一次多張。</p>
-        </section>
-
-        <div class="queue hidden" id="queue"></div>
-
-        <main class="work hidden" id="work">
-          <div class="viewer" id="viewer">
-            <canvas id="cv"></canvas>
-            <div class="handle" id="handle"><span></span></div>
-            <div class="tag left">原圖</div>
-            <div class="tag right">恢復後</div>
+      <main class="studio">
+        <section class="stage">
+          <div class="viewer" id="viewer" tabindex="0" aria-label="預覽畫面，分割模式下可拖曳或用左右鍵移動分割線">
+            <canvas id="view"></canvas>
+            <div class="empty" id="empty">
+              <p class="big">把水下照片或影片拖進來</p>
+              <p class="small">JPG / PNG / WebP / HEIC（瀏覽器支援時）· MP4 / MOV / WebM<br />或直接貼上剪貼簿圖片</p>
+            </div>
+            <div class="label left" id="lblLeft">原圖</div>
+            <div class="label right" id="lblRight">還原後</div>
+            <div class="cut hidden" id="cutFlash">場景切換 · 參數重算</div>
             <div class="busy hidden" id="busy">處理中…</div>
           </div>
 
-          <aside class="panel">
-            <div class="diagnosis" id="diag"></div>
-
-            <div class="presets">
-              <button data-preset="auto" class="on">自動判斷</button>
-              <button data-preset="blue">深藍海水</button>
-              <button data-preset="green">綠水／湖</button>
-              <button data-preset="murky">混濁近攝</button>
-              <button data-preset="shallow">淺水自然</button>
+          <div class="toolbar">
+            <div class="seg" role="group" aria-label="檢視模式">
+              <button data-mode="1" class="on">分割對比</button>
+              <button data-mode="0">結果</button>
+              <button data-mode="2">原圖</button>
             </div>
-
-            <label class="row toggle">
-              <input type="checkbox" id="auto" checked /> 依照片自動調整各項參數
+            <button id="clip" class="chip" aria-pressed="false" title="紅色＝高光溢出，藍色＝暗部死黑">過曝警告</button>
+            <button id="dropper" class="chip" aria-pressed="false" title="點選畫面中應該是中性白／灰的物體（沙地、氣瓶、白板）">白點滴管</button>
+            <button id="clearPick" class="chip hidden">清除白點</button>
+            <label class="inline">
+              預覽
+              <select id="previewRes">
+                <option value="1280">1280</option>
+                <option value="1920" selected>1920</option>
+                <option value="2560">2560</option>
+                <option value="0">原始</option>
+              </select>
             </label>
-
-            <div class="anchor">
-              <button id="pick" class="ghost">🎯 點一下要去色的物體</button>
-              <p class="hint" id="anchorNote">
-                顏色偏紅時最有效：點防寒衣、白靴、沙地等應該是灰色的物體。
-              </p>
-            </div>
-
-            <div class="sliders" id="sliders"></div>
-            <button id="reset" class="ghost">全部重設</button>
-            <div class="actions">
-              <button id="download" class="primary">下載這張</button>
-              <button id="downloadAll">下載全部</button>
-            </div>
-          </aside>
-        </main>
-      </section>
-
-      <!-- ------------------------------------------------------------- video -->
-      <section id="videoPane" class="hidden">
-        <section id="vdrop" class="drop">
-          <input type="file" id="vfile" accept="video/*" hidden />
-          <p class="big">把影片拖進來，或點此選擇</p>
-          <p class="small">
-            支援 MP4 / MOV / WebM。全部在本機解碼、逐幀處理、再編碼，音軌原封不動保留。
-          </p>
-        </section>
-
-        <main class="work hidden" id="vwork">
-          <div class="vleft">
-            <div class="viewer" id="vviewer">
-              <canvas id="vcv"></canvas>
-              <div class="tag solo">恢復後預覽</div>
-              <div class="busy hidden" id="vbusy">處理中…</div>
-            </div>
-            <div class="transport">
-              <button id="vplay" class="primary">▶ 播放預覽</button>
-              <input type="range" id="vseek" min="0" max="1000" value="0" />
-              <span class="time" id="vtime">0:00</span>
-              <button id="vcmp" class="ghost" aria-pressed="false">看原片</button>
-            </div>
-            <p class="note" id="vnote"></p>
+            <span class="perf" id="perf">—</span>
           </div>
 
-          <aside class="panel">
-            <div class="diagnosis" id="vdiag"></div>
+          <div class="transport hidden" id="transport">
+            <button id="play" class="primary">▶ 播放</button>
+            <input type="range" id="seek" min="0" max="1000" value="0" aria-label="播放位置" />
+            <span class="time" id="time">0:00 / 0:00</span>
+          </div>
 
-            <div class="presets">
-              <button data-preset="auto" class="on">自動判斷</button>
-              <button data-preset="blue">深藍海水</button>
-              <button data-preset="green">綠水／湖</button>
-              <button data-preset="murky">混濁近攝</button>
-              <button data-preset="shallow">淺水自然</button>
+          <div class="strip hidden" id="strip"></div>
+        </section>
+
+        <aside class="panel" id="panel">
+          <div class="card analysis">
+            <div class="meter">
+              <div class="score"><b id="uwScore">—</b><span id="uwLabel">等待畫面</span></div>
+              <canvas id="histo" width="256" height="72" aria-label="輸出直方圖"></canvas>
             </div>
+            <dl class="facts">
+              <div><dt>水體</dt><dd id="fWater">—</dd></div>
+              <div><dt>水霧</dt><dd id="fHaze">—</dd></div>
+              <div><dt>水體光</dt><dd><i class="sw" id="swA"></i></dd></div>
+              <div><dt>光源</dt><dd><i class="sw" id="swI"></i></dd></div>
+            </dl>
+          </div>
 
-            <label class="row toggle">
-              <input type="checkbox" id="vauto" checked /> 依影片自動調整參數
+          <div class="card">
+            <label class="master">
+              <input type="checkbox" id="auto" checked />
+              <span><b>全自動模式</b><small>每個畫面自動分析；滑桿動過即改為手動，按 A 交還自動</small></span>
             </label>
+            <div class="presets" id="presets"></div>
+          </div>
 
-            <div class="anchor">
-              <button id="vpick" class="ghost">🎯 點一下要去色的物體</button>
-              <p class="hint" id="vanchorNote">
-                顏色偏紅時最有效：點潜水衣、白靴、沙地等應該是灰色的物體。
-              </p>
+          <div id="groups"></div>
+
+          <div class="card export">
+            <h3>輸出</h3>
+            <div id="photoExport">
+              <label class="row"><span>格式</span>
+                <select id="photoFormat">
+                  <option value="image/jpeg">JPEG（品質 95）</option>
+                  <option value="image/png">PNG（無損）</option>
+                  <option value="image/webp">WebP（品質 95）</option>
+                </select>
+              </label>
+              <div class="actions">
+                <button id="savePhoto" class="primary">下載這張（全解析度）</button>
+                <button id="saveAll">下載全部</button>
+              </div>
             </div>
-
-            <div class="sliders" id="vsliders"></div>
-
-            <h3 class="ptitle">輸出</h3>
-            <label class="row">
-              <span>解析度</span>
-              <select id="vres">
-                <option value="0">原始</option>
-                <option value="2160">2160p</option>
-                <option value="1080" selected>1080p</option>
-                <option value="720">720p</option>
-                <option value="480">480p（快）</option>
-              </select>
-            </label>
-            <label class="row">
-              <span>格式</span>
-              <select id="vformat">
-                <option value="mp4" selected>MP4 (H.264)</option>
-                <option value="webm">WebM (VP9)</option>
-              </select>
-            </label>
-
-            <div class="progress hidden" id="vprogress">
-              <div class="bar"><i id="vbar"></i></div>
-              <span id="vstat">0%</span>
+            <div id="videoExport" class="hidden">
+              <label class="row"><span>解析度</span>
+                <select id="vres">
+                  <option value="0">原始</option>
+                  <option value="2160">2160p</option>
+                  <option value="1080" selected>1080p</option>
+                  <option value="720">720p</option>
+                </select>
+              </label>
+              <label class="row"><span>格式</span>
+                <select id="vformat">
+                  <option value="mp4" selected>MP4</option>
+                  <option value="webm">WebM</option>
+                </select>
+              </label>
+              <label class="row check" id="diskRow"><input type="checkbox" id="toDisk" /> 直接寫入磁碟（長片建議，不佔記憶體）</label>
+              <div class="progress hidden" id="vprogress"><div class="bar"><i id="vbar"></i></div><span id="vstat">0%</span></div>
+              <div class="actions">
+                <button id="vexport" class="primary">匯出影片</button>
+                <button id="vcancel" class="hidden">取消</button>
+              </div>
             </div>
+            <p class="note" id="note"></p>
+          </div>
+        </aside>
+      </main>
 
-            <button id="vreset" class="ghost">全部重設</button>
-            <div class="actions">
-              <button id="vexport" class="primary">匯出影片</button>
-              <button id="vcancel" class="hidden">取消</button>
-            </div>
-            <p class="note" id="vcodec"></p>
-          </aside>
-        </main>
-      </section>
-
-      <section class="how">
-        <h2>它做了什麼</h2>
-        <ol>
-          <li><b>白平衡</b>：把 LAB 的 a/b 色度均值拉回中性，去掉整體偏藍／偏綠。</li>
-          <li><b>紅色復原</b>：依 Jaffe–McGlamery 吸收模型（紅光衰減最快）對紅色頻道做指數擴張，補回珊瑚、潛水衣的暖色。</li>
-          <li><b>去水霧</b>：暗通道先驗（Dark Channel Prior）估計透射率並細化，還原被散射吞掉的對比。</li>
-          <li><b>局部對比</b>：CLAHE 只作用在亮度 L，避免飽和度爆掉與色塊假影。</li>
-          <li><b>細節</b>：unsharp mask 補回被散射糊掉的邊緣。</li>
-          <li><b>色階與 gamma</b>：拉回黑點／白點並調整中間調，最後微調飽和度。</li>
-        </ol>
-
-        <h2>影片怎麼處理</h2>
-        <p>
-          預覽是<b>即時降解析度</b>的近似畫面（480p、每 12 幀重算一次分析），
-          因為完整管線每幀要 200 毫秒左右，不可能跟上播放速度。
-          匯出才是真結果：<b>離線逐幀</b>解碼、完整套用管線、再重新編碼，音軌直接沿用原檔。
-          因為離線處理，匯出比影片長度慢得多，畫面長度請自行斟酌。
-        </p>
-
-        <h2>已知限制</h2>
-        <p>
-          被水吸收掉的紅色資訊在物理上已經不存在，復原出來的是「合理推測」而非原始資料。
-          深度學習模型（UIEB / Water-Net 類）效果通常更好，但需要伺服器或大型推論環境；
-          本工具刻意做成純前端、離線、不上傳。混濁水與強逆光仍會有殘留色偏，可用面板手動微調。<br />
-          影片匯出需要瀏覽器支援 <b>WebCodecs</b>（Chrome / Edge / Safari 皆可，Firefox 支援較晚），
-          且整段影片不會留在記憶體以外，但很長的影片仍可能吃滿記憶體。
-        </p>
-      </section>
-
-      <footer>MIT License · 演算法參考 Jaffe–McGlamery、He et al. (DCP)、Zuiderveld (CLAHE) · 影音 I/O 使用 mediabunny</footer>
+      <footer>
+        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩。
+        影片自動追蹤：每幀分析、指數平滑、場景切換立即重算。MIT License · 影音 I/O：mediabunny
+      </footer>
     </div>
-    <script type="module" src="/src/main.ts"></script>
+    <script type="module" src="/src/app.ts"></script>
   </body>
 </html>

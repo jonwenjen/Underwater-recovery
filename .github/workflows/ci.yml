@@ -26,32 +26,36 @@ jobs:
           cache: npm
       - run: npm ci
 
-      # src + test + bench. The pipeline tests are the regression guard for
-      # white-clipping, banding and the no-op path, so a type error in test/
-      # means a real guard is broken.
+      # src + test + bench, so a type error in a test is caught as a broken guard
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Pipeline tests
+      - name: Engine tests (Studio)
         run: npm test
+
+      # The v1 CPU pipeline is no longer served but stays in the tree; its
+      # regression guards (white clipping, banding, no-op path) keep running.
+      - name: Legacy pipeline tests (v1)
+        run: npm run test:legacy
 
       - name: Production build
         run: npm run build
 
-      # The video e2e drives a headless Chrome, which is available on the
-      # ubuntu runner. It runs against the real production build and the
-      # committed fixture clip (which carries an AAC audio track, so this also
-      # covers audio passthrough).
-      - name: Video end-to-end
-        run: |
-          npx vite preview --port 4173 &
-          for i in $(seq 1 40); do
-            if curl -sf http://localhost:4173/Underwater-recovery/ > /dev/null; then break; fi
-            sleep 1
-          done
-          curl -sf http://localhost:4173/Underwater-recovery/ > /dev/null \
-            || { echo "preview server never came up"; exit 1; }
-          node scripts/e2e-video.mjs \
-            http://localhost:4173/Underwater-recovery/ \
-            test/fixtures/underwater.mp4 \
-            /tmp/exported.mp4
+  verify:
+    # End-to-end on the real production build in headless Chromium: WebGL2
+    # (SwiftShader) + WebCodecs (VP9), ground-truth photo and video scenes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-output
+          path: verify-output

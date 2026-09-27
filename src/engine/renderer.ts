@@ -1,0 +1,300 @@
+/**
+ * WebGL2 renderer + the per-frame loop that ties it to the auto engine.
+ *
+ *   source ─upload+mips─▶ small (256 px) ─readPixels─▶ AutoEngine.step (CPU)
+ *                                                          │ uniforms, maps, LUTs
+ *   source ─────────────▶ GRADE (full res) ─mips─▶ BLUR H ─▶ BLUR V ─▶ FINAL ─▶ canvas
+ *
+ * Everything at full resolution happens on the GPU; the CPU only ever touches
+ * the 256 px analysis frame, so cost barely grows with resolution.
+ */
+import { ANALYSIS_EDGE, AutoEngine, DEHAZE_CHROMA, T0, type FrameState, type StepOptions } from './auto.ts';
+import { toGLMat3 } from './color.ts';
+import { destroy, program, target, texture, type GL, type Program, type Target, type Tex } from './gl.ts';
+import { CLAHE_BINS, CURVE_N } from './luts.ts';
+import { BLUR_FS, COPY_FS, FINAL_FS, GRADE_FS } from './shaders.ts';
+
+export interface View {
+  mode: 0 | 1 | 2; // result | split | original
+  split: number;
+  clip: boolean;
+}
+export const RESULT_VIEW: View = { mode: 0, split: 0.5, clip: false };
+
+type Canvas = HTMLCanvasElement | OffscreenCanvas;
+
+export class Renderer {
+  readonly gl: GL;
+  readonly canvas: Canvas;
+  readonly floatTargets: boolean;
+  readonly maxTexture: number;
+  private progs: { copy: Program; grade: Program; blur: Program; final: Program };
+  private vao: WebGLVertexArrayObject;
+  private src: Tex | null = null;
+  private small: Target | null = null;
+  private scope: Target | null = null;
+  private graded: Target | null = null;
+  private blurA: Target | null = null;
+  private blurB: Target | null = null;
+  private coef: Tex | null = null;
+  private lut: Tex | null = null;
+  private curve: Tex;
+  srcW = 0;
+  srcH = 0;
+  pw = 0;
+  ph = 0;
+  sw = 0;
+  sh = 0;
+  private seed = 0;
+
+  constructor(canvas: Canvas, opts: { preserve?: boolean } = {}) {
+    this.canvas = canvas;
+    const gl = canvas.getContext('webgl2', {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: !!opts.preserve,
+      powerPreference: 'high-performance',
+    }) as GL | null;
+    if (!gl) throw new Error('此瀏覽器不支援 WebGL2，無法即時運算');
+    this.gl = gl;
+    this.floatTargets = !!gl.getExtension('EXT_color_buffer_float');
+    this.maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    this.progs = {
+      copy: program(gl, COPY_FS),
+      grade: program(gl, GRADE_FS),
+      blur: program(gl, BLUR_FS),
+      final: program(gl, FINAL_FS),
+    };
+    this.vao = gl.createVertexArray()!;
+    this.curve = texture(gl, CURVE_N, 1, gl.R16F, gl.RED, gl.FLOAT);
+  }
+
+  /** Upload a new source frame (image, video element, VideoFrame, canvas). */
+  upload(source: TexImageSource, w: number, h: number) {
+    const gl = this.gl;
+    if (!this.src || this.src.w !== w || this.src.h !== h) {
+      destroy(gl, this.src);
+      this.src = texture(gl, w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, { mips: true });
+      this.srcW = w;
+      this.srcH = h;
+      const s = Math.min(1, ANALYSIS_EDGE / Math.max(w, h));
+      this.sw = Math.max(8, Math.round(w * s));
+      this.sh = Math.max(8, Math.round(h * s));
+      destroy(gl, this.small);
+      destroy(gl, this.scope);
+      this.small = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
+      this.scope = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.src.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  }
+
+  /** Processing (and canvas) resolution. */
+  resize(pw: number, ph: number) {
+    if (pw === this.pw && ph === this.ph) return;
+    const gl = this.gl;
+    this.pw = pw;
+    this.ph = ph;
+    this.canvas.width = pw;
+    this.canvas.height = ph;
+    for (const t of [this.graded, this.blurA, this.blurB]) destroy(gl, t);
+    const f = this.floatTargets;
+    this.graded = target(
+      gl,
+      texture(gl, pw, ph, f ? gl.RGBA16F : gl.RGBA8, gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, { mips: true }),
+    );
+    const blur = () =>
+      target(gl, texture(gl, pw, ph, f ? gl.R16F : gl.RGBA8, f ? gl.RED : gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE));
+    this.blurA = blur();
+    this.blurB = blur();
+  }
+
+  /** Render the source into the 256 px analysis target and read it back. */
+  readSmall(): Uint8Array {
+    const gl = this.gl;
+    const out = new Uint8Array(this.sw * this.sh * 4);
+    this.pass(this.progs.copy, this.small!, () => this.bind(0, this.src!, 'u_src', this.progs.copy));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.small!.fb);
+    gl.readPixels(0, 0, this.sw, this.sh, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+  }
+
+  /** Upload the per-frame maps and LUTs computed by the engine. */
+  private uploadState(s: FrameState) {
+    const gl = this.gl;
+    if (!this.coef || this.coef.w !== s.coefW || this.coef.h !== s.coefH) {
+      destroy(gl, this.coef);
+      this.coef = texture(gl, s.coefW, s.coefH, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.coef.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, s.coefW, s.coefH, 0, gl.RGBA, gl.FLOAT, s.coef);
+    const rows = s.claheTiles * s.claheTiles;
+    if (!this.lut || this.lut.h !== rows) {
+      destroy(gl, this.lut);
+      this.lut = texture(gl, CLAHE_BINS, rows, gl.R16F, gl.RED, gl.FLOAT);
+    }
+    if (s.clahe) {
+      gl.bindTexture(gl.TEXTURE_2D, this.lut.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, CLAHE_BINS, rows, 0, gl.RED, gl.FLOAT, s.clahe);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.curve.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, CURVE_N, 1, 0, gl.RED, gl.FLOAT, s.curve);
+  }
+
+  /** Full-resolution grade + blur passes. Call when the state or source changed. */
+  grade(s: FrameState) {
+    const gl = this.gl;
+    this.uploadState(s);
+    const g = this.progs.grade;
+    this.pass(g, this.graded!, () => {
+      this.bind(0, this.src!, 'u_src', g);
+      this.bind(1, this.coef!, 'u_coef', g);
+      this.bind(2, this.lut!, 'u_lut', g);
+      gl.uniform1f(g.u.u_aR, s.aR);
+      gl.uniform1f(g.u.u_aB, s.aB);
+      gl.uniform1f(g.u.u_dR, s.dR);
+      gl.uniform1f(g.u.u_dB, s.dB);
+      gl.uniformMatrix3fv(g.u.u_wb, false, toGLMat3(s.wb));
+      gl.uniform3fv(g.u.u_A, s.A);
+      gl.uniform3fv(g.u.u_Aout, s.Aout);
+      gl.uniform3fv(g.u.u_post, s.post);
+      gl.uniform1f(g.u.u_dehazeChroma, DEHAZE_CHROMA);
+      gl.uniform3fv(g.u.u_k, s.k);
+      gl.uniform1f(g.u.u_t0, T0);
+      gl.uniform1f(g.u.u_dehaze, s.dehazeOn ? 1 : 0);
+      gl.uniform1f(g.u.u_exp, s.expMul);
+      gl.uniform1f(g.u.u_tiles, s.claheTiles);
+      gl.uniform1f(g.u.u_claheMix, s.clahe ? s.claheMix : 0);
+      gl.uniform1f(g.u.u_claheK, s.claheK);
+    });
+    gl.bindTexture(gl.TEXTURE_2D, this.graded!.tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    // separable Gaussian of luminance for the detail band
+    const sigma = Math.max(0.3, s.sharpenRadius);
+    const taps = Math.min(9, Math.ceil(2.5 * sigma) + 1);
+    const w = new Float32Array(9);
+    let sum = 0;
+    for (let i = 0; i < taps; i++) {
+      w[i] = Math.exp((-i * i) / (2 * sigma * sigma));
+      sum += i === 0 ? w[i] : 2 * w[i];
+    }
+    for (let i = 0; i < taps; i++) w[i] /= sum;
+    const b = this.progs.blur;
+    const blur = (src: Tex, dst: Target, dir: [number, number], fromAlpha: boolean) =>
+      this.pass(b, dst, () => {
+        this.bind(0, src, 'u_in', b);
+        gl.uniform2f(b.u.u_dir, dir[0], dir[1]);
+        gl.uniform1fv(b.u.u_w, w);
+        gl.uniform1i(b.u.u_taps, taps);
+        gl.uniform1i(b.u.u_fromAlpha, fromAlpha ? 1 : 0);
+      });
+    blur(this.graded!, this.blurA!, [1 / this.pw, 0], true);
+    blur(this.blurA!, this.blurB!, [0, 1 / this.ph], false);
+  }
+
+  /** Detail/tone/colour/compare pass to the canvas, or into the scope target. */
+  finish(s: FrameState, view: View, toScope = false) {
+    const gl = this.gl;
+    const f = this.progs.final;
+    const dst = toScope ? this.scope! : null;
+    this.pass(f, dst, () => {
+      this.bind(0, this.graded!, 'u_graded', f);
+      this.bind(1, this.blurB!, 'u_blur', f);
+      this.bind(2, this.src!, 'u_src', f);
+      this.bind(3, this.curve, 'u_curve', f);
+      gl.uniform1f(f.u.u_flipY, toScope ? 0 : 1);
+      gl.uniform2f(f.u.u_size, toScope ? this.sw : this.pw, toScope ? this.sh : this.ph);
+      gl.uniform1f(f.u.u_sharpen, s.sharpen);
+      gl.uniform1f(f.u.u_thr, s.threshold);
+      gl.uniform1f(f.u.u_denoise, s.denoise);
+      gl.uniform1f(f.u.u_clarity, s.clarity);
+      gl.uniform1f(
+        f.u.u_clarityLod,
+        Math.max(0, Math.min(Math.log2(Math.max(this.pw, this.ph) / 48), Math.log2(Math.max(this.pw, this.ph)))),
+      );
+      gl.uniform3fv(f.u.u_gain, s.gain);
+      gl.uniform1f(f.u.u_deCast, s.deCast);
+      gl.uniform1f(f.u.u_sat, s.saturation);
+      gl.uniform1f(f.u.u_vib, s.vibrance);
+      gl.uniform1i(f.u.u_mode, toScope ? 0 : view.mode);
+      gl.uniform1f(f.u.u_split, view.split);
+      gl.uniform1i(f.u.u_clip, !toScope && view.clip ? 1 : 0);
+      gl.uniform1f(f.u.u_seed, (this.seed = (this.seed + 0.618) % 1));
+    });
+  }
+
+  /** Final image at analysis size (no split, no overlay) — histogram & tests. */
+  readScope(s: FrameState): Uint8Array {
+    const gl = this.gl;
+    this.finish(s, RESULT_VIEW, true);
+    const out = new Uint8Array(this.sw * this.sh * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scope!.fb);
+    gl.readPixels(0, 0, this.sw, this.sh, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+  }
+
+  private bind(unit: number, t: Tex, name: string, p: Program) {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.uniform1i(p.u[name], unit);
+  }
+
+  private pass(p: Program, dst: Target | null, setup: () => void) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+    gl.viewport(0, 0, dst ? dst.w : this.pw, dst ? dst.h : this.ph);
+    gl.useProgram(p.prog);
+    gl.bindVertexArray(this.vao);
+    setup();
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  dispose() {
+    const gl = this.gl;
+    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve])
+      destroy(gl, t);
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+  }
+}
+
+/**
+ * One source → analysis → render loop. Used identically by the live preview,
+ * photo export and video export, so what you see is what you export.
+ */
+export class Processor {
+  readonly renderer: Renderer;
+  readonly engine = new AutoEngine();
+  state: FrameState | null = null;
+  lastFrameMs = 0;
+
+  constructor(canvas: Canvas, opts: { preserve?: boolean } = {}) {
+    this.renderer = new Renderer(canvas, opts);
+  }
+
+  /** Upload a frame, analyse it, and render. `source` null re-uses the last upload. */
+  frame(source: TexImageSource | null, w: number, h: number, step: StepOptions, view: View): FrameState {
+    const t0 = performance.now();
+    const r = this.renderer;
+    if (source) r.upload(source, w, h);
+    const small = r.readSmall();
+    this.state = this.engine.step(small, r.sw, r.sh, step);
+    r.grade(this.state);
+    r.finish(this.state, view);
+    this.lastFrameMs = performance.now() - t0;
+    return this.state;
+  }
+
+  /** Re-draw with a new view (split, overlay) without re-grading. */
+  redraw(view: View) {
+    if (this.state) this.renderer.finish(this.state, view);
+  }
+}

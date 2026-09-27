@@ -1,23 +1,25 @@
 {
   "name": "underwater-recovery",
   "private": true,
-  "version": "0.1.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types test/pipeline.test.ts",
+    "test": "node --experimental-strip-types test/engine.test.ts",
+    "test:legacy": "node --experimental-strip-types test/pipeline.test.ts",
     "typecheck": "tsc -b && tsc -p tsconfig.test.json",
-    "bench": "node --experimental-strip-types bench/bench.ts",
-    "e2e:video": "node scripts/e2e-video.mjs"
+    "verify": "npm run build && node scripts/verify.mjs",
+    "bench:legacy": "node --experimental-strip-types bench/bench.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
+    "playwright": "^1.56.1",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   },
-  "description": "Browser-local automatic recovery of underwater photos",
+  "description": "Underwater Recovery Studio: GPU real-time recovery of underwater photos and video, with scene-tracking auto mode and pro controls, fully in the browser",
   "dependencies": {
     "mediabunny": "^1.60.0"
   }
