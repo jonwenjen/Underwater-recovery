@@ -2,6 +2,14 @@
 
 _Analysis of `main` @ `1f5b315` ("Add video recovery as a first-class mode"), 2026-09-27._
 
+> **Status (v2.0 "Studio"):** implemented as a redesign rather than patches —
+> P1/P2/P4 (GPU real-time pipeline, Bradford WB matrix), Q1 (Ancuti red
+> compensation), Q2 (haze-lines + guided filter, RCP water light), Q3
+> (eyedropper), Q4 (threshold-gated sharpen/denoise), Q5 (EMA tracking with
+> scene cuts), U1 (full-res export), U2 (transparent auto), U3 (stream to
+> disk, ETA), B1–B4 by construction, E1/E2 (CI, ground-truth verification).
+> Not done: Q6 (on-device ML), U4 (PWA), removal of the v1 files. See README.
+
 This document reviews the current codebase (≈2,400 lines of TypeScript across
 `src/`, `test/`, `bench/` and `scripts/`) and proposes concrete improvements,
 each with **why**, **how**, and an estimate of effort. Where a claim could be

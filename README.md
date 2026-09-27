@@ -1,142 +1,133 @@
-# 🌊 Underwater Recovery
+# 🌊 Underwater Recovery Studio
 
-Automatic recovery of underwater **photos and video**, running entirely in your
-browser. Fixes the four things that go wrong underwater:
+Real-time, high-quality recovery of underwater **photos and video**, entirely in
+your browser. Every slider change and every video frame is re-graded live on
+the GPU; an auto engine analyses each frame and **tracks the scene as the camera
+moves** — descending, panning, cutting from blue to green water — while every
+stage stays under professional manual control.
 
-| Problem | What the app does |
-|---|---|
-| Heavy blue / green cast | Gray-world white balance on LAB chroma, referenced against a neutral grey so colour-accurate photos are left alone |
-| Missing red & warm tones | Jaffe–McGlamery spectral expansion of the red channel, anchored at the observed maximum so nothing clips |
-| Low contrast / water haze | Dark channel prior dehazing with guided transmission, self-limiting so clean images are untouched |
-| Blurry fine detail | CLAHE on the luminance plane + edge-aware unsharp mask |
+**No server, no upload, no account.** Pixels never leave the tab.
 
-**No server, no upload, no account.** Every pixel is processed in a Web Worker
-in the tab. Nothing leaves your machine. Video is decoded, graded and re-encoded
-locally via WebCodecs; the file is never sent anywhere.
+![Studio — split before/after on a reef degraded by the Jaffe–McGlamery model](docs/screenshots/studio-photo.png)
 
 ## Quick start
 
 ```bash
 npm install
-npm run dev      # http://localhost:5173
-npm test         # numeric pipeline tests (no browser needed)
-npm run build    # typecheck + production bundle
-
-# video end-to-end test (drives a throwaway headless Chrome, never your own)
-node scripts/e2e-video.mjs http://localhost:4173/Underwater-recovery/ clip.mp4 out.mp4
+npm run dev        # http://localhost:5173
+npm test           # engine unit tests (Node, no browser)
+npm run verify     # build + end-to-end verification in headless Chromium
+npm run build      # typecheck + production bundle
 ```
 
-## Using it
+## What it does
 
-Drop photos in (or paste from the clipboard). The before/after slider compares
-them. Pick a preset or let auto mode tune itself, then adjust any stage by hand.
+| Problem | Stage | How |
+|---|---|---|
+| Missing reds | **Red compensation** | Ancuti et al. (2018): `R += α·(Ḡ−R̄)·(1−R)·G` — rebuilds red from green where the scene has signal; blue compensation for green water |
+| Blue / green cast | **White balance** | Grey-world illuminant → one **Bradford (von Kries) 3×3 matrix**; temperature / tint on top; **eyedropper** makes any tapped surface exactly neutral |
+| Water haze | **Dehaze** | Water light = the *dominant smooth hazy colour* (Red Channel Prior + texture); transmission from **haze-lines** (Berman et al.); refined by a **guided filter** and upsampled edge-aware on the GPU; acts on luminance, keeps balanced chroma; open water is re-tinted to *clear* water instead of clipped |
+| Distance colour loss | **Distance compensation** | Red lifted in proportion to `(1−t)` — farther objects lost more |
+| Low contrast | **Exposure → CLAHE → clarity** | Log-average auto exposure with a dead zone; CLAHE on luminance only, scaled down when dehaze already restored contrast |
+| Soft detail / particles | **Sharpen + denoise** | Threshold-gated: edges above the threshold are sharpened, flat water below it is smoothed (backscatter) |
+| Tone & colour | **Curve + vibrance** | Levels (auto 0.3 / 99.7 % percentiles), shadows / highlights, contrast, vibrance, saturation, mid-tone de-cast, 8-bit dither |
 
-- **Auto** — scales every correction by how strongly the image actually reads as
-  underwater, so a strobe-lit shot with its reds intact is not pushed into neon.
-- **深藍海水 / 綠水 / 混濁近攝 / 淺水自然** — fixed starting points for common
-  conditions. Tweak from there.
-- Batch: drop many files, switch between them in the strip, then 下載全部.
+### Auto mode that follows the video
 
-## Video
+- Each frame is read back at 192 px; a CPU **mirror** of the shader pipeline
+  derives every parameter stage by stage (≈ 3 ms on a laptop).
+- Global values (illuminant, water light, exposure, compensation…) are
+  smoothed with an exponential moving average — the **反應時間** slider sets its
+  time constant — so the grade glides as you descend instead of flickering.
+- **Scene cuts** (soft colour-histogram distance) snap the tracker instantly;
+  camera pans do not.
+- Spatial maps (transmission, CLAHE tiles) are recomputed every frame so they
+  move with the picture.
 
-The 影片 tab takes MP4 / WebM / MOV and runs the *same* pipeline over every frame,
-with the same presets and sliders. Audio is passed through untouched.
+### Professional control
 
-- **Preview** is a scrub bar, not live playback. The graded pipeline runs at
-  roughly 45 ms per 640×360 frame, so real-time preview is not reachable in
-  JavaScript — you get a still frame at the playhead plus the real parameters.
-- **Export** decodes, grades and re-encodes offline with a progress bar and a
-  cancel button. Cost is roughly linear in frames: expect about a minute for a
-  10-second 720p 30 fps clip.
-- Parameters are analysed **once**, from the first few frames, and held for the
-  whole clip. Per-frame auto-analysis flickers, because underwater statistics
-  swing with every passing shadow.
-- Choose the output size (720p / 1080p / 1440p / 2160p / original) and MP4 or
-  WebM. Frames are resampled to the target size *before* grading, so a 4K source
-  is not processed at 4K.
+- Every auto-driven slider shows the value **auto is applying right now**
+  (amber). Drag it and that one value becomes manual; press **A** to hand it back.
+  Double-click a label to reset it. Turn the master switch off and every value
+  freezes where auto left it.
+- Presets (全自動 / 深藍海水 / 綠水 / 混濁近攝 / 閃燈淺水) lock a few values and
+  leave the rest on auto.
+- Split / result / original views, clipping warning overlay, live RGB
+  histogram, water-light & illuminant swatches, per-frame timing.
+- **Export at full resolution** (JPEG / PNG / WebP) and video to MP4 or WebM,
+  optionally streamed straight to disk; the exporter runs the *same* processor
+  and tracker as the preview, so what you see is what you get.
 
-Implementation notes worth knowing if you touch this code:
+## Verified, not just tested
 
-- `src/video.ts` owns decode/encode. `src/video.worker.ts` owns the per-frame
-  grading. `src/controls.ts` is the shared slider/preset builder.
-- mediabunny does **not** pre-scale samples before calling the `process`
-  callback, and the encoder takes its dimensions from the sample you return — so
-  the scale happens by hand inside the callback. Passing `width`/`height` alone
-  silently does nothing.
-- A `VideoSample` is not a `CanvasImageSource`; draw it with `sample.draw(...)`.
-- `quality` must be a `Quality` instance (`QUALITY_HIGH`), not a string. The
-  pipeline sharpens, and sharpening amplifies compression artefacts, so this is
-  not cosmetic.
+`npm run verify` drives the real built app in headless Chromium (WebGL2 via
+SwiftShader, WebCodecs VP9) against scenes with **known ground truth**: a reef
+rendered in true colour, then degraded with the Jaffe–McGlamery image-formation
+model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
+(30 / 30 passing):
 
-## How the pipeline works
+| Check | Result |
+|---|---|
+| Colour error vs ground truth (chromaticity L1, surfaces) | **0.532 → 0.104 (80 % better)** |
+| Blue cast, 75 %+ of the way to truth | 42.0 → −10.8 (truth −14.1) |
+| Red / contrast | 37.6 → 103.6 / 17.9 → 45.6 |
+| Eyedropper on a white slate | chroma error 0.042 → **0.005** |
+| Detail vs truth local contrast | 1.65× — crisp, not crunchy (1.2–2.0× window) |
+| Clean (non-underwater) photo | not flagged (0.19); colour change 0.022 |
+| Full-res export vs preview | max channel-mean difference 0.1 / 255 |
+| Video: descent 5 → 14 m | illuminant tracked smoothly (max step 0.001), no false cuts |
+| Video: blue → green cut at 3.0 s | cut detected at 3.0 s; green water & blue compensation engage |
+| Video export | 150 / 150 frames, VP9 640×360, casts corrected in both scenes |
+| Phone layout (390 px) | no horizontal scroll |
 
-Photometric stages run in **linear light**, where the absorption and scattering
-model is physically meaningful; perceptual stages run on **sRGB-encoded** values,
-where CLAHE and unsharp actually do something:
+`test/engine.test.ts` (26 checks) covers the colour math, LUTs, guided
+filter, recovery goals on the CPU mirror, manual overrides, EMA tracking,
+scene cuts, the eyedropper, and the analysis time budget.
+
+## Architecture
 
 ```
-sRGB ─▶ linear
-  1. white balance   LAB a/b shifted by the measured cast vs a neutral grey
-  2. red restoration red expanded toward its observed max, gated on real deficit
-  3. dehazing        dark channel prior, omega scaled by measured haze
-linear ─▶ sRGB
-  4. CLAHE           local contrast, luminance only, mean preserved
-  5. unsharp         edge detail
-  6. de-cast guard   mid-tone-weighted grey-world trim
-  7. tone            levels, gamma, saturation
+source ─upload+mips─▶ 192 px readback ─▶ AutoEngine.step (CPU mirror + tracker)
+                                              │ uniforms · guided coefficients · CLAHE LUTs · tone curve
+source ─────────────▶ GRADE ─mips─▶ BLUR H ─▶ BLUR V ─▶ FINAL ─▶ canvas / export
+                      (comp, WB, dehaze,       (detail,  (detail, clarity, de-cast,
+                       exposure, CLAHE)         σ px)     curve, colour, dither, split)
 ```
 
-### Implementation notes worth knowing
+| File | Role |
+|---|---|
+| `src/engine/auto.ts` | Analysis, CPU mirror, temporal tracker, scene cuts, eyedropper |
+| `src/engine/shaders.ts` | GLSL for the full-resolution passes (kept in lock-step with `auto.ts`) |
+| `src/engine/renderer.ts` | WebGL2 renderer and the `Processor` loop shared by preview and export |
+| `src/engine/color.ts`, `filters.ts`, `luts.ts` | Colour math, guided / box / min filters, CLAHE & tone-curve LUTs |
+| `src/engine/params.ts` | Every control: range, default, auto or manual, presets |
+| `src/engine/export.ts` | Full-res photo export, video export (mediabunny, lazy-loaded) |
+| `src/app.ts`, `src/app.css` | Studio UI |
+| `scripts/verify.mjs`, `scripts/verify-scene.js` | End-to-end verification with ground-truth scenes |
 
-- **Red expansion is anchored.** `f(v) = tr · (v/tr)^(1-s)` satisfies `f(0)=0`
-  and `f(tr)=tr`, so it widens a compressed range without inventing light or
-  blowing out already-bright pixels. It is also gated on a red deficit measured
-  *before* white balance, since WB equalises the channel means and would
-  otherwise erase the signal.
-- **CLAHE output is written back into the colour planes.** Computing it on `L`
-  and stopping there is a silent no-op; the new luminance has to be pushed back
-  through a ratio that preserves chroma.
-- **Dehazing is self-limiting.** The dark channel prior assumes the dark channel
-  sits well below the atmospheric light. In a clean image it does not, and full
-  strength would collapse the frame. `omega` is scaled by measured haze, so a
-  clean scene gets a no-op.
-- **The de-cast is mid-tone weighted.** A flat global gain chases whatever is
-  brightest (often a subject) and leaves deep shadows — which carry almost no
-  red signal — tinted purple.
-- **An sRGB grey is not LAB-neutral under D65.** The white balance measures the
-  chroma of a neutral grey at the same brightness and subtracts it, so a
-  colour-accurate photo is not tinted.
-
-## Tests
-
-`test/pipeline.test.ts` runs the real pipeline over a synthetic underwater frame
-and a neutral-grey frame, asserting all four recovery goals numerically, plus two
-regression guards that caught real bugs during development:
-
-- a neutral grey must not be flagged underwater, and must stay grey
-- a no-op configuration must not change a single byte
+The v1 CPU pipeline (`src/main.ts`, `pipeline.ts`, `video.ts`, workers) is no
+longer bundled; it stays in the tree for reference and `npm run test:legacy`.
 
 ## Honest limitations
 
-- **Red is guessed, not recovered.** Water physically absorbs red; that
-  information is gone. A deep-learning model (UIEB / Water-Net class) will
-  generally look better, but needs a server or a large WASM runtime. This is a
-  deliberate trade for a private, offline, dependency-free tool.
-- Deep shadows in a strobe-lit scene can keep a residual purple cast, and very
-  turbid water still fights you. The sliders are there for that.
-- Images are processed at up to 1600 px on the long edge; the original file is
-  not written back.
-- Video re-encodes rather than stream-copying the video track, so quality is
-  re-quantised. Audio is copied, not re-encoded. Codec support follows
-  WebCodecs: H.264 everywhere, VP9/AV1 where the browser offers them.
-- Export runs on the main thread's worker pool and will keep a laptop busy for
-  the length of the export. There is no GPU path.
+- **Red that the water fully absorbed is inferred, not recovered.** At 8 m the
+  test reef's corals keep only ~3 % of their red; compensation brings the red
+  chromaticity from 0.23 to 0.38 against a true 0.58.
+- The live preview needs WebGL2 (every current browser). Video export needs
+  WebCodecs; H.264 availability depends on the browser (Chrome / Edge / Safari),
+  VP9 / AV1 are widely available.
+- The verification GPU is software (SwiftShader), so its timings (≈ 1 s per
+  1600×1000 frame) say nothing about real hardware; on a real GPU the full-res
+  passes cost a few milliseconds.
+- Rotated phone videos keep their rotation as container metadata on export;
+  this path has not been verified on real rotated footage yet.
 
 ## References
 
-- Jaffe & McGlamery — underwater imaging model
-- He, Sun & Tang — dark channel prior dehazing
-- Zuiderveld — CLAHE
-- OpenCV, *Guide to Underwater Image Enhancement* — stage ordering and defaults
+Ancuti et al. — *Color Balance and Fusion for Underwater Image Enhancement* (TIP 2018) ·
+Galdran et al. — *Automatic Red-Channel Underwater Image Restoration* (JVCIR 2015) ·
+Berman et al. — *Non-Local Image Dehazing* (CVPR 2016), *Underwater Single Image Color Restoration Using Haze-Lines* (BMVC 2017) ·
+He, Sun & Tang — *Guided Image Filtering* (TPAMI 2013), *Fast Guided Filter* (2015) ·
+Zuiderveld — CLAHE · Jaffe & McGlamery — underwater imaging model
 
 MIT licensed.
