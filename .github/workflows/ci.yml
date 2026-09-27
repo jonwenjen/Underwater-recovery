@@ -18,6 +18,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,6 +46,7 @@ jobs:
     # End-to-end on the real production build in headless Chromium: WebGL2
     # (SwiftShader) + WebCodecs (VP9), ground-truth photo and video scenes.
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -52,7 +54,18 @@ jobs:
           node-version: 26
           cache: npm
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      # The runner image ships Google Chrome with all its system libraries;
+      # `playwright install --with-deps` instead goes through apt and once hung
+      # for 18+ minutes. Fall back to Playwright's Chromium (no apt) only if
+      # Chrome is missing.
+      - name: Locate Chrome
+        run: |
+          if [ -x /usr/bin/google-chrome ]; then
+            echo "CHROME_PATH=/usr/bin/google-chrome" >> "$GITHUB_ENV"
+            /usr/bin/google-chrome --version
+          else
+            npx playwright install chromium
+          fi
       - run: npm run verify
       - uses: actions/upload-artifact@v4
         if: always()

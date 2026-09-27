@@ -42,7 +42,11 @@ await new Promise((res, rej) => {
   });
 });
 
+// CHROME_PATH: use an installed Chrome (CI uses the runner's preinstalled
+// /usr/bin/google-chrome, which needs no apt dependency step); otherwise
+// Playwright's bundled Chromium.
 const browser = await chromium.launch({
+  executablePath: process.env.CHROME_PATH || undefined,
   args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'],
 });
 const done = async (code) => {
