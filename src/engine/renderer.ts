@@ -12,7 +12,17 @@ import { ANALYSIS_EDGE, AutoEngine, DEHAZE_CHROMA, T0, type FrameState, type Ste
 import { toGLMat3 } from './color.ts';
 import { destroy, program, target, texture, type GL, type Program, type Target, type Tex } from './gl.ts';
 import { CLAHE_BINS, CURVE_N } from './luts.ts';
-import { BLUR_FS, COPY_FS, FINAL_FS, GRADE_FS } from './shaders.ts';
+import { buildCurveLut, HSL_CENTERS, identityLook, isIdentityCurves, isIdentityHsl, LOOK_N, type Look } from './look.ts';
+import { BLUR_FS, COPY_FS, FINAL_FS, GRADE_FS, PRE_FS } from './shaders.ts';
+
+/** Quarter turns clockwise (0–3) and a horizontal mirror, applied before everything else. */
+export interface Orient {
+  rot: 0 | 1 | 2 | 3;
+  flip: boolean;
+}
+export const NO_ORIENT: Orient = { rot: 0, flip: false };
+/** Output size of a w×h source after `o`. */
+export const orientedSize = (w: number, h: number, o: Orient): [number, number] => (o.rot % 2 ? [h, w] : [w, h]);
 
 export interface View {
   mode: 0 | 1 | 2; // result | split | original
@@ -28,7 +38,7 @@ export class Renderer {
   readonly canvas: Canvas;
   readonly floatTargets: boolean;
   readonly maxTexture: number;
-  private progs: { copy: Program; grade: Program; blur: Program; final: Program };
+  private progs: { copy: Program; grade: Program; blur: Program; final: Program; pre: Program };
   private vao: WebGLVertexArrayObject;
   private src: Tex | null = null;
   private small: Target | null = null;
@@ -39,6 +49,13 @@ export class Renderer {
   private coef: Tex | null = null;
   private lut: Tex | null = null;
   private curve: Tex;
+  private pre: Target | null = null;
+  private lookTex: Tex;
+  private look: Look = identityLook();
+  private lookCurves = false;
+  private lookHsl = false;
+  private orient: Orient = NO_ORIENT;
+  private smallKey = '';
   srcW = 0;
   srcH = 0;
   pw = 0;
@@ -66,9 +83,50 @@ export class Renderer {
       grade: program(gl, GRADE_FS),
       blur: program(gl, BLUR_FS),
       final: program(gl, FINAL_FS),
+      pre: program(gl, PRE_FS),
     };
     this.vao = gl.createVertexArray()!;
     this.curve = texture(gl, CURVE_N, 1, gl.R16F, gl.RED, gl.FLOAT);
+    this.lookTex = texture(gl, LOOK_N, 1, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    this.setLook(this.look);
+  }
+
+  /** Rotation / flip. Takes effect on the next `frame` (analysis targets follow). */
+  setOrient(o: Orient) {
+    this.orient = { rot: o.rot, flip: o.flip };
+  }
+  get outW() {
+    return orientedSize(this.srcW, this.srcH, this.orient)[0];
+  }
+  get outH() {
+    return orientedSize(this.srcW, this.srcH, this.orient)[1];
+  }
+
+  /** User curves + HSL. Cheap: only the final pass reads them. */
+  setLook(look: Look) {
+    const gl = this.gl;
+    this.look = look;
+    this.lookCurves = !isIdentityCurves(look.curves);
+    this.lookHsl = !isIdentityHsl(look.hsl);
+    gl.bindTexture(gl.TEXTURE_2D, this.lookTex.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, LOOK_N, 1, 0, gl.RGBA, gl.FLOAT, buildCurveLut(look.curves));
+  }
+
+  /** Analysis-size targets follow the *oriented* frame. */
+  private ensureSmall() {
+    const gl = this.gl;
+    const w = this.outW,
+      h = this.outH;
+    const key = `${w}x${h}`;
+    if (key === this.smallKey) return;
+    this.smallKey = key;
+    const s = Math.min(1, ANALYSIS_EDGE / Math.max(w, h));
+    this.sw = Math.max(8, Math.round(w * s));
+    this.sh = Math.max(8, Math.round(h * s));
+    destroy(gl, this.small);
+    destroy(gl, this.scope);
+    this.small = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
+    this.scope = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
   }
 
   /** Upload a new source frame (image, video element, VideoFrame, canvas). */
@@ -79,13 +137,6 @@ export class Renderer {
       this.src = texture(gl, w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, { mips: true });
       this.srcW = w;
       this.srcH = h;
-      const s = Math.min(1, ANALYSIS_EDGE / Math.max(w, h));
-      this.sw = Math.max(8, Math.round(w * s));
-      this.sh = Math.max(8, Math.round(h * s));
-      destroy(gl, this.small);
-      destroy(gl, this.scope);
-      this.small = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
-      this.scope = target(gl, texture(gl, this.sw, this.sh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
     }
     gl.bindTexture(gl.TEXTURE_2D, this.src.tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -102,8 +153,9 @@ export class Renderer {
     this.ph = ph;
     this.canvas.width = pw;
     this.canvas.height = ph;
-    for (const t of [this.graded, this.blurA, this.blurB]) destroy(gl, t);
+    for (const t of [this.graded, this.blurA, this.blurB, this.pre]) destroy(gl, t);
     const f = this.floatTargets;
+    this.pre = target(gl, texture(gl, pw, ph, f ? gl.RGBA16F : gl.RGBA8, gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE));
     this.graded = target(
       gl,
       texture(gl, pw, ph, f ? gl.RGBA16F : gl.RGBA8, gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, { mips: true }),
@@ -117,6 +169,7 @@ export class Renderer {
   /** Render the source into the 256 px analysis target and read it back. */
   readSmall(): Uint8Array {
     const gl = this.gl;
+    this.ensureSmall();
     const out = new Uint8Array(this.sw * this.sh * 4);
     this.pass(this.progs.copy, this.small!, () => this.bind(0, this.src!, 'u_src', this.progs.copy));
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.small!.fb);
@@ -151,9 +204,22 @@ export class Renderer {
   grade(s: FrameState) {
     const gl = this.gl;
     this.uploadState(s);
+    const restore = s.restore > 0.001;
+    if (restore) {
+      const pp = this.progs.pre;
+      this.pass(pp, this.pre!, () => {
+        this.bind(0, this.src!, 'u_src', pp);
+        gl.uniform2f(pp.u.u_px, 1 / this.pw, 1 / this.ph);
+        gl.uniform1f(pp.u.u_sigL, 0.012 + 0.06 * s.restore);
+        gl.uniform1f(pp.u.u_amt, Math.min(1, s.restore * 2));
+      });
+    }
     const g = this.progs.grade;
     this.pass(g, this.graded!, () => {
       this.bind(0, this.src!, 'u_src', g);
+      this.bind(3, this.pre!, 'u_pre', g);
+      gl.uniform1f(g.u.u_direct, restore ? 1 : 0);
+      gl.uniform1f(g.u.u_shoulder, s.shoulder);
       this.bind(1, this.coef!, 'u_coef', g);
       this.bind(2, this.lut!, 'u_lut', g);
       gl.uniform1f(g.u.u_aR, s.aR);
@@ -225,6 +291,15 @@ export class Renderer {
       gl.uniform1f(f.u.u_vib, s.vibrance);
       gl.uniform1f(f.u.u_chroma, s.chromaGain);
       gl.uniform1f(f.u.u_warm, s.warmGain);
+      this.bind(4, this.lookTex, 'u_look', f);
+      gl.uniform1f(f.u.u_lookOn, this.lookCurves ? 1 : 0);
+      gl.uniform1f(f.u.u_hslOn, this.lookHsl ? 1 : 0);
+      if (this.lookHsl) {
+        gl.uniform1fv(f.u.u_hslC, HSL_CENTERS);
+        gl.uniform1fv(f.u.u_hslH, this.look.hsl.h);
+        gl.uniform1fv(f.u.u_hslS, this.look.hsl.s);
+        gl.uniform1fv(f.u.u_hslL, this.look.hsl.l);
+      }
       gl.uniform1i(f.u.u_mode, toScope ? 0 : view.mode);
       gl.uniform1f(f.u.u_split, view.split);
       gl.uniform1i(f.u.u_clip, !toScope && view.clip ? 1 : 0);
@@ -256,13 +331,15 @@ export class Renderer {
     gl.viewport(0, 0, dst ? dst.w : this.pw, dst ? dst.h : this.ph);
     gl.useProgram(p.prog);
     gl.bindVertexArray(this.vao);
+    if (p.u.u_rot) gl.uniform1i(p.u.u_rot, this.orient.rot);
+    if (p.u.u_flipH) gl.uniform1f(p.u.u_flipH, this.orient.flip ? 1 : 0);
     setup();
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
   dispose() {
     const gl = this.gl;
-    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve])
+    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve, this.pre, this.lookTex])
       destroy(gl, t);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
@@ -293,6 +370,13 @@ export class Processor {
     r.finish(this.state, view);
     this.lastFrameMs = performance.now() - t0;
     return this.state;
+  }
+
+  setOrient(o: Orient) {
+    this.renderer.setOrient(o);
+  }
+  setLook(l: Look) {
+    this.renderer.setLook(l);
   }
 
   /** Re-draw with a new view (split, overlay) without re-grading. */

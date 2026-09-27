@@ -36,6 +36,7 @@ export interface Params {
   sharpenRadius: number;
   threshold: number;
   denoise: number;
+  restore: number;
   // colour
   vibrance: number;
   saturation: number;
@@ -88,6 +89,7 @@ export const DEFAULT_PARAMS: Params = {
   sharpenRadius: 1.2,
   threshold: 0.03,
   denoise: 0.35,
+  restore: 0,
   vibrance: 0.2,
   saturation: 1,
   deCast: 0.4,
@@ -148,6 +150,7 @@ export const GROUPS: Group[] = [
       { key: 'sharpenRadius', label: '銳化半徑 px', min: 0.5, max: 3, step: 0.05, hint: '細節尺度' },
       { key: 'threshold', label: '銳化門檻', min: 0, max: 0.1, step: 0.001, hint: '低於門檻視為雜訊，不銳化' },
       { key: 'denoise', label: '降噪（懸浮粒子）', min: 0, max: 1, step: 0.01, hint: '平坦水域的亮度雜訊壓平' },
+      { key: 'restore', label: '🛠 畫質修復', min: 0, max: 1, step: 0.01, hint: '保邊雙邊濾波：去高感光雜訊、彩色斑點與壓縮色塊（低畫質／舊影片建議 0.4–0.8）' },
     ],
   },
   {
@@ -171,14 +174,35 @@ export const SLIDERS: SliderDef[] = GROUPS.flatMap((g) => g.sliders);
 
 export interface Preset {
   label: string;
+  hint: string;
   /** Values applied and locked. Keys not listed return to auto (or default). */
   set: Partial<Record<NumKey, number>>;
+  /** Also clear 豐富色彩, 畫質修復, curves and HSL: a true starting point. */
+  raw?: boolean;
 }
 
+/** Every stage neutral: with this the pipeline is an identity (see tests). */
+const RAW: Partial<Record<NumKey, number>> = {
+  redComp: 0, blueComp: 0, dehaze: 0, depthColor: 0, waterTint: 1,
+  wbStrength: 0, temp: 0, tint: 0,
+  exposure: 0, contrast: 0, highlights: 0, shadows: 0, blacks: 0, whites: 1,
+  clahe: 0, clarity: 0, sharpen: 0, denoise: 0, restore: 0,
+  vibrance: 0, saturation: 1, deCast: 0, vivid: 0,
+};
+
 export const PRESETS: Record<string, Preset> = {
-  auto: { label: '全自動', set: {} },
-  blue: { label: '深藍海水', set: { redComp: 1.4, depthColor: 0.45, dehaze: 0.85, vibrance: 0.35 } },
-  green: { label: '綠水／湖', set: { blueComp: 0.8, redComp: 1.1, tint: 0.25, dehaze: 0.8 } },
-  murky: { label: '混濁近攝', set: { dehaze: 0.95, clahe: 0.6, denoise: 0.55, sharpen: 0.35, clarity: 0.3 } },
-  strobe: { label: '閃燈／淺水', set: { redComp: 0.3, depthColor: 0, dehaze: 0.35, wbStrength: 0.55, clahe: 0.25 } },
+  auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
+  raw: { label: '原始', hint: '所有校正歸零、顯示原圖，從這裡手動調整（曲線／HSL 也重設）', set: RAW, raw: true },
+  sunny: {
+    label: '淺水／陽光',
+    hint: '陽光射入的淺水：保護光束與水面高光、提亮暗部、加強光紋清晰度、保留清透藍綠水色；紅色與去霧仍由自動依畫面量測',
+    // Measured on the shallow ground-truth scenes: locking dehaze low or red
+    // compensation down made colour *worse* (water drifts violet), so those
+    // stay automatic — the preset only does what is specific to sunlight.
+    set: { highlights: -0.5, whites: 1, shadows: 0.2, clarity: 0.25, depthColor: 0.05, waterTint: 0.75, vibrance: 0.3 },
+  },
+  blue: { label: '深藍海水', hint: '深水、強烈藍色偏色', set: { redComp: 1.4, depthColor: 0.45, dehaze: 0.85, vibrance: 0.35 } },
+  green: { label: '綠水／湖', hint: '湖泊、藻類多的綠水', set: { blueComp: 0.8, redComp: 1.1, tint: 0.25, dehaze: 0.8 } },
+  murky: { label: '混濁近攝', hint: '能見度差、懸浮粒子多', set: { dehaze: 0.95, clahe: 0.6, denoise: 0.55, sharpen: 0.35, clarity: 0.3, restore: 0.4 } },
+  strobe: { label: '閃燈', hint: '有閃燈／補光，紅色大多還在', set: { redComp: 0.3, depthColor: 0, dehaze: 0.35, wbStrength: 0.55, clahe: 0.25 } },
 };

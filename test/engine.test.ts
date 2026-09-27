@@ -9,7 +9,8 @@ import { ANALYSIS_EDGE, AutoEngine, gamutFit, mirrorRender, type FrameState } fr
 import { apply3, boostChroma, luma, srgbToLinear, toOklab, whiteBalanceMatrix, type Vec3 } from '../src/engine/color.ts';
 import { guidedCoefficients } from '../src/engine/filters.ts';
 import { buildClahe, buildCurve, sampleCurve } from '../src/engine/luts.ts';
-import { DEFAULT_PARAMS, type AutoKey, type Params } from '../src/engine/params.ts';
+import { applyHsl, buildCurveLut, curveFn, hslWeights, identityCurves, identityHsl, sampleCurveLut, type Pt } from '../src/engine/look.ts';
+import { DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -287,6 +288,73 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     if (Math.hypot(lab[1], lab[2]) > 0.02 && Math.abs(dh) > 0.05) hueKept = false;
   }
   check('gamut fit stays in sRGB and keeps hue', inGamut && hueKept);
+}
+
+/* ------------------------------------------------ presets, curves, HSL */
+
+{
+  // 「原始」: every stage neutral → the pipeline is an identity
+  const src = underwater('blue');
+  const params = { ...DEFAULT_PARAMS, ...PRESETS.raw.set } as Params;
+  const locked = new Set<AutoKey>(Object.keys(PRESETS.raw.set).filter(isAutoKey));
+  const st = new AutoEngine().step(src, W, H, { params, locked, dt: 0 });
+  const o = mirrorRender(src, W, H, st);
+  let maxd = 0;
+  for (let i = 0; i < W * H; i++)
+    for (let c = 0; c < 3; c++) maxd = Math.max(maxd, Math.abs(o[i * 3 + c] * 255 - src[i * 4 + c]));
+  check('「原始」 preset is an identity (≤ 1 level)', maxd <= 1.01, `max diff ${maxd.toFixed(2)} / 255`);
+  const sun = PRESETS.sunny.set;
+  check('「淺水／陽光」 protects highlights, sharpens caustics, leaves red & dehaze to auto',
+    (sun.highlights ?? 0) < 0 && (sun.clarity ?? 0) > DEFAULT_PARAMS.clarity && sun.redComp === undefined && sun.dehaze === undefined);
+}
+{
+  const id = buildCurveLut(identityCurves());
+  let err = 0;
+  for (let i = 0; i < 256; i++) for (let c = 0; c < 3; c++) err = Math.max(err, Math.abs(id[i * 4 + c] - i / 255));
+  check('identity curves are an identity LUT', err < 1e-6);
+  let mono = true;
+  for (const pts of [[[0, 0], [0.3, 0.6], [0.35, 0.2], [1, 1]], [[0.1, 0.9], [0.5, 0.1], [0.9, 0.95]], [[0, 0], [0.2, 0.8], [0.8, 0.2], [1, 1]]] as Pt[][]) {
+    const f = curveFn(pts);
+    const ys = Array.from({ length: 101 }, (_, i) => f(i / 100));
+    // monotone between points: no value outside the neighbouring points' range
+    for (let i = 0; i < 101; i++) if (ys[i] < -1e-9 || ys[i] > 1 + 1e-9) mono = false;
+  }
+  const f = curveFn([[0, 0], [0.5, 0.7], [1, 1]]);
+  let inc = true;
+  for (let i = 1; i <= 100; i++) if (f(i / 100) < f((i - 1) / 100) - 1e-9) inc = false;
+  check('curves stay in range; rising points give a rising curve (no overshoot)', mono && inc && Math.abs(f(0.5) - 0.7) < 1e-9);
+  const lut = buildCurveLut({ ...identityCurves(), r: [[0, 0], [0.5, 0.8], [1, 1]] });
+  check('R curve moves red only', sampleCurveLut(lut, 0, 0.5) > 0.75 && Math.abs(sampleCurveLut(lut, 1, 0.5) - 0.5) < 1e-3 && Math.abs(sampleCurveLut(lut, 2, 0.5) - 0.5) < 1e-3);
+  const both = buildCurveLut({ ...identityCurves(), rgb: [[0, 0], [0.5, 0.25], [1, 1]], r: [[0, 0], [0.5, 0.8], [1, 1]] });
+  check('channel curve applies before the RGB master', Math.abs(sampleCurveLut(both, 0, 0.5) - curveFn([[0, 0], [0.5, 0.25], [1, 1]])(0.8)) < 2e-3);
+}
+{
+  const coral: Vec3 = [0.85, 0.2, 0.18], water: Vec3 = [0.1, 0.35, 0.75], grey: Vec3 = [0.5, 0.5, 0.5];
+  const same = (a: Vec3, b: Vec3, tol: number) => a.every((v, i) => Math.abs(v - b[i]) <= tol);
+  check('identity HSL leaves colours unchanged', same(applyHsl(coral, identityHsl()), coral, 1e-4) && same(applyHsl(water, identityHsl()), water, 1e-4));
+  const blueOff = { ...identityHsl(), s: [0, 0, 0, 0, 0, -100, 0, 0] };
+  const chroma = (c: Vec3) => { const l = toOklab(srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2])); return Math.hypot(l[1], l[2]); };
+  const w2 = applyHsl(water, blueOff), c2 = applyHsl(coral, blueOff);
+  check('HSL 藍 −100 desaturates blue, leaves red alone', chroma(w2) < 0.3 * chroma(water) && same(c2, coral, 2e-3), `blue C ${chroma(water).toFixed(3)} → ${chroma(w2).toFixed(3)}`);
+  // recovered water is typically a *pale* blue (OKLab C ≈ 0.025): it must still respond fully
+  const paleWater: Vec3 = [0.36, 0.40, 0.47];
+  const pw2 = applyHsl(paleWater, blueOff);
+  check('HSL works on pale water blue, not only on saturated colour', chroma(pw2) < 0.3 * chroma(paleWater), `C ${chroma(paleWater).toFixed(3)} → ${chroma(pw2).toFixed(3)}`);
+  const redHue = { ...identityHsl(), h: [100, 0, 0, 0, 0, 0, 0, 0] };
+  const hue = (c: Vec3) => { const l = toOklab(srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2])); return Math.atan2(l[2], l[1]); };
+  const c3 = applyHsl(coral, redHue);
+  check('HSL 紅 hue +100 turns red toward orange (+~30°)', (hue(c3) - hue(coral)) * 57.3 > 20, `${((hue(c3) - hue(coral)) * 57.3).toFixed(1)}°`);
+  const all = { h: new Array(8).fill(100), s: new Array(8).fill(100), l: new Array(8).fill(100) };
+  check('HSL never tints greys', same(applyHsl(grey, all), grey, 1e-4));
+  let inG = true;
+  for (const c of [coral, water, [0.98, 0.84, 0.18] as Vec3, [0.2, 0.9, 0.3] as Vec3]) {
+    const o = applyHsl(c, all);
+    if (Math.min(...o) < 0 || Math.max(...o) > 1) inG = false;
+  }
+  check('HSL extremes stay inside sRGB', inG);
+  let pou = true;
+  for (let h = -3.2; h < 3.3; h += 0.05) if (Math.abs(hslWeights(h).reduce((a, b) => a + b, 0) - 1) > 1e-9) pou = false;
+  check('HSL band weights always sum to 1 (no seams)', pou);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

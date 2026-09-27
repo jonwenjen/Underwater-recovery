@@ -532,3 +532,57 @@ footer {
   font-size: 0.78rem;
   line-height: 1.6;
 }
+
+/* ------------------------------------------------------------ look panels */
+.lookbox {
+  padding: 0 12px 12px;
+}
+.ctabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.ctabs button {
+  padding: 4px 10px;
+  font-size: 0.82rem;
+}
+.ctabs button[data-ch] {
+  color: var(--c);
+}
+.ctabs button.on {
+  border-color: var(--accent);
+  background: rgba(52, 211, 238, 0.14);
+}
+.ctabs .creset {
+  margin-left: auto;
+  color: var(--dim);
+}
+.curvecv {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  touch-action: none;
+  cursor: crosshair;
+}
+.chint {
+  margin: 6px 0 0;
+  font-size: 0.74rem;
+  color: var(--dim);
+}
+.hslrow .dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.note.tight {
+  margin: -4px 0 8px;
+}
+#flipH[aria-pressed='true'] {
+  background: rgba(52, 211, 238, 0.18);
+  color: var(--accent);
+}

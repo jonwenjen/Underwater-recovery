@@ -16,6 +16,17 @@ vec3 toSrgb(vec3 l) {
   l = clamp(l, 0.0, 1.0);
   return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l));
 }
+// user rotation (quarter turns clockwise) and horizontal flip: maps an
+// output-space uv to where it lives in the unrotated source texture
+uniform int u_rot;
+uniform float u_flipH;
+vec2 srcUV(vec2 uv) {
+  if (u_flipH > 0.5) uv.x = 1.0 - uv.x;
+  if (u_rot == 1) return vec2(uv.y, 1.0 - uv.x);
+  if (u_rot == 2) return vec2(1.0 - uv.x, 1.0 - uv.y);
+  if (u_rot == 3) return vec2(1.0 - uv.y, uv.x);
+  return uv;
+}
 vec3 shoulder(vec3 x) {
   const float k = 0.8;
   return mix(x, k + (1.0 - k) * tanh((x - k) / (1.0 - k)), step(vec3(k), x));
@@ -25,7 +36,7 @@ vec3 shoulder(vec3 x) {
 /** Downsample the source for analysis (mip-filtered) — plain copy. */
 export const COPY_FS = `${COMMON}
 uniform sampler2D u_src;
-void main() { o = vec4(texture(u_src, v_uv).rgb, 1.0); }
+void main() { o = vec4(texture(u_src, srcUV(v_uv)).rgb, 1.0); }
 `;
 
 /**
@@ -34,6 +45,9 @@ void main() { o = vec4(texture(u_src, v_uv).rgb, 1.0); }
  */
 export const GRADE_FS = `${COMMON}
 uniform sampler2D u_src;
+uniform sampler2D u_pre;    // 畫質修復 output, already oriented, at processing size
+uniform float u_direct;     // 1 = read u_pre instead of the source
+uniform float u_shoulder;   // highlight roll-off amount (0 when nothing lifts the image)
 uniform sampler2D u_coef;   // guided-filter mean coefficients (a, b) at analysis res
 uniform sampler2D u_lut;    // CLAHE maps: 256 wide, tiles*tiles rows
 uniform float u_aR, u_aB, u_dR, u_dB;
@@ -59,7 +73,7 @@ float claheMap(float L, vec2 uv) {
 }
 
 void main() {
-  vec3 c = toLin(texture(u_src, v_uv).rgb);
+  vec3 c = toLin(u_direct > 0.5 ? texture(u_pre, v_uv).rgb : texture(u_src, srcUV(v_uv)).rgb);
   // Ancuti compensation: borrow signal from green where the scene has it
   c.r = min(1.0, c.r + u_aR * u_dR * (1.0 - c.r) * c.g);
   c.b = min(1.0, c.b + u_aB * u_dB * (1.0 - c.b) * c.g);
@@ -78,7 +92,8 @@ void main() {
     c = mix(c * yr, j, u_dehazeChroma);
   }
   c *= u_post;
-  vec3 e = toSrgb(shoulder(c * u_exp));
+  vec3 ce = c * u_exp;
+  vec3 e = toSrgb(mix(ce, shoulder(ce), u_shoulder));
   float L = dot(e, LUMA);
   float L2 = L;
   if (u_claheMix > 0.0) {
@@ -124,6 +139,9 @@ uniform vec3 u_gain;
 uniform float u_deCast;
 uniform float u_sat, u_vib;
 uniform float u_chroma, u_warm;   // 豐富色彩: OKLab chroma gain, warm-hue extra
+uniform sampler2D u_look;         // user curves: 256×1, rgb = master(channel(x))
+uniform float u_lookOn, u_hslOn;
+uniform float u_hslC[8], u_hslH[8], u_hslS[8], u_hslL[8];
 uniform int u_mode;          // 0 result, 1 split, 2 original
 uniform float u_split;
 uniform int u_clip;          // highlight / shadow clipping overlay
@@ -175,6 +193,48 @@ vec3 gamutFit(vec3 lab, float k) {
   return clamp(fromOklab(vec3(lab.x, lab.yz * lo)), 0.0, 1.0);
 }
 
+// mirrors fitLab() in look.ts: shrink chroma until the colour is in sRGB
+vec3 fitLab(vec3 lab) {
+  vec3 c = fromOklab(lab);
+  if (min(c.r, min(c.g, c.b)) >= -1e-4 && max(c.r, max(c.g, c.b)) <= 1.0001) return c;
+  float lo = 0.0, hi = 1.0;
+  for (int i = 0; i < 6; i++) {
+    float mid = 0.5 * (lo + hi);
+    vec3 m = fromOklab(vec3(lab.x, lab.yz * mid));
+    if (min(m.r, min(m.g, m.b)) >= -1e-4 && max(m.r, max(m.g, m.b)) <= 1.0001) lo = mid;
+    else hi = mid;
+  }
+  return clamp(fromOklab(vec3(lab.x, lab.yz * lo)), 0.0, 1.0);
+}
+
+// mirrors applyHsl() in look.ts: 8 bands, partition-of-unity weights in OKLCh
+vec3 applyHsl(vec3 e) {
+  vec3 lab = oklab(toLin(e));
+  float C = length(lab.yz);
+  if (C < 1e-5) return e;
+  const float TAU = 6.28318531;
+  float h = atan(lab.z, lab.y);
+  float hh = mod(h, TAU);
+  int i0 = 7;
+  for (int i = 0; i < 7; i++) {
+    if (hh >= u_hslC[i] && hh < u_hslC[i + 1]) { i0 = i; break; }
+  }
+  float a, b;
+  if (i0 < 7) { a = u_hslC[i0]; b = u_hslC[i0 + 1]; }
+  else if (hh >= u_hslC[7]) { a = u_hslC[7]; b = u_hslC[0] + TAU; }
+  else { a = u_hslC[7] - TAU; b = u_hslC[0]; }
+  float t = smoothstep(0.0, 1.0, (hh - a) / (b - a));
+  int i1 = i0 == 7 ? 0 : i0 + 1;
+  float dh = (1.0 - t) * u_hslH[i0] + t * u_hslH[i1];
+  float ds = (1.0 - t) * u_hslS[i0] + t * u_hslS[i1];
+  float dl = (1.0 - t) * u_hslL[i0] + t * u_hslL[i1];
+  float colourful = smoothstep(0.003, 0.02, C);
+  float h2 = h + dh / 100.0 * 0.52359878 * colourful;
+  float C2 = C * max(0.0, 1.0 + ds / 100.0 * colourful);
+  float L2 = clamp(lab.x + dl / 100.0 * 0.2 * colourful, 0.0, 1.0);
+  return toSrgb(fitLab(vec3(L2, C2 * cos(h2), C2 * sin(h2))));
+}
+
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
   p += dot(p, p + 45.32 + u_seed);
@@ -183,7 +243,7 @@ float hash(vec2 p) {
 
 void main() {
   vec2 uv = vec2(v_uv.x, u_flipY > 0.5 ? 1.0 - v_uv.y : v_uv.y);
-  vec3 src = texture(u_src, uv).rgb;
+  vec3 src = texture(u_src, srcUV(uv)).rgb;
   if (u_mode == 2 || (u_mode == 1 && uv.x < u_split)) {
     o = vec4(src, 1.0);
   } else {
@@ -225,6 +285,13 @@ void main() {
         e = toSrgb(gamutFit(lab, boostChroma(C, atan(lab.z, lab.y)) / C));
       }
     }
+    // user look: curves (per channel, then RGB master), then HSL mixer
+    if (u_lookOn > 0.5) {
+      e = vec3(texture(u_look, vec2((e.r * 255.0 + 0.5) / 256.0, 0.5)).r,
+               texture(u_look, vec2((e.g * 255.0 + 0.5) / 256.0, 0.5)).g,
+               texture(u_look, vec2((e.b * 255.0 + 0.5) / 256.0, 0.5)).b);
+    }
+    if (u_hslOn > 0.5) e = applyHsl(e);
     if (u_clip == 1) {
       if (max(e.r, max(e.g, e.b)) > 0.996) e = vec3(1.0, 0.1, 0.3);
       else if (max(e.r, max(e.g, e.b)) < 0.004) e = vec3(0.1, 0.4, 1.0);
@@ -235,5 +302,42 @@ void main() {
     o = vec4(e, 1.0);
   }
   if (u_mode == 1 && abs(uv.x - u_split) * u_size.x < 1.0) o = vec4(1.0, 1.0, 1.0, 1.0);
+}
+`;
+
+/**
+ * 畫質修復 pre-pass (at processing resolution, output orientation):
+ * luminance gets a 5×5 bilateral (edges kept, grain and 8×8 compression
+ * steps smoothed); chroma gets a wider 5×5 at 2 px spacing with the same
+ * luminance edge-stop, which is what removes colour blotches and chroma noise
+ * without bleeding colour across edges.
+ */
+export const PRE_FS = `${COMMON}
+uniform sampler2D u_src;
+uniform vec2 u_px;      // one output pixel, in uv
+uniform float u_sigL;   // luminance range sigma
+uniform float u_amt;    // blend with the original
+void main() {
+  vec3 c0 = texture(u_src, srcUV(v_uv)).rgb;
+  float y0 = dot(c0, LUMA);
+  float sy = 0.0, wy = 0.0, wc = 0.0;
+  vec3 sc = vec3(0.0);
+  float k1 = 1.0 / (2.0 * u_sigL * u_sigL), k2 = k1 / 4.0;
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      vec2 off = vec2(float(dx), float(dy));
+      float sp = exp(-dot(off, off) / 4.5);
+      vec3 c1 = texture(u_src, srcUV(v_uv + off * u_px)).rgb;
+      float y1 = dot(c1, LUMA);
+      float w1 = sp * exp(-(y1 - y0) * (y1 - y0) * k1);
+      sy += y1 * w1; wy += w1;
+      vec3 c2 = texture(u_src, srcUV(v_uv + off * 2.0 * u_px)).rgb;
+      float y2 = dot(c2, LUMA);
+      float w2 = sp * exp(-(y2 - y0) * (y2 - y0) * k2);
+      sc += (c2 - y2) * w2; wc += w2;
+    }
+  }
+  vec3 outc = clamp(sy / wy + sc / wc, 0.0, 1.0);
+  o = vec4(mix(c0, outc, u_amt), 1.0);
 }
 `;

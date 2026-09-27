@@ -47,6 +47,11 @@
             <button id="clip" class="chip" aria-pressed="false" title="紅色＝高光溢出，藍色＝暗部死黑">過曝警告</button>
             <button id="dropper" class="chip" aria-pressed="false" title="點選畫面中應該是中性白／灰的物體（沙地、氣瓶、白板）">白點滴管</button>
             <button id="clearPick" class="chip hidden">清除白點</button>
+            <div class="seg" role="group" aria-label="旋轉與翻轉">
+              <button id="rotL" title="逆時針旋轉 90°" aria-label="逆時針旋轉 90°">⟲</button>
+              <button id="rotR" title="順時針旋轉 90°" aria-label="順時針旋轉 90°">⟳</button>
+              <button id="flipH" title="水平翻轉" aria-label="水平翻轉" aria-pressed="false">⇋</button>
+            </div>
             <label class="inline">
               預覽
               <select id="previewRes">
@@ -63,6 +68,16 @@
             <button id="play" class="primary">▶ 播放</button>
             <input type="range" id="seek" min="0" max="1000" value="0" aria-label="播放位置" />
             <span class="time" id="time">0:00 / 0:00</span>
+            <label class="inline">
+              速度
+              <select id="playRate" aria-label="預覽播放速度">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
           </div>
 
           <div class="strip hidden" id="strip"></div>
@@ -96,6 +111,15 @@
 
           <div id="groups"></div>
 
+          <details class="group" id="curvesGroup">
+            <summary>曲線（RGB／R／G／B）</summary>
+            <div class="lookbox" id="curves"></div>
+          </details>
+          <details class="group" id="hslGroup">
+            <summary>HSL（各色 色相／飽和度／明亮度）</summary>
+            <div class="lookbox" id="hsl"></div>
+          </details>
+
           <div class="card export">
             <h3>輸出</h3>
             <div id="photoExport">
@@ -126,6 +150,16 @@
                   <option value="webm">WebM</option>
                 </select>
               </label>
+              <label class="row"><span>速度</span>
+                <select id="vspeed">
+                  <option value="0.25">0.25×（慢動作）</option>
+                  <option value="0.5">0.5×（慢動作）</option>
+                  <option value="1" selected>1×（原速）</option>
+                  <option value="2">2×（快轉）</option>
+                  <option value="4">4×（快轉）</option>
+                </select>
+              </label>
+              <p class="note tight hidden" id="speedNote">變速輸出不含音軌</p>
               <label class="row check" id="diskRow"><input type="checkbox" id="toDisk" /> 直接寫入磁碟（長片建議，不佔記憶體）</label>
               <div class="progress hidden" id="vprogress"><div class="bar"><i id="vbar"></i></div><span id="vstat">0%</span></div>
               <div class="actions">
@@ -139,7 +173,7 @@
       </main>
 
       <footer>
-        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩。
+        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩 → 使用者曲線／HSL。可選：畫質修復（保邊去雜訊）、旋轉翻轉、變速輸出。
         影片自動追蹤：每幀分析、指數平滑、場景切換立即重算。MIT License · 影音 I/O：mediabunny
       </footer>
     </div>

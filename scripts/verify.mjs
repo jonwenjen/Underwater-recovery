@@ -282,6 +282,231 @@ try {
   });
   check('photo re-render timing recorded', bench.msPerFrame > 0, `${f1(bench.msPerFrame)} ms/frame at ${bench.size.join('×')} on SwiftShader (CPU-emulated GPU)`);
 
+  /* ====================================================== new controls */
+  console.log('\n— presets, rotation, curves, HSL, 畫質修復');
+  const feat = await page.evaluate(async () => {
+    const S = window.__scene;
+    const U = window.__uw;
+    const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+    const lab = (r, g, b) => {
+      const lr = lin(r / 255), lg = lin(g / 255), lb = lin(b / 255);
+      const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+      const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+      const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+      return [0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s, 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s, 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s];
+    };
+    const meanOver = (o, t, mask, f) => {
+      let a = 0, c = 0;
+      for (let y = 0; y < o.h; y++)
+        for (let x = 0; x < o.w; x++) {
+          const ti = Math.min(t.h - 1, Math.floor(((y + 0.5) / o.h) * t.h)) * t.w + Math.min(t.w - 1, Math.floor(((x + 0.5) / o.w) * t.w));
+          if (!mask(ti)) continue;
+          const i = (y * o.w + x) * 4;
+          a += f(o.px[i], o.px[i + 1], o.px[i + 2]);
+          c++;
+        }
+      return a / Math.max(1, c);
+    };
+    const chroma = (r, g, b) => { const l = lab(r, g, b); return Math.hypot(l[1], l[2]); };
+    const luma = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const out = {};
+    const W = 800, H = 500;
+    const t = S.truth(W, H);
+    await U.addFiles([await S.toFile(S.degrade(t, 'blue', 8), W, H, 'features.png')]);
+    U.preset('auto');
+    U.setView({ mode: 0 });
+
+    // 原始: output must be the source
+    U.preset('raw');
+    U.render();
+    const o0 = U.outputPixels(), s0 = U.sourcePixels();
+    let d = 0;
+    for (let i = 0; i < o0.px.length; i += 4) d += Math.abs(o0.px[i] - s0.px[i]) + Math.abs(o0.px[i + 1] - s0.px[i + 1]) + Math.abs(o0.px[i + 2] - s0.px[i + 2]);
+    out.rawDiff = d / (o0.px.length / 4) / 3;
+    U.preset('auto');
+    const ra = U.render();
+    const oA = U.outputPixels();
+    const ts = S.truth(oA.w, oA.h);
+
+    // rotation: 90° clockwise must be the same picture, turned
+    U.setOrient({ rot: 1, flip: false });
+    const rr = U.render();
+    const oR = U.outputPixels();
+    let rd = 0, rc = 0;
+    for (let y = 0; y < oR.h; y += 3)
+      for (let x = 0; x < oR.w; x += 3) {
+        const sx = y, sy = oA.h - 1 - x; // CW: rotated (x, y) ← original (y, H-1-x)
+        if (sy < 0 || sy >= oA.h || sx >= oA.w) continue;
+        const i = (y * oR.w + x) * 4, j = (sy * oA.w + sx) * 4;
+        rd += Math.abs(luma(oR.px[i], oR.px[i + 1], oR.px[i + 2]) - luma(oA.px[j], oA.px[j + 1], oA.px[j + 2]));
+        rc++;
+      }
+    out.rot = { sizeBefore: ra.size, sizeAfter: rr.size, diff: rd / rc };
+    const exp = await U.exportPhoto('image/jpeg');
+    out.rotExport = [exp.w, exp.h];
+    U.setOrient({ rot: 0, flip: true });
+    U.render();
+    const oF = U.outputPixels();
+    let fd = 0, fc = 0;
+    for (let y = 0; y < oF.h; y += 3)
+      for (let x = 0; x < oF.w; x += 3) {
+        const i = (y * oF.w + x) * 4, j = (y * oA.w + (oA.w - 1 - x)) * 4;
+        fd += Math.abs(luma(oF.px[i], oF.px[i + 1], oF.px[i + 2]) - luma(oA.px[j], oA.px[j + 1], oA.px[j + 2]));
+        fc++;
+      }
+    out.flipDiff = fd / fc;
+    U.setOrient({ rot: 0, flip: false });
+    U.render();
+
+    // curves
+    const lumaAll = (o) => { let a = 0; for (let i = 0; i < o.px.length; i += 4) a += luma(o.px[i], o.px[i + 1], o.px[i + 2]); return a / (o.px.length / 4); };
+    const chan = (o, c) => { let a = 0; for (let i = 0; i < o.px.length; i += 4) a += o.px[i + c]; return a / (o.px.length / 4); };
+    const base = U.outputPixels();
+    const L = [[0, 0], [1, 1]];
+    U.setLook({ curves: { rgb: [[0, 0], [0.5, 0.65], [1, 1]], r: L, g: L, b: L } });
+    const oC = U.outputPixels();
+    U.setLook({ curves: { rgb: L, r: [[0, 0], [0.5, 0.65], [1, 1]], g: L, b: L } });
+    const oR2 = U.outputPixels();
+    out.curves = {
+      luma: [lumaAll(base), lumaAll(oC)],
+      r: [chan(base, 0), chan(oR2, 0)], g: [chan(base, 1), chan(oR2, 1)], b: [chan(base, 2), chan(oR2, 2)],
+    };
+    U.resetLook();
+
+    // HSL: blue saturation −100
+    const water = (ti) => !ts.object[ti];
+    const coral = (ti) => ts.coral[ti];
+    const slate = (ti) => ts.slate[ti];
+    const cw0 = meanOver(base, ts, water, chroma), cc0 = meanOver(base, ts, coral, chroma), cs0 = meanOver(base, ts, slate, chroma);
+    U.setLook({ hsl: { h: new Array(8).fill(0), s: [0, 0, 0, 0, 0, -100, 0, 0], l: new Array(8).fill(0) } });
+    const oH = U.outputPixels();
+    out.hsl = { water: [cw0, meanOver(oH, ts, water, chroma)], coral: [cc0, meanOver(oH, ts, coral, chroma)], slate: [cs0, meanOver(oH, ts, slate, chroma)] };
+    U.resetLook();
+
+    // 畫質修復 on a noisy, blotchy frame (full resolution preview)
+    let seed = 9;
+    const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const noisy = S.degrade(t, 'blue', 8);
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const n = (rnd() + rnd() + rnd() - 1.5) * 28;
+        const cb = 14 * Math.sin(x / 9 + rnd()) * Math.cos(y / 7); // colour blotches
+        noisy[i] += n + cb; noisy[i + 1] += n; noisy[i + 2] += n - cb;
+      }
+    await U.addFiles([await S.toFile(noisy, W, H, 'noisy.png')]);
+    U.setView({ mode: 0 });
+    U.setPreview(0);
+    const grab = () => {
+      U.render();
+      const c2 = new OffscreenCanvas(W, H);
+      const x2 = c2.getContext('2d');
+      x2.drawImage(document.getElementById('view'), 0, 0);
+      return x2.getImageData(0, 0, W, H).data;
+    };
+    const energy = (px) => {
+      let e = 0, c = 0, ch = 0;
+      for (let y = 2; y < H - 2; y += 2)
+        for (let x = 2; x < W - 2; x += 2) {
+          if (t.object[y * W + x] && !t.coral[y * W + x] && !t.slate[y * W + x]) {
+            const i = (y * W + x) * 4;
+            let m = 0, mr = 0, mb = 0;
+            for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const k = ((y + dy) * W + x + dx) * 4; m += luma(px[k], px[k + 1], px[k + 2]); mr += px[k] - px[k + 1]; mb += px[k + 2] - px[k + 1]; }
+            e += Math.abs(luma(px[i], px[i + 1], px[i + 2]) - m / 25);
+            ch += Math.abs(px[i] - px[i + 1] - mr / 25) + Math.abs(px[i + 2] - px[i + 1] - mb / 25);
+            c++;
+          }
+        }
+      return { luma: e / c, chroma: ch / c };
+    };
+    const edge = (px) => {
+      // luminance step across the white slate's left edge (x = 0.8 W)
+      let a = 0, b = 0, c = 0;
+      for (let y = Math.floor(0.74 * H); y < Math.floor(0.88 * H); y++) {
+        const xi = Math.floor(0.8 * W);
+        const i = (y * W + xi + 4) * 4, j = (y * W + xi - 5) * 4;
+        a += luma(px[i], px[i + 1], px[i + 2]); b += luma(px[j], px[j + 1], px[j + 2]); c++;
+      }
+      return (a - b) / c;
+    };
+    const n0 = grab();
+    U.setParam('restore', 0.8);
+    const n1 = grab();
+    U.setParam('restore', 0);
+    out.restore = { before: energy(n0), after: energy(n1), edge: [edge(n0), edge(n1)] };
+    U.setPreview(1920);
+
+    // 淺水／陽光 on a sunlit shallow scene with light shafts
+    const sun = S.degrade(t, 'blue', 2.5);
+    for (let y = 0; y < H * 0.55; y++)
+      for (let x = 0; x < W; x++) {
+        const ray = Math.max(0, Math.sin((x + y * 0.6) / 40)) ** 8 * (1 - y / (H * 0.55));
+        const i = (y * W + x) * 4;
+        sun[i] += 70 * ray; sun[i + 1] += 90 * ray; sun[i + 2] += 90 * ray;
+      }
+    await U.addFiles([await S.toFile(sun, W, H, 'sunny.png')]);
+    U.setView({ mode: 0 });
+    const blown = (o) => { let b = 0; for (let i = 0; i < o.px.length; i += 4) if (Math.min(o.px[i], o.px[i + 1], o.px[i + 2]) >= 250) b++; return b / (o.px.length / 4); };
+    U.preset('auto');
+    U.render();
+    const sa = U.outputPixels();
+    U.preset('sunny');
+    const sr = U.render();
+    const ss = U.outputPixels();
+    const tsun = S.truth(ss.w, ss.h);
+    const srcSmall = S.degrade(tsun, 'blue', 2.5);
+    out.sunny = {
+      uw: sr.stats.underwater,
+      blownAuto: blown(sa), blownSunny: blown(ss),
+      errSrc: S.chromaError(srcSmall, ss.w, ss.h, tsun).err, errSunny: S.chromaError(ss.px, ss.w, ss.h, tsun).err,
+      hl: U.state().params.highlights,
+    };
+    U.preset('auto');
+    await new Promise((r) => setTimeout(r, 50));
+    return out;
+  });
+  check('「原始」 preset shows the source unchanged (GPU)', feat.rawDiff < 1.5, `mean diff ${f3(feat.rawDiff)} / 255`);
+  check('rotate 90°: frame turns, content matches', feat.rot.sizeAfter[0] === feat.rot.sizeBefore[1] && feat.rot.sizeAfter[1] === feat.rot.sizeBefore[0] && feat.rot.diff < 8,
+    `${feat.rot.sizeBefore.join('×')} → ${feat.rot.sizeAfter.join('×')}, luma diff ${f1(feat.rot.diff)}`);
+  check('rotated photo exports rotated at full resolution', feat.rotExport[0] === 500 && feat.rotExport[1] === 800, feat.rotExport.join('×'));
+  check('horizontal flip mirrors the frame', feat.flipDiff < 8, `luma diff ${f1(feat.flipDiff)}`);
+  check('RGB curve brightens mid-tones', feat.curves.luma[1] > feat.curves.luma[0] + 8, `${f1(feat.curves.luma[0])} → ${f1(feat.curves.luma[1])}`);
+  check('R curve moves red only',
+    feat.curves.r[1] > feat.curves.r[0] + 8 && Math.abs(feat.curves.g[1] - feat.curves.g[0]) < 1.5 && Math.abs(feat.curves.b[1] - feat.curves.b[0]) < 1.5,
+    `R ${f1(feat.curves.r[0])} → ${f1(feat.curves.r[1])}, G ±${f1(Math.abs(feat.curves.g[1] - feat.curves.g[0]))}, B ±${f1(Math.abs(feat.curves.b[1] - feat.curves.b[0]))}`);
+  // (a slightly blue-tinted slate may lose that tint too — it must just never gain colour)
+  check('HSL 藍 飽和度 −100: water loses its blue, coral untouched, slate not tinted',
+    feat.hsl.water[1] < 0.4 * feat.hsl.water[0] && Math.abs(feat.hsl.coral[1] - feat.hsl.coral[0]) < 0.02 && feat.hsl.slate[1] <= feat.hsl.slate[0] + 0.002,
+    `water C ${f3(feat.hsl.water[0])} → ${f3(feat.hsl.water[1])}, coral ${f3(feat.hsl.coral[0])} → ${f3(feat.hsl.coral[1])}, slate ${f3(feat.hsl.slate[0])} → ${f3(feat.hsl.slate[1])}`);
+  check('畫質修復 removes grain and colour blotches',
+    feat.restore.after.luma < 0.65 * feat.restore.before.luma && feat.restore.after.chroma < 0.6 * feat.restore.before.chroma,
+    `grain ${f1(feat.restore.before.luma)} → ${f1(feat.restore.after.luma)}, colour noise ${f1(feat.restore.before.chroma)} → ${f1(feat.restore.after.chroma)}`);
+  check('畫質修復 keeps edges', feat.restore.edge[1] > 0.8 * feat.restore.edge[0], `slate edge step ${f1(feat.restore.edge[0])} → ${f1(feat.restore.edge[1])}`);
+  check('「淺水／陽光」 protects the light shafts and still restores colour',
+    feat.sunny.hl < 0 && feat.sunny.blownSunny <= feat.sunny.blownAuto && feat.sunny.errSunny < 0.6 * feat.sunny.errSrc,
+    `blown ${f1(feat.sunny.blownAuto * 100)} % → ${f1(feat.sunny.blownSunny * 100)} %, colour error ${f3(feat.sunny.errSrc)} → ${f3(feat.sunny.errSunny)}`);
+
+  // screenshot of the new controls in use (sunlit scene, S-curve, warmer orange)
+  await page.evaluate(() => {
+    const U = window.__uw;
+    U.preset('sunny');
+    U.setLook({
+      curves: { rgb: [[0, 0], [0.25, 0.2], [0.75, 0.82], [1, 1]], r: [[0, 0], [1, 1]], g: [[0, 0], [1, 1]], b: [[0, 0], [1, 1]] },
+      hsl: { h: new Array(8).fill(0), s: [0, 30, 0, 0, 0, 0, 0, 0], l: new Array(8).fill(0) },
+    });
+    U.setView({ mode: 1, split: 0.5 });
+    U.render();
+    document.getElementById('curvesGroup').open = true;
+    document.getElementById('hslGroup').open = true;
+    document.querySelectorAll('details.group').forEach((d, i) => { if (i < 5) d.open = false; });
+  });
+  await page.screenshot({ path: join(OUT, 'studio-controls.png'), fullPage: true });
+  await page.evaluate(() => {
+    window.__uw.resetLook();
+    window.__uw.preset('auto');
+    document.querySelectorAll('details.group').forEach((d, i) => { d.open = i < 3; });
+  });
+
   /* ============================================================ video */
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');
   const clip = await page.evaluate(async () => {
@@ -348,6 +573,28 @@ try {
   const gcast = (s) => s.g - (s.r + s.b) / 2;
   check('exported blue-water frame corrected', Math.abs(cast(vf.blue.out)) < 0.3 * cast(vf.blue.src), `blue cast ${f1(cast(vf.blue.src))} → ${f1(cast(vf.blue.out))}`);
   check('exported green-water frame corrected', Math.abs(gcast(vf.green.out)) < 0.3 * gcast(vf.green.src), `green cast ${f1(gcast(vf.green.src))} → ${f1(gcast(vf.green.out))}`);
+
+  // speed + rotation in the exporter, and the preview speed control
+  const spd = await page.evaluate(async () => {
+    const U = window.__uw;
+    const sel = document.getElementById('playRate');
+    sel.value = '0.5';
+    sel.dispatchEvent(new Event('change'));
+    const rate = U.videoRate();
+    sel.value = '1';
+    sel.dispatchEvent(new Event('change'));
+    U.setOrient({ rot: 1, flip: false });
+    const fast = await U.exportVideo({ maxEdge: 640, format: 'webm', speed: 2 });
+    U.setOrient({ rot: 0, flip: false });
+    const slow = await U.exportVideo({ maxEdge: 640, format: 'webm', speed: 0.5 });
+    return { rate, fast: fast.probe, slow: slow.probe };
+  });
+  check('preview playback speed control', spd.rate === 0.5, `playbackRate ${spd.rate}`);
+  check('2× export: half the length, source frame rate kept, rotated',
+    Math.abs(spd.fast.duration - 2.5) < 0.2 && Math.abs(spd.fast.frames - 75) <= 2 && spd.fast.width === 360 && spd.fast.height === 640,
+    `${f1(spd.fast.duration)} s, ${spd.fast.frames} frames, ${spd.fast.width}×${spd.fast.height}`);
+  check('0.5× export: slow motion, every frame kept', Math.abs(spd.slow.duration - 10) < 0.3 && spd.slow.frames === 150,
+    `${f1(spd.slow.duration)} s, ${spd.slow.frames} frames`);
 
   /* ============================================================ layout */
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });

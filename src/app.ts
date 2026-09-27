@@ -12,7 +12,10 @@ import {
   type Params,
   type SliderDef,
 } from './engine/params.ts';
-import { Processor, type View } from './engine/renderer.ts';
+import { cloneLook, identityLook, type Look } from './engine/look.ts';
+import { NO_ORIENT, orientedSize, Processor, type Orient, type View } from './engine/renderer.ts';
+import { curveEditor } from './ui/curves.ts';
+import { hslPanel } from './ui/hsl.ts';
 
 type ExportMod = typeof import('./engine/export.ts');
 let exportMod: Promise<ExportMod> | null = null;
@@ -45,6 +48,8 @@ let params: Params = { ...DEFAULT_PARAMS };
 const locked = new Set<AutoKey>();
 const view: View = { mode: 1, split: 0.5, clip: false };
 let previewCap = 1920;
+let orient: Orient = { ...NO_ORIENT };
+let look: Look = identityLook();
 let lastState: FrameState | null = null;
 let activePreset = 'auto';
 
@@ -80,10 +85,11 @@ function requestRender(upload = false) {
 }
 
 function sizeFor(it: Item) {
-  const max = Math.max(it.w, it.h);
+  const [ow, oh] = orientedSize(it.w, it.h, orient);
+  const max = Math.max(ow, oh);
   const cap = Math.min(previewCap > 0 ? previewCap : max, proc.renderer.maxTexture);
   const s = Math.min(1, cap / max);
-  proc.renderer.resize(Math.max(2, Math.round(it.w * s)), Math.max(2, Math.round(it.h * s)));
+  proc.renderer.resize(Math.max(2, Math.round(ow * s)), Math.max(2, Math.round(oh * s)));
 }
 
 /** Render the current still (photo, or paused video) with the current settings. */
@@ -156,7 +162,9 @@ function renderAnalysis(st: FrameState) {
   $('swA').style.background = rgbCss(s.waterLight);
   $('swI').style.background = rgbCss(s.illum);
   $('fGain').textContent = st.chromaGain > 1.001 || st.warmGain > 0.001 ? `×${st.chromaGain.toFixed(2)}` : '關';
-  drawHistogram(proc.renderer.readScope(st));
+  const px = proc.renderer.readScope(st);
+  drawHistogram(px);
+  curvesUi?.draw(px);
 }
 
 function drawHistogram(px: Uint8Array) {
@@ -293,6 +301,7 @@ function buildPresets() {
   for (const [key, pr] of Object.entries(PRESETS)) {
     const b = document.createElement('button');
     b.textContent = pr.label;
+    b.title = pr.hint;
     b.dataset.preset = key;
     b.addEventListener('click', () => applyPreset(key));
     host.append(b);
@@ -304,14 +313,21 @@ function applyPreset(key: string) {
   const pr = PRESETS[key];
   // presets choose the water model; rich colour and tracking speed are the
   // user's taste and survive a preset change
-  params = { ...DEFAULT_PARAMS, auto: true, response: params.response, vivid: params.vivid };
+  params = { ...DEFAULT_PARAMS, auto: true, response: params.response, vivid: params.vivid, restore: params.restore };
   locked.clear();
   for (const [k, v] of Object.entries(pr.set) as [NumKey, number][]) {
     params[k] = v;
     if (isAutoKey(k)) locked.add(k);
   }
+  if (pr.raw) {
+    // 原始: the untouched picture, a clean starting point for manual work
+    look = identityLook();
+    lookChanged();
+    hslUi.sync();
+  }
   $<HTMLInputElement>('auto').checked = true;
   markPreset(key);
+  refreshControls(lastState);
   requestRender();
 }
 
@@ -484,6 +500,7 @@ async function select(i: number) {
   proc.engine.pick = null;
   $('clearPick').classList.add('hidden');
   if (it.kind === 'video') {
+    it.video.playbackRate = parseFloat($<HTMLSelectElement>('playRate').value);
     $<HTMLInputElement>('seek').value = String(Math.round((it.video.currentTime / (it.duration || 1)) * 1000));
     updateTime(it);
   }
@@ -603,7 +620,7 @@ document.addEventListener(
 
 /* ---------------------------------------------------------------- export */
 
-const grade = () => ({ params: { ...params }, locked: new Set(locked), pick: proc.engine.pick });
+const grade = () => ({ params: { ...params }, locked: new Set(locked), pick: proc.engine.pick, orient: { ...orient }, look: cloneLook(look) });
 const baseName = (n: string) => n.replace(/\.[^.]+$/, '');
 function download(blob: Blob, name: string) {
   const a = document.createElement('a');
@@ -669,6 +686,7 @@ $('vexport').addEventListener('click', async () => {
       maxEdge: parseInt($<HTMLSelectElement>('vres').value, 10),
       format,
       writable,
+      speed: parseFloat($<HTMLSelectElement>('vspeed').value),
       onCancelable: (c) => (cancelExport = c),
       onProgress: (p, frames) => {
         const el = (performance.now() - t0) / 1000;
@@ -693,6 +711,50 @@ $('vexport').addEventListener('click', async () => {
 $('vcancel').addEventListener('click', () => {
   cancelExport?.();
   note.textContent = '取消中…';
+});
+
+/* ------------------------------------------------------- look: curves + HSL */
+
+function lookChanged() {
+  proc.setLook(look);
+  if (proc.state) {
+    proc.redraw(view); // the look lives in the final pass: no re-grade needed
+    if (lastState) {
+      const px = proc.renderer.readScope(lastState);
+      drawHistogram(px);
+      curvesUi?.draw(px);
+    }
+  }
+  markPreset(null);
+}
+const curvesUi = curveEditor($('curves'), () => look.curves, lookChanged);
+const hslUi = hslPanel($('hsl'), () => look.hsl, lookChanged);
+
+/* --------------------------------------------------------- rotate / flip */
+
+function setOrient(next: Orient) {
+  orient = { rot: next.rot, flip: next.flip };
+  proc.setOrient(orient);
+  $('flipH').setAttribute('aria-pressed', String(orient.flip));
+  // the frame changed shape: re-analyse from scratch, a white point no longer
+  // sits where it was picked
+  proc.engine.reset();
+  proc.engine.pick = null;
+  $('clearPick').classList.add('hidden');
+  requestRender(true);
+}
+$('rotL').addEventListener('click', () => setOrient({ ...orient, rot: ((orient.rot + 3) % 4) as Orient['rot'] }));
+$('rotR').addEventListener('click', () => setOrient({ ...orient, rot: ((orient.rot + 1) % 4) as Orient['rot'] }));
+$('flipH').addEventListener('click', () => setOrient({ ...orient, flip: !orient.flip }));
+
+/* ------------------------------------------------------------------ speed */
+
+$<HTMLSelectElement>('playRate').addEventListener('change', (e) => {
+  const it = items[current];
+  if (it?.kind === 'video') it.video.playbackRate = parseFloat((e.target as HTMLSelectElement).value);
+});
+$<HTMLSelectElement>('vspeed').addEventListener('change', (e) => {
+  $('speedNote').classList.toggle('hidden', (e.target as HTMLSelectElement).value === '1');
 });
 
 /* ------------------------------------------------------------------ init */
@@ -751,6 +813,27 @@ Object.assign(window as unknown as Record<string, unknown>, {
       updateLabels();
       redraw();
     },
+    setOrient: (o: Orient) => setOrient(o),
+    /** Replace curves / HSL (test hook); omitted parts stay. */
+    setLook(l: Partial<Look>) {
+      look = { curves: l.curves ?? look.curves, hsl: l.hsl ?? look.hsl };
+      lookChanged();
+      hslUi.sync();
+    },
+    resetLook() {
+      look = identityLook();
+      lookChanged();
+      hslUi.sync();
+    },
+    outputSize: () => [proc.renderer.pw, proc.renderer.ph],
+    /** Source pixels at analysis resolution, oriented like the output. */
+    sourcePixels() {
+      return { w: proc.renderer.sw, h: proc.renderer.sh, px: Array.from(proc.renderer.readSmall()) };
+    },
+    videoRate() {
+      const it = items[current];
+      return it?.kind === 'video' ? it.video.playbackRate : null;
+    },
     setPreview(cap: number) {
       previewCap = cap;
     },
@@ -801,7 +884,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
       stopPlayback();
       return { trace, polled: frames, wall: performance.now() - t0 };
     },
-    async exportVideo(opts: { maxEdge: number; format: 'mp4' | 'webm' }) {
+    async exportVideo(opts: { maxEdge: number; format: 'mp4' | 'webm'; speed?: number }) {
       const it = items[current];
       if (it?.kind !== 'video') throw new Error('no video');
       const mod = await loadExport();

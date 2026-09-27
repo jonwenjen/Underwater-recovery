@@ -93,6 +93,8 @@ export interface FrameState {
   warmGain: number; // extra gain for reds → yellows
   // detail
   sharpen: number;
+  restore: number; // 畫質修復 pre-pass strength
+  shoulder: number; // highlight roll-off amount
   sharpenRadius: number;
   threshold: number;
   denoise: number;
@@ -478,15 +480,20 @@ export class AutoEngine {
     const evTarget = kk < kLo ? Math.log2(kLo / kk) * 0.7 : kk > 0.32 ? Math.log2(0.32 / kk) * 0.7 : 0;
     const ev = E('exposure', clamp(evTarget, -1, 1.5));
     const expMul = Math.pow(2, ev);
+    // Highlight roll-off only when something can push values past 1: an
+    // exposure lift, dehaze, WB or compensation. With all of them off
+    // (「原始」) the pipeline is an exact identity.
+    const sh = clamp(Math.max((expMul - 1) * 4, dehazeOn ? 1 : 0, wbS * 4, (aR + aB) * 4), 0, 1);
+    const shl = (x: number) => x + (shoulder(x) - x) * sh;
 
     /* 6. encode + CLAHE --------------------------------------------- */
     const e = this.buf('e', n * 3);
     const L = this.buf('L', n);
     let sL = 0, sL2 = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
-      const r = encodeFast(shoulder(Wb[q] * expMul));
-      const g = encodeFast(shoulder(Wb[q + 1] * expMul));
-      const b = encodeFast(shoulder(Wb[q + 2] * expMul));
+      const r = encodeFast(shl(Wb[q] * expMul));
+      const g = encodeFast(shl(Wb[q + 1] * expMul));
+      const b = encodeFast(shl(Wb[q + 2] * expMul));
       e[q] = r; e[q + 1] = g; e[q + 2] = b;
       const l = luma(r, g, b);
       L[i] = l; sL += l; sL2 += l * l;
@@ -582,7 +589,7 @@ export class AutoEngine {
       wb, expMul,
       clahe, claheTiles: tiles, claheMix, claheK,
       curve, gain, deCast, vibrance, saturation: p.saturation, chromaGain, warmGain,
-      sharpen: p.sharpen, sharpenRadius: p.sharpenRadius, threshold: p.threshold,
+      sharpen: p.sharpen, sharpenRadius: p.sharpenRadius, threshold: p.threshold, restore: p.restore, shoulder: sh,
       denoise: p.denoise, clarity: p.clarity,
       effective: eff as Record<AutoKey, number>,
       stats: {
@@ -690,7 +697,8 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
         b = mix(b * yr, j2, DEHAZE_CHROMA);
       }
       const r2 = r * s.post[0] * s.expMul, g2 = g * s.post[1] * s.expMul, b2 = b * s.post[2] * s.expMul;
-      let er = encodeFast(shoulder(r2)), eg = encodeFast(shoulder(g2)), eb = encodeFast(shoulder(b2));
+      const sl = (x: number) => x + (shoulder(x) - x) * s.shoulder;
+      let er = encodeFast(sl(r2)), eg = encodeFast(sl(g2)), eb = encodeFast(sl(b2));
       if (s.clahe && s.claheMix > 0) {
         const L = luma(er, eg, eb);
         const L2 = mix(L, sampleClahe(s.clahe, s.claheTiles, L, (x + 0.5) / w, (y + 0.5) / h) * s.claheK, s.claheMix);

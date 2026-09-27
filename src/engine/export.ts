@@ -17,19 +17,29 @@ import {
   Output,
   QUALITY_HIGH,
   StreamTarget,
+  VideoSample,
   VideoSampleSink,
   WebMOutputFormat,
   canEncodeVideo,
   type VideoCodec,
 } from 'mediabunny';
 import type { Pick } from './auto.ts';
+import { identityLook, type Look } from './look.ts';
 import type { AutoKey, Params } from './params.ts';
-import { Processor, RESULT_VIEW } from './renderer.ts';
+import { NO_ORIENT, orientedSize, Processor, RESULT_VIEW, type Orient } from './renderer.ts';
 
 export interface GradeSettings {
   params: Params;
   locked: ReadonlySet<AutoKey>;
   pick: Pick | null;
+  orient?: Orient;
+  look?: Look;
+}
+
+function prepare(proc: Processor, g: GradeSettings) {
+  proc.engine.pick = g.pick && { ...g.pick };
+  proc.setOrient(g.orient ?? NO_ORIENT);
+  proc.setLook(g.look ?? identityLook());
 }
 
 /* ---------------------------------------------------------------- photo */
@@ -53,8 +63,9 @@ export async function exportPhoto(
       h = Math.floor(h * s);
       src = await createImageBitmap(bitmap, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
     }
-    proc.renderer.resize(w, h);
-    proc.engine.pick = g.pick && { ...g.pick };
+    prepare(proc, g);
+    const [ow, oh] = orientedSize(w, h, g.orient ?? NO_ORIENT);
+    proc.renderer.resize(ow, oh);
     proc.frame(src, w, h, { params: g.params, locked: g.locked, dt: 0 }, RESULT_VIEW);
     return await canvas.convertToBlob({ type, quality });
   } finally {
@@ -94,6 +105,13 @@ export interface VideoExportOptions extends GradeSettings {
   onProgress?: (p: number, framesDone: number) => void;
   /** Receives a cancel function once the conversion is running. */
   onCancelable?: (cancel: () => void) => void;
+  /**
+   * Playback speed of the result: 2 = twice as fast (frames dropped to keep
+   * the source frame rate), 0.5 = slow motion (frames held longer).
+   * Audio is dropped when ≠ 1 — resampling it without a pitch shift is out
+   * of scope, and silent is better than chipmunks.
+   */
+  speed?: number;
 }
 
 export interface VideoExportResult {
@@ -115,8 +133,11 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
   const baseW = rotated ? track.displayHeight : track.displayWidth;
   const baseH = rotated ? track.displayWidth : track.displayHeight;
   const s = o.maxEdge > 0 ? Math.min(1, o.maxEdge / Math.max(baseW, baseH)) : 1;
-  const outW = Math.max(2, Math.round((baseW * s) / 2) * 2); // encoders want even sizes
-  const outH = Math.max(2, Math.round((baseH * s) / 2) * 2);
+  // the user's rotation turns the frame; quarter turns swap the sides
+  const [rw, rh] = orientedSize(baseW, baseH, o.orient ?? NO_ORIENT);
+  const outW = Math.max(2, Math.round((rw * s) / 2) * 2); // encoders want even sizes
+  const outH = Math.max(2, Math.round((rh * s) / 2) * 2);
+  const speed = o.speed && o.speed > 0 ? o.speed : 1;
 
   const candidates: VideoCodec[] = o.format === 'mp4' ? ['avc', 'hevc', 'vp9', 'av1'] : ['vp9', 'av1', 'vp8'];
   let codec: VideoCodec | null = null;
@@ -135,9 +156,10 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
   const canvas = new OffscreenCanvas(outW, outH);
   const proc = new Processor(canvas, { preserve: true });
   proc.renderer.resize(outW, outH);
-  proc.engine.pick = o.pick && { ...o.pick };
+  prepare(proc, o);
   let frames = 0;
   let lastT: number | null = null;
+  let nextEmit = -Infinity;
 
   const conversion = await Conversion.init({
     input,
@@ -148,6 +170,14 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
       processedWidth: outW,
       processedHeight: outH,
       process: (sample) => {
+        const outT = sample.timestamp / speed;
+        const srcDur = sample.duration > 0 ? sample.duration : 1 / 30;
+        // faster than real time: keep only as many frames as the source rate
+        // (half-frame tolerance: container timestamps are rounded, e.g. to ms)
+        if (speed > 1) {
+          if (outT + 0.5 * srcDur < nextEmit) return null;
+          nextEmit = nextEmit === -Infinity || nextEmit < outT - srcDur ? outT + srcDur : nextEmit + srcDur;
+        }
         const frame = sample.toVideoFrame();
         try {
           const t = sample.timestamp;
@@ -160,9 +190,11 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
           frame.close();
         }
         frames++;
-        return canvas;
+        if (speed === 1) return canvas;
+        return new VideoSample(canvas, { timestamp: outT, duration: speed > 1 ? srcDur : srcDur / speed });
       },
     },
+    audio: speed === 1 ? undefined : { discard: true },
   });
   if (!conversion.isValid) {
     proc.renderer.dispose();
@@ -239,10 +271,17 @@ export async function frameStats(file: Blob, t: number): Promise<{ r: number; g:
 }
 
 /** Count decodable frames of a finished file (used by the verification harness). */
-export async function countFrames(file: Blob): Promise<{ frames: number; width: number; height: number; codec: string | null }> {
+export async function countFrames(file: Blob): Promise<{ frames: number; width: number; height: number; codec: string | null; duration?: number; hasAudio?: boolean }> {
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const track = await input.getPrimaryVideoTrack();
   if (!track) return { frames: 0, width: 0, height: 0, codec: null };
   const stats = await track.computePacketStats();
-  return { frames: stats.packetCount, width: track.displayWidth, height: track.displayHeight, codec: track.codec };
+  return {
+    frames: stats.packetCount,
+    width: track.displayWidth,
+    height: track.displayHeight,
+    codec: track.codec,
+    duration: await track.computeDuration(),
+    hasAudio: !!(await input.getPrimaryAudioTrack()),
+  };
 }

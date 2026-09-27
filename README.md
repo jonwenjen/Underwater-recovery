@@ -62,6 +62,32 @@ with every amount *measured per frame*:
 
 ![豐富色彩 on — split before/after](docs/screenshots/studio-vivid.png)
 
+### Presets, curves, HSL, rotation, speed, restoration
+
+![Curves, HSL and the 淺水／陽光 preset](docs/screenshots/studio-controls.png)
+
+- **Presets** — 全自動 · **原始** (every stage neutral: shows the untouched
+  source, exact identity, and also resets curves / HSL — a clean start for
+  manual grading) · **淺水／陽光** (sunlit shallow water: protects light shafts
+  and surface highlights, lifts shadows, sharpens caustics, keeps turquoise
+  water; red and dehaze stay automatic because locking them made colour worse
+  on the ground-truth scenes) · 深藍海水 · 綠水／湖 · 混濁近攝 · 閃燈.
+- **Curves** — RGB master + R / G / B, monotone cubic (never overshoots or
+  inverts), drawn over the live histogram; tap to add, drag, double-tap to
+  delete. Channel curves apply before the master, as in Photoshop / Lightroom.
+- **HSL** — 色相 / 飽和度 / 明亮度 for 紅 橙 黃 綠 青 藍 紫 洋紅, in OKLCh with
+  band weights that always sum to 1 (no seams). True greys are never tinted;
+  pale colours such as recovered water respond fully. Out-of-gamut results
+  give back chroma instead of clipping.
+- **Rotation / flip** — ⟲ ⟳ ⇋ in the toolbar; applied before analysis, so the
+  preview, the auto engine and both exporters see the turned frame.
+- **Speed** — preview playback 0.25–2×; export 0.25–4× (faster keeps the
+  source frame rate by dropping frames; slower holds frames for slow motion;
+  audio is dropped when the speed changes).
+- **🛠 畫質修復** — bilateral pre-pass: luminance grain and 8×8 compression
+  steps smoothed with an edge stop; chroma filtered wider to remove colour
+  blotches. For high-ISO, old or heavily compressed footage.
+
 ### Professional control
 
 - Every auto-driven slider shows the value **auto is applying right now**
@@ -82,7 +108,7 @@ with every amount *measured per frame*:
 SwiftShader, WebCodecs VP9) against scenes with **known ground truth**: a reef
 rendered in true colour, then degraded with the Jaffe–McGlamery image-formation
 model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
-(34 / 34 passing):
+(47 / 47 passing):
 
 | Check | Result |
 |---|---|
@@ -97,12 +123,22 @@ model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
 | Video: blue → green cut at 3.0 s | cut detected at 3.0 s; green water & blue compensation engage |
 | Video export | 150 / 150 frames, VP9 640×360, casts corrected in both scenes |
 | 豐富色彩 (button, GPU) | surface chroma 0.042 → **0.084** (truth 0.077), brighter, coral redder, 0.1 % blown, colour error still 0.532 → 0.180 |
+| 「原始」 preset | output = source (mean diff 0.3 / 255) |
+| Rotate 90° / flip | 800×500 → 500×800, content matches (luma diff 0.7 / 0.4); photo exports 500×800 |
+| Curves | RGB mid-point lift 104 → 133; R curve moves red only (G, B ±0.0) |
+| HSL 藍 −100 | water chroma 0.031 → 0.001; coral and slate unchanged |
+| 畫質修復 | grain 29.4 → 15.6, colour noise 12.5 → 6.6, slate edge kept (140.6 → 146.5) |
+| 淺水／陽光 on a sunlit scene | no blown light shafts; colour error 0.429 → 0.140 |
+| Export speed | 2×: 2.5 s, 75 frames, rotated 360×640 · 0.5×: 9.9 s, all 150 frames |
 | Phone layout (390 px) | no horizontal scroll |
 
-`test/engine.test.ts` (32 checks) covers the colour math, LUTs, guided
+`test/engine.test.ts` (45 checks) covers the colour math, LUTs, guided
 filter, recovery goals on the CPU mirror, manual overrides, EMA tracking,
 scene cuts, the eyedropper, 豐富色彩 (richer, not darker, greys stay grey,
-never reduces chroma, gamut fit keeps hue), and the analysis time budget.
+never reduces chroma, gamut fit keeps hue), 「原始」 as an exact identity,
+curves (identity, no overshoot, channel order), HSL (identity, targets its
+band, pale colours respond, greys untouched, in gamut, seamless weights), and
+the analysis time budget.
 
 ## Architecture
 
@@ -121,7 +157,9 @@ source ─────────────▶ GRADE ─mips─▶ BLUR H ─
 | `src/engine/renderer.ts` | WebGL2 renderer and the `Processor` loop shared by preview and export |
 | `src/engine/color.ts`, `filters.ts`, `luts.ts` | Colour math, guided / box / min filters, CLAHE & tone-curve LUTs |
 | `src/engine/params.ts` | Every control: range, default, auto or manual, presets |
-| `src/engine/export.ts` | Full-res photo export, video export (mediabunny, lazy-loaded) |
+| `src/engine/look.ts` | Curves (monotone cubic → LUT) and the 8-band OKLCh HSL mixer |
+| `src/engine/export.ts` | Full-res photo export, video export with speed + rotation (mediabunny, lazy-loaded) |
+| `src/ui/curves.ts`, `src/ui/hsl.ts` | Curve editor and HSL panel |
 | `src/app.ts`, `src/app.css` | Studio UI |
 | `scripts/verify.mjs`, `scripts/verify-scene.js` | End-to-end verification with ground-truth scenes |
 
