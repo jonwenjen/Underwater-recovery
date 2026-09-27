@@ -40,6 +40,8 @@ export interface Params {
   vibrance: number;
   saturation: number;
   deCast: number;
+  /** 豐富色彩 strength (0 = off). The amounts it drives are computed per frame. */
+  vivid: number;
   // tracking
   response: number;
 }
@@ -89,6 +91,7 @@ export const DEFAULT_PARAMS: Params = {
   vibrance: 0.2,
   saturation: 1,
   deCast: 0.4,
+  vivid: 0,
   response: 1.2,
 };
 
@@ -153,6 +156,7 @@ export const GROUPS: Group[] = [
       { key: 'vibrance', label: '自然飽和度', min: -1, max: 1, step: 0.01, hint: '優先提升低飽和色，不讓珊瑚爆色' },
       { key: 'saturation', label: '飽和度', min: 0, max: 2, step: 0.01, hint: '整體飽和度' },
       { key: 'deCast', label: '中間調去色偏', min: 0, max: 1, step: 0.01, hint: '修掉殘留的整體色罩（常見為洋紅／青）' },
+      { key: 'vivid', label: '✨ 色彩豐富度（自動）', min: 0, max: 1, step: 0.01, hint: '依畫面實測彩度自動補足：OKLab 保色相增艷、暖色（珊瑚／魚）加強、提亮、水色更藍；0 關閉' },
     ],
   },
   {

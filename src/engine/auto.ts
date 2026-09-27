@@ -21,6 +21,8 @@
  * the CLAHE tiles to stop shimmer.
  */
 import {
+  boostChroma,
+  fromOklab,
   LIN8,
   LUMA_B,
   LUMA_G,
@@ -31,6 +33,8 @@ import {
   mix,
   shoulder,
   smoothstep,
+  srgbToLinear,
+  toOklab,
   whiteBalanceMatrix,
   type Mat3,
   type Vec3,
@@ -45,6 +49,9 @@ import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
  * error on the ground-truth scenes, and 192 costs 44 % less.
  */
 export const ANALYSIS_EDGE = 192;
+/** Mean surface chroma (OKLab) that 豐富色彩 at full strength aims for; the
+ * ground-truth reef scene measures 0.077, the flat default output 0.03–0.06. */
+export const CHROMA_TARGET = 0.085;
 export const T0 = 0.3; // transmission floor: keeps far water from turning to noise
 /**
  * Share of the dehazed *colour* kept; the rest of dehaze acts on luminance.
@@ -82,6 +89,8 @@ export interface FrameState {
   deCast: number;
   vibrance: number;
   saturation: number;
+  chromaGain: number; // 豐富色彩: hue-preserving OKLab chroma gain (1 = off)
+  warmGain: number; // extra gain for reds → yellows
   // detail
   sharpen: number;
   sharpenRadius: number;
@@ -101,6 +110,8 @@ export interface FrameStats {
   waterLight: Vec3;
   sceneCut: boolean;
   analysisMs: number;
+  /** Mean OKLab chroma of surfaces before the colour stage. */
+  chroma: number;
 }
 
 /** Eyedropper state: the illuminant it implies, and a residual gain fixed on first use. */
@@ -222,6 +233,8 @@ export class AutoEngine {
     // How much to trust the scene is underwater at all: a clean land photo
     // (score < 0.2) gets almost nothing, a clear underwater frame gets it all.
     const gate = smoothstep(0.2, 0.55, uw);
+    // 豐富色彩 strength: every adaptive amount below scales with it
+    const vivid = clamp(p.vivid, 0, 1);
     const gateWb = smoothstep(0.15, 0.45, uw);
     const water: FrameStats['water'] = uw < 0.3 ? 'neutral' : mG > mB * 1.08 ? 'green' : 'blue';
 
@@ -336,7 +349,7 @@ export class AutoEngine {
     // a neutral grey veil (flat, lifeless), 1 keeps the full cast.
     const ry = Math.max(1e-4, luma(rr, rg, rb)),
       ay = luma(A[0], A[1], A[2]);
-    const keep = clamp(p.waterTint, 0, 1);
+    const keep = mix(clamp(p.waterTint, 0, 1), Math.max(p.waterTint, 0.8), 0.6 * vivid);
     const hue: Vec3 = [mix(1, rr / ry, keep), mix(1, rg / ry, keep), mix(1, rb / ry, keep)];
     const hy = Math.max(1e-4, luma(hue[0], hue[1], hue[2]));
     const Aout: Vec3 = [
@@ -461,7 +474,8 @@ export class AutoEngine {
     const key = Math.exp(logSum / Math.ceil(n / 4));
     // Dead zone: lift dim frames, tame hot ones, leave a good exposure alone.
     const kk = Math.max(1e-4, key);
-    const evTarget = kk < 0.16 ? Math.log2(0.16 / kk) * 0.7 : kk > 0.32 ? Math.log2(0.32 / kk) * 0.7 : 0;
+    const kLo = 0.16 + 0.08 * vivid; // rich colour also means a more luminous frame
+    const evTarget = kk < kLo ? Math.log2(kLo / kk) * 0.7 : kk > 0.32 ? Math.log2(0.32 / kk) * 0.7 : 0;
     const ev = E('exposure', clamp(evTarget, -1, 1.5));
     const expMul = Math.pow(2, ev);
 
@@ -534,12 +548,28 @@ export class AutoEngine {
       S('gG', clamp(gAvg / Math.max(1e-4, gm[1]), 0.85, 1.2)),
       S('gB', clamp(gAvg / Math.max(1e-4, gm[2]), 0.85, 1.2)),
     ];
-    const deCast = this.pick ? 0 : E('deCast', 0.6 * gate);
+    // de-cast pulls toward grey; ease it off when rich colour is wanted
+    const deCast = this.pick ? 0 : E('deCast', 0.6 * gate * (1 - 0.5 * vivid));
+    // Measure how colourful the surfaces actually are (mean OKLab chroma,
+    // near surfaces, every 4th pixel) and derive the gain that brings them
+    // toward a vivid target. Measured, so a frame that is already colourful
+    // gets little and a flat one gets a lot. Skipped entirely when off.
+    let cSum = 0, cW = 0;
+    for (let i = 0, q = 0; vivid > 0 && i < n; i += 4, q += 12) {
+      const wgt = smoothstep(0.3, 0.75, tMap[i]) * smoothstep(0.05, 0.2, L[i]);
+      if (wgt <= 0) continue;
+      const lab = toOklab(srgbToLinear(clamp(e[q], 0, 1)), srgbToLinear(clamp(e[q + 1], 0, 1)), srgbToLinear(clamp(e[q + 2], 0, 1)));
+      cSum += Math.hypot(lab[1], lab[2]) * wgt;
+      cW += wgt;
+    }
+    const chroma = cW > 0 ? cSum / cW : 0;
+    const chromaGain = S('cGain', 1 + vivid * (clamp(CHROMA_TARGET / Math.max(chroma, 0.01), 1, 2.6) - 1));
+    const warmGain = S('warmG', 0.45 * vivid);
     const vibrance = E('vibrance', 0.05 + 0.3 * gate);
     const curve = buildCurve({
       blacks,
       whites,
-      contrast: p.contrast,
+      contrast: clamp(p.contrast + 0.08 * vivid, -1, 1),
       highlights: p.highlights,
       shadows,
     });
@@ -551,7 +581,7 @@ export class AutoEngine {
       A, Aout, post, k, dehazeOn, coef, coefW: w, coefH: h,
       wb, expMul,
       clahe, claheTiles: tiles, claheMix, claheK,
-      curve, gain, deCast, vibrance, saturation: p.saturation,
+      curve, gain, deCast, vibrance, saturation: p.saturation, chromaGain, warmGain,
       sharpen: p.sharpen, sharpenRadius: p.sharpenRadius, threshold: p.threshold,
       denoise: p.denoise, clarity: p.clarity,
       effective: eff as Record<AutoKey, number>,
@@ -563,6 +593,7 @@ export class AutoEngine {
         waterLight: A,
         sceneCut: cut,
         analysisMs: performance.now() - t0,
+        chroma,
       },
     };
   }
@@ -600,6 +631,26 @@ export class AutoEngine {
     for (let i = 0; i < 64; i++) d += Math.abs(sig[i] - prev[i]);
     return d * 0.5 > 0.3;
   }
+}
+
+/**
+ * Scale OKLab chroma by `k`, but if that leaves sRGB, bisect back toward the
+ * original (k = 1, in gamut) so only the *added* chroma is given up: hue and
+ * lightness stay, nothing clips to a flat patch. Mirrors `gamutFit` in GLSL.
+ */
+export function gamutFit(lab: Vec3, k: number): Vec3 {
+  const at = (f: number) => fromOklab(lab[0], lab[1] * f, lab[2] * f);
+  const ok = (c: Vec3) => Math.min(c[0], c[1], c[2]) >= -1e-4 && Math.max(c[0], c[1], c[2]) <= 1.0001;
+  let c = at(k);
+  if (ok(c)) return c;
+  let lo = 1, hi = k;
+  for (let i = 0; i < 5; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (ok(at(mid))) lo = mid;
+    else hi = mid;
+  }
+  c = at(lo);
+  return [clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1)];
 }
 
 /**
@@ -662,9 +713,21 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
       const l2 = luma(er, eg, eb);
       const sat = Math.max(er, eg, eb) - Math.min(er, eg, eb);
       const k2 = s.saturation + s.vibrance * (1 - smoothstep(0, 0.6, sat));
-      out[q] = clamp(l2 + (er - l2) * k2, 0, 1);
-      out[q + 1] = clamp(l2 + (eg - l2) * k2, 0, 1);
-      out[q + 2] = clamp(l2 + (eb - l2) * k2, 0, 1);
+      let fr = clamp(l2 + (er - l2) * k2, 0, 1),
+        fg = clamp(l2 + (eg - l2) * k2, 0, 1),
+        fb = clamp(l2 + (eb - l2) * k2, 0, 1);
+      if (s.chromaGain > 1.0001 || s.warmGain > 0.0001) {
+        const lab = toOklab(srgbToLinear(fr), srgbToLinear(fg), srgbToLinear(fb));
+        const C = Math.hypot(lab[1], lab[2]);
+        if (C > 1e-5) {
+          const k3 = boostChroma(C, Math.atan2(lab[2], lab[1]), s.chromaGain, s.warmGain) / C;
+          const rgb = gamutFit(lab, k3);
+          fr = encodeFast(rgb[0]); fg = encodeFast(rgb[1]); fb = encodeFast(rgb[2]);
+        }
+      }
+      out[q] = fr;
+      out[q + 1] = fg;
+      out[q + 2] = fb;
     }
   return out;
 }

@@ -123,10 +123,57 @@ uniform float u_sharpen, u_thr, u_denoise, u_clarity, u_clarityLod;
 uniform vec3 u_gain;
 uniform float u_deCast;
 uniform float u_sat, u_vib;
+uniform float u_chroma, u_warm;   // 豐富色彩: OKLab chroma gain, warm-hue extra
 uniform int u_mode;          // 0 result, 1 split, 2 original
 uniform float u_split;
 uniform int u_clip;          // highlight / shadow clipping overlay
 uniform float u_seed;
+
+vec3 oklab(vec3 c) {
+  vec3 lms = vec3(
+    dot(c, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
+    dot(c, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
+    dot(c, vec3(0.0883024619, 0.2817188376, 0.6299787005)));
+  lms = pow(max(lms, 0.0), vec3(1.0 / 3.0));
+  return vec3(
+    dot(lms, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
+    dot(lms, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+    dot(lms, vec3(0.0259040371, 0.7827717662, -0.8086757660)));
+}
+vec3 fromOklab(vec3 lab) {
+  vec3 lms = vec3(
+    lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z,
+    lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z,
+    lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z);
+  lms = lms * lms * lms;
+  return vec3(
+    dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
+    dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
+    dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010)));
+}
+// mirrors boostChroma() in color.ts
+float boostChroma(float C, float h) {
+  float warmW = smoothstep(-0.3, 0.2, h) * (1.0 - smoothstep(1.1, 1.5, h));
+  float g = u_chroma * (1.0 + u_warm * warmW);
+  float x = C * (1.0 + (g - 1.0) * smoothstep(0.012, 0.05, C));
+  const float knee = 0.12, cmax = 0.27;
+  float soft = x <= knee ? x : knee + (cmax - knee) * tanh((x - knee) / (cmax - knee));
+  return max(C, soft);
+}
+
+// mirrors gamutFit() in auto.ts: give back only the added chroma if needed
+vec3 gamutFit(vec3 lab, float k) {
+  vec3 c = fromOklab(vec3(lab.x, lab.yz * k));
+  if (min(c.r, min(c.g, c.b)) >= -1e-4 && max(c.r, max(c.g, c.b)) <= 1.0001) return c;
+  float lo = 1.0, hi = k;
+  for (int i = 0; i < 5; i++) {
+    float mid = 0.5 * (lo + hi);
+    vec3 m = fromOklab(vec3(lab.x, lab.yz * mid));
+    if (min(m.r, min(m.g, m.b)) >= -1e-4 && max(m.r, max(m.g, m.b)) <= 1.0001) lo = mid;
+    else hi = mid;
+  }
+  return clamp(fromOklab(vec3(lab.x, lab.yz * lo)), 0.0, 1.0);
+}
 
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
@@ -170,6 +217,14 @@ void main() {
     float sat = max(e.r, max(e.g, e.b)) - min(e.r, min(e.g, e.b));
     e = l2 + (e - l2) * (u_sat + u_vib * (1.0 - smoothstep(0.0, 0.6, sat)));
     e = clamp(e, 0.0, 1.0);
+    // 豐富色彩: hue-preserving chroma gain in OKLab, measured per frame
+    if (u_chroma > 1.0001 || u_warm > 0.0001) {
+      vec3 lab = oklab(toLin(e));
+      float C = length(lab.yz);
+      if (C > 1e-5) {
+        e = toSrgb(gamutFit(lab, boostChroma(C, atan(lab.z, lab.y)) / C));
+      }
+    }
     if (u_clip == 1) {
       if (max(e.r, max(e.g, e.b)) > 0.996) e = vec3(1.0, 0.1, 0.3);
       else if (max(e.r, max(e.g, e.b)) < 0.004) e = vec3(0.1, 0.4, 1.0);

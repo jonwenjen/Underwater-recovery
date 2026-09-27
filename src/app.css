@@ -333,7 +333,7 @@ details.group {
 }
 .facts {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 6px;
   margin: 10px 0 0;
 }
@@ -382,6 +382,26 @@ details.group {
 .presets button {
   font-size: 0.82rem;
   padding: 5px 10px;
+}
+.vivid {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  margin-top: 10px;
+  font-weight: 600;
+  text-align: left;
+}
+.vivid small {
+  font-weight: 400;
+  font-size: 0.74rem;
+  color: var(--dim);
+  margin-top: 2px;
+}
+.vivid[aria-pressed='true'] {
+  background: linear-gradient(90deg, rgba(255, 93, 122, 0.22), rgba(255, 209, 102, 0.22), rgba(52, 211, 238, 0.22));
+  border-color: var(--accent-2);
+  color: var(--accent-2);
 }
 .presets button.on {
   border-color: var(--accent);

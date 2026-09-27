@@ -155,6 +155,7 @@ function renderAnalysis(st: FrameState) {
   $('fHaze').textContent = `${Math.round(s.haze * 100)}%`;
   $('swA').style.background = rgbCss(s.waterLight);
   $('swI').style.background = rgbCss(s.illum);
+  $('fGain').textContent = st.chromaGain > 1.001 || st.warmGain > 0.001 ? `×${st.chromaGain.toFixed(2)}` : '關';
   drawHistogram(proc.renderer.readScope(st));
 }
 
@@ -271,6 +272,7 @@ function buildControls() {
 }
 
 function refreshControls(st: FrameState | null) {
+  syncVivid();
   for (const [k, r] of rows) {
     const auto = isFollowingAuto(k);
     const v = auto && st ? st.effective[k as AutoKey] : params[k];
@@ -300,7 +302,9 @@ function buildPresets() {
 
 function applyPreset(key: string) {
   const pr = PRESETS[key];
-  params = { ...DEFAULT_PARAMS, auto: true, response: params.response };
+  // presets choose the water model; rich colour and tracking speed are the
+  // user's taste and survive a preset change
+  params = { ...DEFAULT_PARAMS, auto: true, response: params.response, vivid: params.vivid };
   locked.clear();
   for (const [k, v] of Object.entries(pr.set) as [NumKey, number][]) {
     params[k] = v;
@@ -317,6 +321,22 @@ function markPreset(key: string | null) {
     b.classList.toggle('on', b.dataset.preset === activePreset),
   );
 }
+
+/* 豐富色彩: one tap on/off; the slider in 色彩 sets how strong */
+const VIVID_ON = 0.7;
+let lastVivid = VIVID_ON;
+function syncVivid() {
+  $('vivid').setAttribute('aria-pressed', String(params.vivid > 0));
+}
+$('vivid').addEventListener('click', () => {
+  if (params.vivid > 0) {
+    lastVivid = params.vivid;
+    params.vivid = 0;
+  } else params.vivid = lastVivid;
+  syncVivid();
+  refreshControls(lastState);
+  requestRender();
+});
 
 $<HTMLInputElement>('auto').addEventListener('change', (e) => {
   const on = (e.target as HTMLInputElement).checked;

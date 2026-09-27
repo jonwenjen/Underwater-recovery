@@ -5,8 +5,8 @@
  * Covers the colour math, LUT builders, auto analysis and the temporal
  * tracker, plus end-to-end recovery goals on the CPU mirror of the shader.
  */
-import { ANALYSIS_EDGE, AutoEngine, mirrorRender, type FrameState } from '../src/engine/auto.ts';
-import { apply3, luma, whiteBalanceMatrix, type Vec3 } from '../src/engine/color.ts';
+import { ANALYSIS_EDGE, AutoEngine, gamutFit, mirrorRender, type FrameState } from '../src/engine/auto.ts';
+import { apply3, boostChroma, luma, srgbToLinear, toOklab, whiteBalanceMatrix, type Vec3 } from '../src/engine/color.ts';
 import { guidedCoefficients } from '../src/engine/filters.ts';
 import { buildClahe, buildCurve, sampleCurve } from '../src/engine/luts.ts';
 import { DEFAULT_PARAMS, type AutoKey, type Params } from '../src/engine/params.ts';
@@ -242,6 +242,51 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   for (let i = 0; i < 30; i++) eng.step(img, aw, ah, { params: DEFAULT_PARAMS, locked: none, dt: 1 / 30 });
   const ms = (performance.now() - t0) / 30;
   check(`analysis fits a real-time budget (< 25 ms / frame at ${aw}×${ah})`, ms < 25, `${ms.toFixed(1)} ms`);
+}
+
+/* ------------------------------------------------------------ 豐富色彩 */
+
+{
+  const meanChroma = (o: Float32Array) => {
+    let c = 0, l = 0;
+    const n = o.length / 3;
+    for (let q = 0; q < o.length; q += 3) {
+      const lab = toOklab(srgbToLinear(o[q]), srgbToLinear(o[q + 1]), srgbToLinear(o[q + 2]));
+      c += Math.hypot(lab[1], lab[2]);
+      l += lab[0];
+    }
+    return { C: c / n, L: l / n };
+  };
+  const src = underwater('blue');
+  const off = run(src);
+  const on = run(src, { ...DEFAULT_PARAMS, vivid: 0.7 });
+  const a = meanChroma(mirrorRender(src, W, H, off)), b = meanChroma(mirrorRender(src, W, H, on));
+  check('default leaves 豐富色彩 off (gain exactly 1)', off.chromaGain === 1 && off.warmGain === 0);
+  check('豐富色彩 enriches colour (chroma +30 %)', b.C > a.C * 1.3, `C ${a.C.toFixed(3)} → ${b.C.toFixed(3)}, gain ×${on.chromaGain.toFixed(2)}`);
+  check('豐富色彩 does not darken the frame', b.L >= a.L - 0.005, `L ${a.L.toFixed(3)} → ${b.L.toFixed(3)}`);
+
+  const g = grey();
+  const go = statsF(mirrorRender(g, W, H, run(g, { ...DEFAULT_PARAMS, vivid: 1 })));
+  check('豐富色彩 at full strength keeps greys grey', Math.abs(go.r - go.b) < 3 && Math.abs(go.g - go.b) < 3, fmt(go));
+
+  let never = true, neutral = true;
+  for (let C = 0; C <= 0.3; C += 0.005)
+    for (let h = -3; h <= 3; h += 0.25) {
+      if (boostChroma(C, h, 1.8, 0.4) < C - 1e-9) never = false;
+      if (C <= 0.012 && Math.abs(boostChroma(C, h, 2.6, 0.45) - C) > 1e-9) neutral = false;
+    }
+  check('chroma boost never reduces chroma; near-neutrals untouched', never && neutral);
+
+  let inGamut = true, hueKept = true;
+  for (const [r, gg, bb] of [[0.98, 0.84, 0.18], [0.86, 0.18, 0.16], [0.2, 0.5, 0.9], [0.95, 0.95, 0.9]]) {
+    const lab = toOklab(srgbToLinear(r), srgbToLinear(gg), srgbToLinear(bb));
+    const out = gamutFit(lab, 2.5);
+    if (Math.min(...out) < 0 || Math.max(...out) > 1) inGamut = false;
+    const l2 = toOklab(out[0], out[1], out[2]);
+    const dh = Math.atan2(Math.sin(Math.atan2(l2[2], l2[1]) - Math.atan2(lab[2], lab[1])), Math.cos(Math.atan2(l2[2], l2[1]) - Math.atan2(lab[2], lab[1])));
+    if (Math.hypot(lab[1], lab[2]) > 0.02 && Math.abs(dh) > 0.05) hueKept = false;
+  }
+  check('gamut fit stays in sRGB and keeps hue', inGamut && hueKept);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

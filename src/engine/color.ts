@@ -139,3 +139,47 @@ export function whiteBalanceMatrix(illum: Vec3, temp: number, tint: number): Mat
 export function toGLMat3(m: Mat3): Float32Array {
   return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
 }
+
+/* ---------------------------------------------------------------- OKLab */
+
+/** Linear sRGB → OKLab (Ottosson 2020). Mirrors `oklab()` in the shaders. */
+export function toOklab(r: number, g: number, b: number): Vec3 {
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ];
+}
+export function fromOklab(L: number, a: number, b: number): Vec3 {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  return [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  ];
+}
+
+/**
+ * Chroma boost for "rich colour": hue-preserving, in OKLab.
+ * - Near-neutrals (C < ~0.012) are left alone and the gain ramps in by 0.05:
+ *   boosting a grey slate's residual tint just makes a visible cast.
+ * - Reds / oranges (coral, the colours water removes first) get `warm` extra;
+ *   beige sand and yellow fish sit outside that band.
+ * - Never *reduces* chroma; rolls off above a knee so vivid colours don't clip.
+ */
+export const CHROMA_KNEE = 0.12;
+export const CHROMA_MAX = 0.27;
+export function warmWeight(hue: number): number {
+  return smoothstep(-0.3, 0.2, hue) * (1 - smoothstep(1.1, 1.5, hue));
+}
+export function boostChroma(C: number, hue: number, gain: number, warm: number): number {
+  const g = gain * (1 + warm * warmWeight(hue));
+  const x = C * (1 + (g - 1) * smoothstep(0.012, 0.05, C));
+  const soft = x <= CHROMA_KNEE ? x : CHROMA_KNEE + (CHROMA_MAX - CHROMA_KNEE) * Math.tanh((x - CHROMA_KNEE) / (CHROMA_MAX - CHROMA_KNEE));
+  return Math.max(C, soft);
+}

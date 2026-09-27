@@ -147,6 +147,63 @@ try {
   check('manual slider overrides auto live', manual.off < manual.auto - 5, `red ${f1(manual.auto)} → ${f1(manual.off)} (redComp 0), re-render ${f1(manual.ms)} ms`);
   check('A badge returns control to auto', Math.abs(manual.back - manual.auto) < 0.5, `red back to ${f1(manual.back)}`);
 
+  // 豐富色彩: press the real button, measure on the GPU output
+  const vivid = await page.evaluate(() => {
+    const S = window.__scene;
+    const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+    const measure = (o, t) => {
+      let C = 0, L = 0, c = 0, blown = 0;
+      for (let y = 0; y < o.h; y++)
+        for (let x = 0; x < o.w; x++) {
+          const i = (y * o.w + x) * 4;
+          const r = o.px[i] / 255, g = o.px[i + 1] / 255, b = o.px[i + 2] / 255;
+          if (Math.min(r, g, b) >= 0.98) blown++;
+          const ti = Math.min(t.h - 1, Math.floor(((y + 0.5) / o.h) * t.h)) * t.w + Math.min(t.w - 1, Math.floor(((x + 0.5) / o.w) * t.w));
+          if (!t.object[ti]) continue;
+          const lr = lin(r), lg = lin(g), lb = lin(b);
+          const l_ = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+          const m_ = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+          const s_ = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+          const A = 1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_;
+          const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_;
+          C += Math.hypot(A, B);
+          L += 0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_;
+          c++;
+        }
+      return { C: C / c, L: L / c, blown: blown / (o.w * o.h) };
+    };
+    window.__uw.preset('auto');
+    window.__uw.setView({ mode: 0 });
+    window.__uw.render();
+    const o0 = window.__uw.outputPixels();
+    const t = S.truth(o0.w, o0.h);
+    const src = S.degrade(t, 'blue', 8);
+    const off = measure(o0, t);
+    document.getElementById('vivid').click(); // the real UI toggle
+    const r = window.__uw.render();
+    const o1 = window.__uw.outputPixels();
+    const on = measure(o1, t);
+    const pressed = document.getElementById('vivid').getAttribute('aria-pressed');
+    const readout = document.getElementById('fGain').textContent;
+    return {
+      off, on, pressed, readout, gain: r.effective && window.__uw.state().params.vivid,
+      errSrc: S.chromaError(src, o0.w, o0.h, t).err,
+      errOn: S.chromaError(o1.px, o1.w, o1.h, t).err,
+      coralOff: S.chromaError(o0.px, o0.w, o0.h, t, 'coral').redChroma,
+      coralOn: S.chromaError(o1.px, o1.w, o1.h, t, 'coral').redChroma,
+    };
+  });
+  check('豐富色彩 button turns the option on', vivid.pressed === 'true' && vivid.readout.startsWith('×'), `pressed ${vivid.pressed}, readout ${vivid.readout}`);
+  check('豐富色彩: surface colour richer on the GPU (chroma +30 %)', vivid.on.C > vivid.off.C * 1.3, `OKLab C ${f3(vivid.off.C)} → ${f3(vivid.on.C)} (truth 0.077)`);
+  check('豐富色彩: frame not darker, coral redder', vivid.on.L >= vivid.off.L - 0.005 && vivid.coralOn > vivid.coralOff, `L ${f3(vivid.off.L)} → ${f3(vivid.on.L)}, coral red ${f3(vivid.coralOff)} → ${f3(vivid.coralOn)}`);
+  check('豐富色彩: no blown whites, still far closer to truth than the source', vivid.on.blown < 0.01 && vivid.errOn < 0.5 * vivid.errSrc, `blown ${f1(vivid.on.blown * 100)} %, colour error ${f3(vivid.errSrc)} → ${f3(vivid.errOn)}`);
+  await page.evaluate(() => {
+    window.__uw.setView({ mode: 1, split: 0.5 });
+    window.__uw.render();
+  });
+  await page.screenshot({ path: join(OUT, 'studio-vivid.png') });
+  await page.evaluate(() => document.getElementById('vivid').click()); // back off for the rest
+
   const ui = await page.evaluate(() => {
     const slider = document.querySelector('.srow input[aria-label="紅色補償"]');
     slider.value = '0.2';

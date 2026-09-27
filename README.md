@@ -44,6 +44,24 @@ npm run build      # typecheck + production bundle
 - Spatial maps (transmission, CLAHE tiles) are recomputed every frame so they
   move with the picture.
 
+### ✨ 豐富色彩 (rich colour)
+
+Accurate recovery can look flat: on the ground-truth reef the default output
+has only 35–60 % of the true scene's colourfulness and is darker. One tap on
+**✨ 豐富色彩** (strength in the 色彩 group) adds an automatic look layer,
+with every amount *measured per frame*:
+
+- **Adaptive chroma** — mean OKLab chroma of surfaces is measured and a gain
+  computed toward a vivid target: flat frames get a lot, colourful ones little.
+  Hue-preserving (OKLab), near-neutrals (greys, whites) left alone, soft
+  roll-off, and a **gamut fit** that gives back only the added chroma instead
+  of clipping.
+- **Warm emphasis** on reds / oranges — the colours water removes first.
+- **More light** — the auto-exposure target and contrast rise; de-cast eases
+  off and open water keeps a deeper blue.
+
+![豐富色彩 on — split before/after](docs/screenshots/studio-vivid.png)
+
 ### Professional control
 
 - Every auto-driven slider shows the value **auto is applying right now**
@@ -64,7 +82,7 @@ npm run build      # typecheck + production bundle
 SwiftShader, WebCodecs VP9) against scenes with **known ground truth**: a reef
 rendered in true colour, then degraded with the Jaffe–McGlamery image-formation
 model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
-(30 / 30 passing):
+(34 / 34 passing):
 
 | Check | Result |
 |---|---|
@@ -78,11 +96,13 @@ model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
 | Video: descent 5 → 14 m | illuminant tracked smoothly (max step 0.001), no false cuts |
 | Video: blue → green cut at 3.0 s | cut detected at 3.0 s; green water & blue compensation engage |
 | Video export | 150 / 150 frames, VP9 640×360, casts corrected in both scenes |
+| 豐富色彩 (button, GPU) | surface chroma 0.042 → **0.084** (truth 0.077), brighter, coral redder, 0.1 % blown, colour error still 0.532 → 0.180 |
 | Phone layout (390 px) | no horizontal scroll |
 
-`test/engine.test.ts` (26 checks) covers the colour math, LUTs, guided
+`test/engine.test.ts` (32 checks) covers the colour math, LUTs, guided
 filter, recovery goals on the CPU mirror, manual overrides, EMA tracking,
-scene cuts, the eyedropper, and the analysis time budget.
+scene cuts, the eyedropper, 豐富色彩 (richer, not darker, greys stay grey,
+never reduces chroma, gamut fit keeps hue), and the analysis time budget.
 
 ## Architecture
 

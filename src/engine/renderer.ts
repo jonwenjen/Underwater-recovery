@@ -223,6 +223,8 @@ export class Renderer {
       gl.uniform1f(f.u.u_deCast, s.deCast);
       gl.uniform1f(f.u.u_sat, s.saturation);
       gl.uniform1f(f.u.u_vib, s.vibrance);
+      gl.uniform1f(f.u.u_chroma, s.chromaGain);
+      gl.uniform1f(f.u.u_warm, s.warmGain);
       gl.uniform1i(f.u.u_mode, toScope ? 0 : view.mode);
       gl.uniform1f(f.u.u_split, view.split);
       gl.uniform1i(f.u.u_clip, !toScope && view.clip ? 1 : 0);
