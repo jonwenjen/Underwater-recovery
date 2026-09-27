@@ -527,3 +527,49 @@ footer {
 .hidden {
   display: none !important;
 }
+
+/* ------------------------------------------------ neutral anchor (tap-to-grey) */
+
+.anchor {
+  margin: 0.6rem 0 0.9rem;
+  padding: 0.55rem 0.6rem;
+  border: 1px dashed var(--border, #d8dde3);
+  border-radius: 8px;
+}
+.anchor .ghost {
+  width: 100%;
+  cursor: pointer;
+}
+.anchor .hint {
+  margin: 0.4rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--muted, #6b7785);
+}
+/* While a tap is pending, make it obvious the canvas is the target. */
+body.picking .viewer {
+  outline: 2px solid #ff9f43;
+  outline-offset: -2px;
+  cursor: crosshair;
+}
+body.picking .viewer::after {
+  content: "點一下畫面上的物體";
+  position: absolute;
+  left: 50%;
+  top: 0.6rem;
+  transform: translateX(-50%);
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  background: #ff9f43;
+  color: #1a1206;
+  font-size: 0.78rem;
+  font-weight: 600;
+  pointer-events: none;
+}
+/* The "source frame" view is a diagnostic, so say so. */
+#vcv.original {
+  filter: none;
+}
+.viewer.show-original .tag.solo::after {
+  content: "（原片，未套用）";
+}

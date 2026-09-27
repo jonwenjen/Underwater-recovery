@@ -259,6 +259,31 @@ export class VideoPreview {
     await this.waitForFrame();
   }
 
+  /**
+   * Show the untouched source frame instead of the recovered one.
+   *
+   * The preview is the only place the user can see what a change actually did,
+   * so it has to be able to show both. `showOriginal` is read per frame, which
+   * means toggling it mid-playback takes effect on the next frame rather than
+   * needing a re-grab.
+   */
+  showOriginal = false;
+
+  /** The last decoded frame, before any processing. */
+  private lastSource: ImageData | null = null;
+
+  /**
+   * The current frame as decoded, for reading a tap off.
+   *
+   * Deliberately the SOURCE, not the processed preview: the whole point of a
+   * neutral anchor is to tell the pipeline what colour is neutral, so reading
+   * it back from the already-corrected frame would ask the pipeline to
+   * neutralise its own opinion of neutral and converge on nothing.
+   */
+  sourceFrame(): ImageData | null {
+    return this.lastSource;
+  }
+
   /** @returns the analysis of the frame just drawn, for the auto UI. */
   private async renderOnce(params: Params): Promise<Analysis | null> {
     if (this.disposed) return null;
@@ -273,7 +298,11 @@ export class VideoPreview {
       this.canvas.height = h;
     }
     this.ctx.drawImage(this.video, 0, 0, w, h);
-    const frame = this.ctx.getImageData(0, 0, w, h);
+    this.lastSource = this.ctx.getImageData(0, 0, w, h);
+    // Nothing downstream of this point runs for the source view: the frame is
+    // already on the canvas exactly as decoded.
+    if (this.showOriginal) return null;
+    const frame = this.lastSource;
     // The preview analyses the frame it is actually showing, so Auto tracks
     // the frame under the playhead and the diagnosis panel matches what is on
     // screen. The export path analyses the clip separately and never reuses

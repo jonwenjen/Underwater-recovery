@@ -45,6 +45,13 @@ export interface Params {
   // global
   saturation: number; // 0..1.5
   auto: boolean;
+  /**
+   * A Lab (a, b) the user has declared neutral by tapping it, overriding the
+   * whole-image cast estimate. See `neutralAnchor` in the README for why this
+   * exists; it is the only control that reliably removes a colour cast.
+   */
+  anchorA?: number;
+  anchorB?: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
@@ -76,6 +83,97 @@ export interface Analysis {
   suggestedDehaze: number;
   suggestedGamma: number;
   meanLuma: number;
+}
+
+/**
+ * Read a Lab (a, b) from the patch around a tapped pixel, for use as a
+ * user-declared neutral anchor.
+ *
+ * Tapping is far more reliable than the whole-image cast estimate, because the
+ * user knows what *should* be neutral (a wetsuit, a torch, the sand) and the
+ * estimate cannot. Measured on the test photo: the whole-image estimate gives
+ * castA -15.6 while a patch of true mid-grey gives -5.0 — three times too much,
+ * and that overshoot is what pushes every preset warm.
+ *
+ * The patch is a median over a small window rather than a single pixel, so one
+ * hot or dead pixel cannot set the anchor.
+ *
+ * @returns the anchor, or a reason it was rejected.
+ */
+export function neutralAnchorAt(
+  img: ImageData,
+  x: number,
+  y: number,
+  // 1 => a 3x3 median. The job here is only to reject single hot or dead
+  // pixels, and a bigger window stops doing that job: in a cave or over sand
+  // the surroundings are darker than the object, so a 13x13 median (or even
+  // 5x5) reads the water rather than what was tapped. 3x3 still refuses an
+  // outlier but follows the object the user actually hit.
+  radius = 1,
+): { ok: true; a: number; b: number; l: number } | { ok: false; reason: string } {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  const ls: number[] = [];
+  const x0 = Math.max(0, Math.round(x) - radius);
+  const x1 = Math.min(img.width - 1, Math.round(x) + radius);
+  const y0 = Math.max(0, Math.round(y) - radius);
+  const y1 = Math.min(img.height - 1, Math.round(y) + radius);
+  for (let py = y0; py <= y1; py++) {
+    for (let px = x0; px <= x1; px++) {
+      const i = (py * img.width + px) * 4;
+      if (img.data[i + 3] < 200) continue;
+      const r = toLinear(img.data[i]);
+      const g = toLinear(img.data[i + 1]);
+      const b = toLinear(img.data[i + 2]);
+      const Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const X = 0.4124 * r + 0.3576 * g + 0.1805 * b;
+      const Z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+      const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+      const fx = f(X), fy = f(Y), fz = f(Z);
+      xs.push(500 * (fx - fy));
+      ys.push(200 * (fy - fz));
+      ls.push(116 * fy - 16); // CIE L*, the standard 116/16 form
+    }
+  }
+  // a 3x3 window is 9; anything under 4 means we are off the image
+  if (xs.length < 4) return { ok: false, reason: '這個位置沒有足夠的像素，請點畫面中間' };
+  const med = (v: number[]) => v.slice().sort((p, q) => p - q)[v.length >> 1];
+  const L = med(ls);
+  // A tap that is too dark cannot carry a usable a/b (the black-border problem
+  // again), and one that is blown out has clipped, so its cast is meaningless.
+  if (L < 12) return { ok: false, reason: `這個位置太暗了（亮度 ${L.toFixed(0)}），請點中間調的灰色物體` };
+  if (L > 96) return { ok: false, reason: `這個位置太亮或過曝了（亮度 ${L.toFixed(0)}），請點中間調的灰色物體` };
+  // Return the anchor in the SAME baseline-relative convention as
+  // `Analysis.castA`, not as a raw Lab a/b.
+  //
+  // This matters and is easy to get wrong. The sRGB->XYZ rows do NOT sum to
+  // 1.0 each: they sum to 0.9505 (X) and 1.089 (Z). So an sRGB grey (r=g=b)
+  // does NOT land on Lab a=b=0 — it lands near a=-4.8, b=-3.3, because X comes
+  // out below Y and Z above it. `analyse` handles this by subtracting the chroma
+  // of a same-luminance sRGB neutral, which is what makes `castA` zero for a
+  // genuinely neutral photo. An anchor returned as a raw Lab a/b would carry
+  // that ~-4.8 bias into `whiteBalance` and over-correct a neutral tap.
+  const lab = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const lstar = L / 100;
+  // invert L* to linear Y, then take the sRGB-neutral reference at that Y
+  const Yn = lstar > 0.008856 ? lstar ** 3 : (lstar - 16 / 116) / 7.787;
+  const refA = 500 * (lab(Yn * 0.9505) - lab(Yn));
+  const refB = 200 * (lab(Yn) - lab(Yn * 1.089));
+  const castA = med(xs) - refA;
+  const castB = med(ys) - refB;
+  // Sanity bound. A user only ever taps something they believe is neutral; if
+  // the patch is this far from neutral it is sand, coral, a fish or a wetsuit
+  // panel, and taking it at its word wrecks the frame. Measured: a tap that
+  // landed on a yellow fish returned b=+56 and swung the result from warmth
+  // -7.8 to -43.1. Refusing is far easier to recover from than a ruined image.
+  const LIMIT = 30;
+  if (Math.abs(castA) > LIMIT || Math.abs(castB) > LIMIT) {
+    return {
+      ok: false,
+      reason: `這裡看起來是彩色的（色偏 a ${castA.toFixed(0)}、b ${castB.toFixed(0)}），請找灰色、白色或黑色系的物體`,
+    };
+  }
+  return { ok: true, a: castA, b: castB, l: L };
 }
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
@@ -258,8 +356,15 @@ function whiteBalance(
 ) {
   // Shift only the *cast* relative to a neutral grey of the same brightness,
   // so a colour-accurate photo is left alone.
-  const wbA = a.castA * (0.8 * p.wbStrength);
-  const wbB = a.castB * (0.8 * p.wbStrength);
+  // A user-declared neutral wins over the whole-image estimate. The measured
+  // cast is a mean over every pixel, so anything genuinely coloured in the
+  // scene (sand, coral, a red wetsuit) drags it, and the correction that
+  // follows overshoots — which is what makes every preset drift warm.
+  const hasAnchor = p.anchorA !== undefined && p.anchorB !== undefined;
+  const baseA = hasAnchor ? p.anchorA! : a.castA;
+  const baseB = hasAnchor ? p.anchorB! : a.castB;
+  const wbA = baseA * (0.8 * p.wbStrength);
+  const wbB = baseB * (0.8 * p.wbStrength);
   const manA = p.greenBias * 0.5;
   const manB = p.warm * 0.5;
   // A constant a/b offset is a *subtractive* correction, so it is only
@@ -342,7 +447,13 @@ function redRestore(
   if (deficit <= 0.02) return;
   // Cap the expansion. Without a ceiling, a scene that is only mildly
   // red-deficient gets a large exponent and the frame swings magenta.
-  const s = Math.min(p.redStrength, 0.5) * Math.min(deficit, 0.6);
+  //
+  // redStrength is 0..1 in the UI but the safe ceiling is 0.5, so the top half
+  // of the slider used to be dead: 0.5 and 0.9 produced byte-identical output,
+  // while the slider showed the user a number that was not doing anything.
+  // Scaling instead of clamping keeps the whole travel live and lands 1.0 on
+  // the old ceiling.
+  const s = Math.min(p.redStrength * 0.5, 0.5) * Math.min(deficit, 0.6);
 
   // Anchor the expansion at the observed max so nothing clips:
   //   f(v) = tr * (v/tr)^(1-s)   with  f(0)=0 and f(tr)=tr

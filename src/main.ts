@@ -1,5 +1,5 @@
 import './style.css';
-import { analyse, DEFAULT_PARAMS } from './pipeline';
+import { analyse, neutralAnchorAt, DEFAULT_PARAMS } from './pipeline';
 import type { Analysis, Params } from './pipeline';
 import { buildControls, PRESETS } from './controls';
 import RecoveryWorker from './worker?worker';
@@ -496,6 +496,9 @@ const vbar = $('vbar');
 const vstat = $('vstat');
 const vexportBtn = $<HTMLButtonElement>('vexport');
 const vdiag = $('vdiag');
+const vpick = $<HTMLButtonElement>('vpick');
+const vanchorNote = $('vanchorNote');
+const vcmp = $<HTMLButtonElement>('vcmp');
 const vres = $<HTMLSelectElement>('vres');
 const vformat = $<HTMLSelectElement>('vformat');
 const videoPane = $('videoPane');
@@ -614,6 +617,124 @@ async function refreshPreviewFrame() {
   if (!preview) return;
   await grabAt(Math.max(preview.currentTime, 0));
 }
+
+// Original / recovered toggle. The preview is how the user judges a change, so
+// it has to be able to show the source frame too.
+vcmp.addEventListener('click', async () => {
+  const on = vcmp.getAttribute('aria-pressed') !== 'true';
+  vcmp.setAttribute('aria-pressed', String(on));
+  vcmp.textContent = on ? '看恢復後' : '看原片';
+  vcv.classList.toggle('original', on);
+  if (!preview || !videoMeta) return;
+  if (on) {
+    preview.showOriginal = true;
+    vbusy.classList.remove('hidden');
+    try {
+      await preview.grab(videoMeta.duration * (parseInt(vseek.value, 10) / 1000), videoParams());
+    } finally {
+      vbusy.classList.add('hidden');
+    }
+  } else {
+    preview.showOriginal = false;
+    await grabAt(videoMeta.duration * (parseInt(vseek.value, 10) / 1000));
+  }
+});
+
+/**
+ * Apply a tap to whichever canvas was clicked.
+ *
+ * The anchor is read from the SOURCE image, not the processed one — reading it
+ * from the result would ask "what is grey now?" after the pipeline has already
+ * decided, and would then correct its own output.
+ */
+async function applyPick(canvas: HTMLCanvasElement, mode: 'photo' | 'video', ev: MouseEvent) {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round(((ev.clientX - rect.left) / rect.width) * canvas.width);
+  const y = Math.round(((ev.clientY - rect.top) / rect.height) * canvas.height);
+  if (mode === 'video') {
+    if (!preview) return;
+    const frame = preview.sourceFrame();
+    if (!frame) return;
+    const res = neutralAnchorAt(frame, x, y);
+    if (!res.ok) { vanchorNote.textContent = res.reason; return; }
+    videoControls.set({ ...videoControls.params, anchorA: res.a, anchorB: res.b });
+    videoControls.pin('anchorA', 'anchorB');
+    await endPick();
+    vanchorNote.textContent = `已把這裡當成中性色（a ${res.a.toFixed(1)}，b ${res.b.toFixed(1)}）`;
+    return grabAt(videoMeta ? videoMeta.duration * (parseInt(vseek.value, 10) / 1000) : 0);
+  }
+  const it = items[current];
+  if (!it) return;
+  const res = neutralAnchorAt(it.original, x, y);
+  if (!res.ok) { $('anchorNote').textContent = res.reason; return; }
+  photoControls.set({ ...photoControls.params, anchorA: res.a, anchorB: res.b });
+  photoControls.pin('anchorA', 'anchorB');
+  await endPick();
+  $('anchorNote').textContent = `已把這裡當成中性色（a ${res.a.toFixed(1)}，b ${res.b.toFixed(1)}）`;
+  schedule();
+}
+
+$('cv').addEventListener('click', (ev) => {
+  if (picking === 'photo') applyPick($<HTMLCanvasElement>('cv'), 'photo', ev);
+});
+vcv.addEventListener('click', (ev) => {
+  if (picking === 'video') applyPick(vcv, 'video', ev);
+});
+
+/**
+ * Tap-to-neutral, for both modes. See `neutralAnchorAt` in the pipeline.
+ *
+ * Entering pick mode flips the video preview to the source frame, because the
+ * anchor is read from the source. Judging the tap against the recovered image
+ * is a trap: a spot that looks like a mid grey after recovery is often near
+ * black in the source, and the tap gets rejected for being too dark.
+ */
+let picking: 'photo' | 'video' | null = null;
+let pickedWhileComparing = false;
+async function beginPick(which: 'photo' | 'video') {
+  picking = which;
+  const note = which === 'photo' ? $('anchorNote') : vanchorNote;
+  note.textContent =
+    which === 'video'
+      ? '已切到原片，點畫面上應該是灰色／白色的物體'
+      : '點畫面上應該是灰色／白色的物體（再點一次取消）';
+  document.body.classList.add('picking');
+  if (which === 'video' && preview && videoMeta && !preview.showOriginal) {
+    pickedWhileComparing = true;
+    preview.showOriginal = true;
+    vcmp.setAttribute('aria-pressed', 'true');
+    vcmp.textContent = '看恢復後';
+    vcv.classList.add('original');
+    vbusy.classList.remove('hidden');
+    try {
+      await preview.grab(
+        videoMeta.duration * (parseInt(vseek.value, 10) / 1000),
+        videoParams(),
+      );
+    } finally {
+      vbusy.classList.add('hidden');
+    }
+  }
+}
+async function endPick() {
+  const wasPicking = picking;
+  picking = null;
+  document.body.classList.remove('picking');
+  if (pickedWhileComparing && preview) {
+    pickedWhileComparing = false;
+    preview.showOriginal = false;
+    vcmp.setAttribute('aria-pressed', 'false');
+    vcmp.textContent = '看原片';
+    vcv.classList.remove('original');
+  }
+  void wasPicking;
+  $('anchorNote').textContent =
+    '顏色偏紅時最有效：點防寒衣、白靴、沙地等應該是灰色的物體。';
+  vanchorNote.textContent =
+    '顏色偏紅時最有效：點潜水衣、白靴、沙地等應該是灰色的物體。';
+}
+$('pick').addEventListener('click', () => beginPick('photo'));
+vpick.addEventListener('click', () => beginPick('video'));
 
 $('vplay').addEventListener('click', async () => {
   if (!preview) return;

@@ -6,8 +6,8 @@ import type { Analysis, Params } from './pipeline';
 export const PRESETS: Record<string, Partial<Params>> = {
   auto: {},
   blue: {
-    redStrength: 0.9,
-    warm: 12,
+    redStrength: 0.55,
+    warm: 4,
     greenBias: -6,
     dehazeStrength: 0.9,
     claheClip: 2.2,
@@ -26,8 +26,8 @@ export const PRESETS: Record<string, Partial<Params>> = {
     saturation: 1.1,
   },
   murky: {
-    redStrength: 0.5,
-    warm: 6,
+    redStrength: 0.45,
+    warm: 0,
     greenBias: 4,
     dehazeStrength: 1,
     claheClip: 3,
@@ -55,7 +55,7 @@ export const SLIDERS: {
   step: number;
 }[] = [
   { key: 'redStrength', label: '紅色復原', min: 0, max: 1, step: 0.01 },
-  { key: 'warm', label: '暖色（去藍）', min: -50, max: 50, step: 1 },
+  { key: 'warm', label: '暖色 ←→ 冷調', min: -50, max: 50, step: 1 },
   { key: 'greenBias', label: '洋紅（去綠）', min: -50, max: 50, step: 1 },
   { key: 'dehazeStrength', label: '去水霧', min: 0, max: 1, step: 0.01 },
   { key: 'claheClip', label: '局部對比 CLAHE', min: 0, max: 5, step: 0.1 },
@@ -78,6 +78,11 @@ export interface Controls {
   sync(): void;
   /** Replace the params wholesale (preset or reset). */
   set(next: Params): void;
+  /**
+   * Mark keys as user-owned so Auto stops overwriting them. Needed when a
+   * control outside the slider row (a tap on the canvas) changes a param.
+   */
+  pin(...keys: (keyof Params)[]): void;
   /** Push the auto checkbox state into params. */
   setAuto(on: boolean): void;
   /**
@@ -175,6 +180,10 @@ export function buildControls(
     get params() {
       return params;
     },
+    pin(...keys: (keyof Params)[]) {
+      for (const k of keys) manual.add(k);
+    },
+
     get manual() {
       return manual;
     },

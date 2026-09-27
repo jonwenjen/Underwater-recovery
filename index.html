@@ -60,6 +60,13 @@
               <input type="checkbox" id="auto" checked /> 依照片自動調整各項參數
             </label>
 
+            <div class="anchor">
+              <button id="pick" class="ghost">🎯 點一下要去色的物體</button>
+              <p class="hint" id="anchorNote">
+                顏色偏紅時最有效：點防寒衣、白靴、沙地等應該是灰色的物體。
+              </p>
+            </div>
+
             <div class="sliders" id="sliders"></div>
             <button id="reset" class="ghost">全部重設</button>
             <div class="actions">
@@ -91,6 +98,7 @@
               <button id="vplay" class="primary">▶ 播放預覽</button>
               <input type="range" id="vseek" min="0" max="1000" value="0" />
               <span class="time" id="vtime">0:00</span>
+              <button id="vcmp" class="ghost" aria-pressed="false">看原片</button>
             </div>
             <p class="note" id="vnote"></p>
           </div>
@@ -109,6 +117,13 @@
             <label class="row toggle">
               <input type="checkbox" id="vauto" checked /> 依影片自動調整參數
             </label>
+
+            <div class="anchor">
+              <button id="vpick" class="ghost">🎯 點一下要去色的物體</button>
+              <p class="hint" id="vanchorNote">
+                顏色偏紅時最有效：點潜水衣、白靴、沙地等應該是灰色的物體。
+              </p>
+            </div>
 
             <div class="sliders" id="vsliders"></div>
 

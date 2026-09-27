@@ -173,6 +173,11 @@ function dumpDiagnostics(label) {
 let prev;
 try {
   prev = await evaluate(`(async () => {
+  // Show the video tab first. Without this the whole pane stays display:none,
+  // so the canvas has no layout box and anything that needs its screen position
+  // (tap-to-neutral) silently does nothing.
+  document.getElementById('tabVideo').click();
+  await new Promise(r => setTimeout(r, 100));
   const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
   const file = new File([bin], 'test.mp4', { type: 'video/mp4' });
   const dt = new DataTransfer();
@@ -227,9 +232,142 @@ if (prev.lumaMax - prev.lumaMin < 10) {
 }
 if (prev.meanR === 0 && prev.meanB === 0) fail('preview canvas is empty');
 
+// The preview must show the RECOVERED frame, not the source frame. The user
+// reported seeing the original, so assert it rather than trusting the tag.
+const applied = await evaluate(`(async () => {
+  const cv = document.getElementById('vcv');
+  const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+  let r=0,g=0,b=0,n=0;
+  for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+  // the same frame straight from the source file, at the preview size
+  const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
+  const v = document.createElement('video');
+  v.src = URL.createObjectURL(new Blob([bin], { type: 'video/mp4' }));
+  v.muted = true; document.body.appendChild(v);
+  await new Promise(res => { const t=setTimeout(()=>res(),15000);
+    v.addEventListener('loadeddata', () => { clearTimeout(t); res(); }, {once:true}); });
+  v.currentTime = 3; // the preview is parked at 3s above
+  await new Promise(res => { const t=setTimeout(res,15000);
+    v.addEventListener('seeked', () => { clearTimeout(t); res(); }, {once:true}); });
+  const c = document.createElement('canvas');
+  c.width = cv.width; c.height = cv.height;
+  c.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height);
+  const s = c.getContext('2d').getImageData(0,0,cv.width,cv.height).data;
+  let sr=0,sg=0,sb=0;
+  for (let i=0;i<s.length;i+=4){ sr+=s[i]; sg+=s[i+1]; sb+=s[i+2]; }
+  return { applied: [r/n, g/n, b/n].map(v=>Math.round(v)), source: [sr/n, sg/n, sb/n].map(v=>Math.round(v)) };
+})()`);
+const delta = Math.abs(applied.applied[0] - applied.source[0]) + Math.abs(applied.applied[1] - applied.source[1]) + Math.abs(applied.applied[2] - applied.source[2]);
+console.log(`preview vs source: applied rgb(${applied.applied})  source rgb(${applied.source})  delta ${delta}`);
+if (delta < 6) fail('preview shows the SOURCE frame — the pipeline is not applied to the preview');
+
+/* --------------------------------------- original / recovered preview toggle */
+{
+  const grab = `(() => {
+    const cv = document.getElementById('vcv');
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    let r=0,g=0,b=0,n=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    return [Math.round(r/n), Math.round(g/n), Math.round(b/n)];
+  })()`;
+  const before = await evaluate(grab);
+  await evaluate(`document.getElementById('vcmp').click()`);
+  await new Promise(r => setTimeout(r, 4000));
+  const sourceView = await evaluate(grab);
+  const label = await evaluate(`document.getElementById('vcmp').textContent`);
+  await evaluate(`document.getElementById('vcmp').click()`);
+  await new Promise(r => setTimeout(r, 6000));
+  const recovered = await evaluate(grab);
+  console.log(`preview toggle: recovered ${before} -> original ${sourceView} -> recovered ${recovered}  (button now "${label}")`);
+  const dSrc = Math.abs(sourceView[0]-before[0]) + Math.abs(sourceView[1]-before[1]) + Math.abs(sourceView[2]-before[2]);
+  const dBack = Math.abs(recovered[0]-before[0]) + Math.abs(recovered[1]-before[1]) + Math.abs(recovered[2]-before[2]);
+  if (dSrc < 6) fail('toggling to the original did not change the preview — 看原片 is not wired');
+  if (dBack > 6) fail('toggling back did not restore the recovered frame');
+  if (label !== '看恢復後') fail(`compare button label did not flip, got "${label}"`);
+}
+
+/* ------------------------------------------------- tap-to-neutral anchor works */
+{
+  const before = await evaluate(`(() => {
+    const d = document.getElementById('vcv').getContext('2d')
+      .getImageData(0, 0, document.getElementById('vcv').width, document.getElementById('vcv').height).data;
+    let r=0,g=0,b=0,n=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    return [r/n,g/n,b/n];
+  })()`);
+  const dbg = await evaluate(`(() => {
+    const cv = document.getElementById('vcv');
+    const r = cv.getBoundingClientRect();
+    return { attrW: cv.width, attrH: cv.height, rectW: r.width, rectH: r.height,
+             left: r.left, top: r.top,
+             clientX: r.left + r.width/2, clientY: r.top + r.height/2,
+             computed: getComputedStyle(cv).objectFit,
+             display: getComputedStyle(cv).display,
+             visibility: getComputedStyle(cv).visibility,
+             hasOffsetParent: !!cv.offsetParent,
+             viewerW: document.getElementById('vviewer').getBoundingClientRect().width,
+             vworkHidden: document.getElementById('vwork').classList.contains('hidden'),
+             paneHidden: document.getElementById('videoPane').classList.contains('hidden'),
+             winW: window.innerWidth, winH: window.innerHeight };
+  })()`);
+  await evaluate(`document.getElementById('vpick').click()`);
+  // Entering pick mode swaps the preview to the SOURCE frame, and that grab is
+  // async. Wait for it, or we scan the recovered frame and tap a spot that is
+  // near black in the source.
+  await new Promise(r => setTimeout(r, 6000));
+  const showingSource = await evaluate(`(() => {
+    const cv = document.getElementById('vcv');
+    const d = cv.getContext('2d').getImageData(0,0,cv.width,cv.height).data;
+    let r=0,g=0,b=0,n=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    return [Math.round(r/n), Math.round(g/n), Math.round(b/n)];
+  })()`);
+  if (showingSource[0] > 90) fail('pick mode did not switch the preview to the source frame');
+  const cvBox = await evaluate(`(() => { const r = document.getElementById('vcv').getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+  // Tap a mid-tone pixel, the way a user would: the anchor deliberately
+  // rejects taps that are too dark or blown out, and the centre of an
+  // underwater frame is usually dark water.
+  const tapped = await evaluate(`(() => {
+    const cv = document.getElementById('vcv');
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    let best = null, bestScore = 1e9;
+    for (let y = 4; y < cv.height - 4; y += 3) {
+      for (let x = 4; x < cv.width - 4; x += 3) {
+        const i = (y * cv.width + x) * 4;
+        const l = (d[i]*0.2126 + d[i+1]*0.7152 + d[i+2]*0.0722);
+        // want a mid-tone, and a flat neighbourhood so it is a real object
+        let v = Math.abs(l - 128) + Math.abs(d[i] - d[i+1]) + Math.abs(d[i+1] - d[i+2]);
+        if (v < bestScore) { bestScore = v; best = { x, y, l: Math.round(l) }; }
+      }
+    }
+    const r = cv.getBoundingClientRect();
+    cv.dispatchEvent(new MouseEvent('click', { bubbles: true,
+      clientX: r.left + (best.x / cv.width) * r.width,
+      clientY: r.top + (best.y / cv.height) * r.height }));
+    return best;
+  })()`);
+
+  await new Promise(r => setTimeout(r, 7000));
+  const note = await evaluate(`document.getElementById('vanchorNote').textContent.trim()`);
+  const after = await evaluate(`(() => {
+    const cv = document.getElementById('vcv');
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    let r=0,g=0,b=0,n=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    return [r/n,g/n,b/n];
+  })()`);
+  const warmth = (v) => v[0] - (v[1] + v[2]) / 2;
+  console.log(`neutral anchor: warmth ${warmth(before).toFixed(1)} -> ${warmth(after).toFixed(1)}  note="${note}"`);
+  if (!/中性色/.test(note)) fail(`tap did not set an anchor, note said: ${note}`);
+  if (Math.abs(warmth(after) - warmth(before)) < 1) fail('anchor was accepted but changed nothing');
+}
+
 /* ------------------------------------------- photo controls actually work */
 
 const photo = await evaluate(`(async () => {
+  document.getElementById('tabPhotos').click();
+  await new Promise(r => setTimeout(r, 100));
   const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
   // use a still frame of the video as a photo
   const v = document.createElement('video');
@@ -302,12 +440,48 @@ if (distinct.size < 4) fail('presets are not producing distinct output (B2 not f
 if (Math.abs(photo.sliderMoved.before.r - photo.sliderMoved.after.r) < 1)
   fail('moving the red slider did not change the output (B2 not fixed)');
 
+/* ------------------------------------------- photo tap-to-neutral also works */
+{
+  const r = await evaluate(`(async () => {
+    const cv = document.getElementById('cv');
+    // find a mid-tone pixel in the SOURCE half (left of the split handle)
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    let best = null, bestScore = 1e9;
+    for (let y = 6; y < cv.height - 6; y += 3) {
+      for (let x = 6; x < cv.width * 0.45; x += 3) {
+        const i = (y * cv.width + x) * 4;
+        const l = d[i]*0.2126 + d[i+1]*0.7152 + d[i+2]*0.0722;
+        // want a mid-tone AND low chroma — a user taps something neutral, and
+        // tapping the most colourful mid-tone would be refused by design
+        const chroma = Math.max(d[i],d[i+1],d[i+2]) - Math.min(d[i],d[i+1],d[i+2]);
+        const v = Math.abs(l - 128) + chroma * 2;
+        if (v < bestScore) { bestScore = v; best = { x, y, l: Math.round(l), chroma }; }
+      }
+    }
+    const before = (() => { let s=0,n=0; for (let i=0;i<d.length;i+=4){ s += d[i]- (d[i+1]+d[i+2])/2; n++; } return s/n; })();
+    document.getElementById('pick').click();
+    const box = cv.getBoundingClientRect();
+    cv.dispatchEvent(new MouseEvent('click', { bubbles: true,
+      clientX: box.left + (best.x / cv.width) * box.width,
+      clientY: box.top + (best.y / cv.height) * box.height }));
+    await new Promise(r2 => setTimeout(r2, 6000));
+    const d2 = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    let s2=0,n2=0; for (let i=0;i<d2.length;i+=4){ s2 += d2[i]- (d2[i+1]+d2[i+2])/2; n2++; }
+    return { before, after: s2/n2, note: document.getElementById('anchorNote').textContent.trim(), px: best };
+  })()`);
+  console.log(`photo anchor: warmth ${r.before.toFixed(1)} -> ${r.after.toFixed(1)}  note="${r.note}"`);
+  if (!/中性色/.test(r.note)) fail(`photo tap did not set an anchor, note said: ${r.note}`);
+  if (Math.abs(r.after - r.before) < 0.3) fail('photo anchor was accepted but changed nothing');
+}
+
 /* ----------------------------------------------------------------- export */
 
 console.log('running export (offline, every frame)…');
 const t0 = Date.now();
 const MAXEDGE = process.env.MAXEDGE || '360';
 const out = await evaluate(`(async () => {
+  document.getElementById('tabVideo').click();
+  await new Promise(r => setTimeout(r, 300));
   const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
   const file = new File([bin], 'test.mp4', { type: 'video/mp4' });
   const t = Date.now();

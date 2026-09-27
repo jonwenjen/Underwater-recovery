@@ -5,6 +5,7 @@
  */
 import {
   analyse,
+  neutralAnchorAt,
   process as runPipeline,
   DEFAULT_PARAMS,
   autoParams,
@@ -334,6 +335,81 @@ check(
     uAfter.r > uBefore.r * 1.15 && uAfter.blueDominance < uBefore.blueDominance - 15,
     `r ${uBefore.r.toFixed(1)} -> ${uAfter.r.toFixed(1)}, blueDom ${uBefore.blueDominance.toFixed(1)} -> ${uAfter.blueDominance.toFixed(1)}`,
   );
+}
+
+// The red-strength slider used to have a dead top half: Math.min(redStrength,
+// 0.5) made 0.5 and 0.9 produce byte-identical output while the slider showed a
+// number that was not doing anything. Every step must now change the result.
+{
+  const src = makeUnderwater();
+  const an = analyse(asImg(src));
+  const seen: string[] = [];
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+    const out = runPipeline(asImg(src), { ...DEFAULT_PARAMS, auto: false, redStrength: v }, an).image;
+    seen.push(String(stats(out).r.toFixed(2)));
+  }
+  const distinct = new Set(seen).size;
+  check(
+    'every redStrength step changes the output',
+    distinct === seen.length,
+    `red channel at 0/0.25/0.5/0.75/1 -> ${seen.join(', ')}`,
+  );
+}
+
+// A tapped neutral must be measured, and it must override the whole-image cast.
+{
+  const W = 64, H = 64;
+  const src = new ImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      src.data[i] = 40; src.data[i + 1] = 110; src.data[i + 2] = 140; src.data[i + 3] = 255;
+    }
+  }
+  // a neutral patch to tap
+  for (let y = 28; y < 36; y++) {
+    for (let x = 28; x < 36; x++) {
+      const i = (y * W + x) * 4;
+      src.data[i] = 120; src.data[i+1] = 120; src.data[i+2] = 120; src.data[i+3] = 255; // r=g=b: truly neutral
+    }
+  }
+  const an = analyse(asImg(src));
+  const tap = neutralAnchorAt(asImg(src), 32, 32);
+  check('neutral tap is accepted', tap.ok, tap.ok ? `a=${tap.a.toFixed(2)} L=${tap.l.toFixed(0)}` : tap.reason);
+  if (tap.ok) {
+    // A genuinely neutral patch must read as (near) neutral.
+    check(
+      'a neutral patch reads as neutral',
+      Math.abs(tap.a) < 2 && Math.abs(tap.b) < 2,
+      `a=${tap.a.toFixed(2)} b=${tap.b.toFixed(2)}`,
+    );
+    // And the whole-image cast must be much larger for a blue scene, i.e. the
+    // anchor is doing real work rather than restating the estimate.
+    check(
+      'anchor differs from the whole-image cast',
+      Math.abs(tap.a - an.castA) > 1,
+      `anchor a=${tap.a.toFixed(2)} vs image castA=${an.castA.toFixed(2)}`,
+    );
+  }
+  // A black or blown-out tap must be refused with a reason, not silently used.
+  const dark = new ImageData(16, 16);
+  for (let i = 0; i < dark.data.length; i += 4) {
+    dark.data[i] = 4; dark.data[i+1] = 4; dark.data[i+2] = 4; dark.data[i+3] = 255;
+  }
+  check('black tap is refused', !neutralAnchorAt(asImg(dark), 8, 8).ok, 'should not accept');
+  const blown = new ImageData(16, 16);
+  for (let i = 0; i < blown.data.length; i += 4) {
+    blown.data[i] = 255; blown.data[i+1] = 255; blown.data[i+2] = 255; blown.data[i+3] = 255;
+  }
+  check('blown-out tap is refused', !neutralAnchorAt(asImg(blown), 8, 8).ok, 'should not accept');
+  // A saturated object must be refused rather than believed: a tap on a yellow
+  // fish returned b=+56 in the real app and swung the frame hard.
+  const yellow = new ImageData(16, 16);
+  for (let i = 0; i < yellow.data.length; i += 4) {
+    yellow.data[i] = 230; yellow.data[i+1] = 200; yellow.data[i+2] = 40; yellow.data[i+3] = 255;
+  }
+  const yTap = neutralAnchorAt(asImg(yellow), 8, 8);
+  check('a saturated tap is refused', !yTap.ok, yTap.ok ? `accepted b=${yTap.b.toFixed(0)}` : yTap.reason);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
