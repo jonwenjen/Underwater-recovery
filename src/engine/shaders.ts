@@ -36,7 +36,8 @@ vec3 shoulder(vec3 x) {
 /** Downsample the source for analysis (mip-filtered) — plain copy. */
 export const COPY_FS = `${COMMON}
 uniform sampler2D u_src;
-void main() { o = vec4(texture(u_src, srcUV(v_uv)).rgb, 1.0); }
+uniform vec4 u_crop;   // (x0, y0, width, height) in output uv — whole frame, or the noise probe
+void main() { o = vec4(texture(u_src, srcUV(u_crop.xy + v_uv * u_crop.zw)).rgb, 1.0); }
 `;
 
 /**
@@ -139,6 +140,11 @@ uniform vec3 u_gain;
 uniform float u_deCast;
 uniform float u_sat, u_vib;
 uniform float u_chroma, u_warm;   // 豐富色彩: OKLab chroma gain, warm-hue extra
+uniform sampler2D u_rays;         // 光束: radial blur of the bright part toward the source
+uniform float u_beams, u_beamWarm, u_rayGain;
+uniform vec2 u_surfA, u_surfB;    // 水面高光: graduated filter A (full) → B (none)
+uniform float u_surfHL, u_surfTone, u_surfWarm;
+uniform float u_hiThr, u_hiAmt;   // 光線去洋紅: sunlight above u_hiThr loses magenta
 uniform sampler2D u_look;         // user curves: 256×1, rgb = master(channel(x))
 uniform float u_lookOn, u_hslOn;
 uniform float u_hslC[8], u_hslH[8], u_hslS[8], u_hslL[8];
@@ -285,6 +291,44 @@ void main() {
         e = toSrgb(gamutFit(lab, boostChroma(C, atan(lab.z, lab.y)) / C));
       }
     }
+    // 光束: add light along the beams (screen) or take the beam structure away
+    if (abs(u_beams) > 0.001) {
+      float r = clamp(texture(u_rays, uv).r * u_rayGain, 0.0, 1.0);
+      if (u_beams > 0.0) {
+        vec3 tint = vec3(1.0 + 0.25 * u_beamWarm, 1.0, 1.0 - 0.25 * u_beamWarm);
+        e = 1.0 - (1.0 - e) * (1.0 - clamp(u_beams * 1.5 * r * tint, 0.0, 1.0));
+      } else {
+        float Lb = dot(e, LUMA);
+        float Lr = max(Lb + u_beams * 1.2 * r, Lb * 0.55);
+        e *= (Lr + 1e-3) / (Lb + 1e-3);
+      }
+    }
+    // 水面高光: graduated filter from the surface — mirrors applySurface() in light.ts
+    if (u_surfHL > 0.001 || abs(u_surfTone) > 0.001 || abs(u_surfWarm) > 0.001) {
+      vec2 ab = u_surfB - u_surfA;
+      float m = clamp(dot(uv - u_surfA, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+      float wgt = 1.0 - smoothstep(0.0, 1.0, m);
+      if (wgt > 0.0) {
+        float Ls = dot(e, LUMA);
+        float a = u_surfHL * wgt;
+        float Lh = Ls > 0.55 ? 0.55 + (Ls - 0.55) * (1.0 - 0.75 * a) : Ls;
+        Lh *= exp2(u_surfTone * 0.8 * wgt);
+        e *= (Lh + 1e-3) / (Ls + 1e-3);
+        e *= vec3(1.0 + 0.12 * u_surfWarm * wgt, 1.0, 1.0 - 0.12 * u_surfWarm * wgt);
+        e = clamp(e, 0.0, 1.0);
+      }
+    }
+    // 光線去洋紅 — mirrors neutralLight() in light.ts
+    if (u_hiAmt > 0.001) {
+      float wL = smoothstep(u_hiThr - 0.12, u_hiThr, dot(e, LUMA));
+      if (wL > 0.0) {
+        vec3 lab = oklab(toLin(e));
+        float hd = degrees(atan(lab.z, lab.y));
+        float dh = abs(mod(hd - 320.0 + 540.0, 360.0) - 180.0);
+        float k = 1.0 - u_hiAmt * wL * (1.0 - smoothstep(30.0, 55.0, dh)) * (1.0 - smoothstep(0.05, 0.09, length(lab.yz)));
+        if (k < 1.0) e = clamp(toSrgb(fromOklab(vec3(lab.x, lab.yz * k))), 0.0, 1.0);
+      }
+    }
     // user look: curves (per channel, then RGB master), then HSL mixer
     if (u_lookOn > 0.5) {
       e = vec3(texture(u_look, vec2((e.r * 255.0 + 0.5) / 256.0, 0.5)).r,
@@ -339,5 +383,28 @@ void main() {
   }
   vec3 outc = clamp(sy / wy + sc / wc, 0.0, 1.0);
   o = vec4(mix(c0, outc, u_amt), 1.0);
+}
+`;
+
+/**
+ * 光束 rays (half resolution): average the light above a threshold along the
+ * line from each pixel toward the source, with decay — a radial blur of the
+ * bright part, i.e. the beams' own structure, extended toward the light.
+ */
+export const RAYS_FS = `${COMMON}
+uniform sampler2D u_graded;   // alpha = post-CLAHE luminance, output orientation
+uniform vec2 u_sun;           // source, uv (may lie outside the frame)
+uniform float u_thr, u_len;
+void main() {
+  vec2 d = u_sun - v_uv;
+  float acc = 0.0, wsum = 0.0, decay = 1.0;
+  for (int i = 0; i < 40; i++) {
+    vec2 p = v_uv + d * (float(i) / 40.0) * u_len;
+    if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) break;
+    acc += max(texture(u_graded, p).a - u_thr, 0.0) * decay;
+    wsum += decay;
+    decay *= 0.95;
+  }
+  o = vec4(acc / max(wsum, 1e-3), 0.0, 0.0, 1.0);
 }
 `;

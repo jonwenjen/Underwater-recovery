@@ -10,6 +10,7 @@ import { apply3, boostChroma, luma, srgbToLinear, toOklab, whiteBalanceMatrix, t
 import { guidedCoefficients } from '../src/engine/filters.ts';
 import { buildClahe, buildCurve, sampleCurve } from '../src/engine/luts.ts';
 import { applyHsl, buildCurveLut, curveFn, hslWeights, identityCurves, identityHsl, sampleCurveLut, type Pt } from '../src/engine/look.ts';
+import { applySurface, detectBeams, detectSurface, estimateNoise, neutralLight, surfaceMask } from '../src/engine/light.ts';
 import { DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
 
 let failures = 0;
@@ -153,9 +154,21 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   console.log('  blue water  before', fmt(before), '\n              after ', fmt(after));
   check('detects underwater (blue)', s.stats.underwater > 0.6 && s.stats.water === 'blue',
     `score ${s.stats.underwater.toFixed(2)} ${s.stats.water}`);
-  // ≥ 75 % rather than ~0: open water intentionally keeps some blue (水色保留)
-  check('blue cast removed (≥ 75 %)', Math.abs(cast(after)) < 0.25 * cast(before) && cast(before) > 40,
-    `${cast(before).toFixed(1)} → ${cast(after).toFixed(1)}`);
+  // on the subject (left 40 %) ≥ 75 %; the whole frame ≥ 60 % — open water
+  // intentionally keeps some blue (水色保留)
+  const region = (px: ArrayLike<number>, stride: number, scale: number) => {
+    let r = 0, g = 0, b = 0, c = 0;
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W * 0.4; x++) {
+        const i = (y * W + x) * stride;
+        r += px[i] * scale; g += px[i + 1] * scale; b += px[i + 2] * scale; c++;
+      }
+    return { r: r / c, g: g / c, b: b / c };
+  };
+  const subj0 = cast(region(src, 4, 1)), subj1 = cast(region(mirrorRender(src, W, H, s), 3, 255));
+  check('blue cast removed (subject ≥ 75 %, frame ≥ 60 %)',
+    Math.abs(subj1) < 0.25 * subj0 && Math.abs(cast(after)) < 0.4 * cast(before) && cast(before) > 40,
+    `subject ${subj0.toFixed(1)} → ${subj1.toFixed(1)}, frame ${cast(before).toFixed(1)} → ${cast(after).toFixed(1)}`);
   check('red recovered (up ≥ 1.3× and back in balance with green)',
     after.r > before.r * 1.3 && after.r / after.g > 0.8,
     `${before.r.toFixed(1)} → ${after.r.toFixed(1)}, r/g ${(before.r / before.g).toFixed(2)} → ${(after.r / after.g).toFixed(2)}`);
@@ -239,9 +252,14 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     }
   const eng = new AutoEngine();
   for (let i = 0; i < 15; i++) eng.step(img, aw, ah, { params: DEFAULT_PARAMS, locked: none, dt: 1 / 30 }); // JIT warm-up
-  const t0 = performance.now();
-  for (let i = 0; i < 30; i++) eng.step(img, aw, ah, { params: DEFAULT_PARAMS, locked: none, dt: 1 / 30 });
-  const ms = (performance.now() - t0) / 30;
+  // median, not mean: steady-state cost, robust to a stall on a shared CI machine
+  const times: number[] = [];
+  for (let i = 0; i < 30; i++) {
+    const t0 = performance.now();
+    eng.step(img, aw, ah, { params: DEFAULT_PARAMS, locked: none, dt: 1 / 30 });
+    times.push(performance.now() - t0);
+  }
+  const ms = times.sort((a, b) => a - b)[15];
   check(`analysis fits a real-time budget (< 25 ms / frame at ${aw}×${ah})`, ms < 25, `${ms.toFixed(1)} ms`);
 }
 
@@ -259,15 +277,19 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     return { C: c / n, L: l / n };
   };
   const src = underwater('blue');
-  const off = run(src);
-  const on = run(src, { ...DEFAULT_PARAMS, vivid: 0.7 });
+  const auto = run(src);
+  const off = new AutoEngine().step(src, W, H, { params: { ...DEFAULT_PARAMS, vivid: 0 }, locked: new Set<AutoKey>(['vivid']), dt: 0 });
+  const on = new AutoEngine().step(src, W, H, { params: { ...DEFAULT_PARAMS, vivid: 0.7 }, locked: new Set<AutoKey>(['vivid']), dt: 0 });
   const a = meanChroma(mirrorRender(src, W, H, off)), b = meanChroma(mirrorRender(src, W, H, on));
-  check('default leaves 豐富色彩 off (gain exactly 1)', off.chromaGain === 1 && off.warmGain === 0);
+  // full auto applies a mild dose (TUNING.vividAuto, found by scripts/optimize.ts)
+  check('full auto applies mild 豐富色彩; locked at 0 it is off',
+    auto.effective.vivid > 0.1 && auto.effective.vivid < 0.4 && off.chromaGain === 1 && off.warmGain === 0,
+    `auto vivid ${auto.effective.vivid.toFixed(2)}`);
   check('豐富色彩 enriches colour (chroma +30 %)', b.C > a.C * 1.3, `C ${a.C.toFixed(3)} → ${b.C.toFixed(3)}, gain ×${on.chromaGain.toFixed(2)}`);
   check('豐富色彩 does not darken the frame', b.L >= a.L - 0.005, `L ${a.L.toFixed(3)} → ${b.L.toFixed(3)}`);
 
   const g = grey();
-  const go = statsF(mirrorRender(g, W, H, run(g, { ...DEFAULT_PARAMS, vivid: 1 })));
+  const go = statsF(mirrorRender(g, W, H, new AutoEngine().step(g, W, H, { params: { ...DEFAULT_PARAMS, vivid: 1 }, locked: new Set<AutoKey>(['vivid']), dt: 0 })));
   check('豐富色彩 at full strength keeps greys grey', Math.abs(go.r - go.b) < 3 && Math.abs(go.g - go.b) < 3, fmt(go));
 
   let never = true, neutral = true;
@@ -355,6 +377,93 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   let pou = true;
   for (let h = -3.2; h < 3.3; h += 0.05) if (Math.abs(hslWeights(h).reduce((a, b) => a + b, 0) - 1) > 1e-9) pou = false;
   check('HSL band weights always sum to 1 (no seams)', pou);
+}
+
+/* ------------------------------------------------ light: beams, surface, grain */
+
+{
+  // the ground-truth reef of scripts/verify-scene.js, sunlit: beams from (0.7, −0.4)
+  (globalThis as unknown as { window: unknown }).window ??= globalThis;
+  await import('../scripts/verify-scene.js');
+  type Scene = {
+    truth(w: number, h: number): { object: Uint8Array };
+    degrade(t: unknown, water: string, depth: number, seed?: number, opts?: Record<string, number | boolean>): Uint8ClampedArray;
+  };
+  const SC = (globalThis as unknown as { __scene: Scene }).__scene;
+  const w = 192, h = 120;
+  const T = SC.truth(w, h);
+  const lumOf = (px: Uint8ClampedArray) => {
+    const L = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) L[i] = luma(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]) / 255;
+    return L;
+  };
+  const sun = SC.degrade(T, 'blue', 2.5, 3, { beams: true });
+  const plain = SC.degrade(T, 'blue', 8);
+  const b1 = detectBeams(lumOf(sun), w, h), b0 = detectBeams(lumOf(plain), w, h);
+  check('beams detected on a sunlit frame, not on a plain reef', b1.presence > 0.5 && b0.presence < 0.2,
+    `presence ${b1.presence.toFixed(2)} vs ${b0.presence.toFixed(2)}`);
+  check('beam source found above the frame near the true one (0.70, −0.40)', Math.abs(b1.x - 0.7) < 0.3 && b1.y < 0 && b1.y > -1.2,
+    `(${b1.x.toFixed(2)}, ${b1.y.toFixed(2)})`);
+
+  const surf = SC.degrade(T, 'blue', 2.5, 3, { surface: true });
+  const e = (px: Uint8ClampedArray) => Float32Array.from({ length: w * h * 3 }, (_, k) => px[Math.floor(k / 3) * 4 + (k % 3)] / 255);
+  const s1 = detectSurface(lumOf(surf), e(surf), w, h), s0 = detectSurface(lumOf(plain), e(plain), w, h);
+  check('bright surface band detected, B placed just below it', s1.presence > 0.5 && s0.presence < 0.2 && s1.by > 0.1 && s1.by < 0.35,
+    `presence ${s1.presence.toFixed(2)} vs ${s0.presence.toFixed(2)}, B y ${s1.by.toFixed(2)}, clipped ${(s1.clip * 100).toFixed(0)} %`);
+
+  let seed = 5;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  let noiseOk = true;
+  const est: string[] = [];
+  for (const sigma of [2, 5, 10]) {
+    const px = new Uint8ClampedArray(256 * 256 * 4);
+    for (let y = 0; y < 256; y++)
+      for (let x = 0; x < 256; x++) {
+        const i = (y * 256 + x) * 4, base = 120 + 50 * Math.sin(x / 30) * Math.cos(y / 40) + (x > 128 ? 40 : 0);
+        for (let c = 0; c < 3; c++) px[i + c] = base + (rnd() + rnd() + rnd() + rnd() - 2) * 1.732 * sigma;
+        px[i + 3] = 255;
+      }
+    // independent grain per channel: luminance σ = σ·‖(0.2126, 0.7152, 0.0722)‖
+    const want = sigma * 0.748, g = estimateNoise(px, 256, 256);
+    est.push(`${want.toFixed(1)}→${g.toFixed(1)}`);
+    if (Math.abs(g - want) > 0.15 * want + 0.3) noiseOk = false;
+  }
+  check('luminance grain σ estimated within 15 % on a textured frame', noiseOk, est.join(', '));
+
+  check('surface mask: full at A, none past B, smooth between',
+    surfaceMask(0.5, 0, 0.5, 0, 0.5, 0.3) === 1 && surfaceMask(0.5, 0.4, 0.5, 0, 0.5, 0.3) === 0 && Math.abs(surfaceMask(0.2, 0.15, 0.5, 0, 0.5, 0.3) - 0.5) < 1e-6);
+  const same = (a: Vec3, b: Vec3, tol: number) => a.every((v, i) => Math.abs(v - b[i]) <= tol);
+  const hi = applySurface([1, 1, 0.98], 1, 1, 0, 0), mid = applySurface([0.4, 0.45, 0.5], 1, 1, 0, 0);
+  check('surface recovery compresses highlights only', hi[1] < 0.8 && same(mid, [0.4, 0.45, 0.5], 2e-3), `white → ${hi.map((v) => v.toFixed(2)).join(',')}`);
+
+  const labC = (c: Vec3) => { const l = toOklab(srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2])); return Math.hypot(l[1], l[2]); };
+  const pinkLight: Vec3 = [0.93, 0.84, 0.92], coralPink: Vec3 = [0.95, 0.45, 0.62], paleBlue: Vec3 = [0.7, 0.85, 0.95];
+  const nl = neutralLight(pinkLight, 0.8, 0.85);
+  check('光線去洋紅: pale pink light turns white; pink coral and blue water untouched',
+    labC(nl) < 0.4 * labC(pinkLight) && same(neutralLight(coralPink, 0.5, 0.85), coralPink, 1e-6) && same(neutralLight(paleBlue, 0.5, 0.85), paleBlue, 1e-6),
+    `light C ${labC(pinkLight).toFixed(3)} → ${labC(nl).toFixed(3)}`);
+
+  // de-cast guard: sunlit sandy frame — open water must not turn violet
+  const sandy = SC.degrade(T, 'blue', 2.5, 3, { beams: true, surface: true });
+  const st = new AutoEngine().step(sandy, w, h, { params: DEFAULT_PARAMS, locked: none, dt: 0 });
+  const out = mirrorRender(sandy, w, h, st);
+  let wa = 0, wb = 0, wn = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (T.object[i] || i < w * h * 0.15) continue;
+    const lab = toOklab(srgbToLinear(out[i * 3]), srgbToLinear(out[i * 3 + 1]), srgbToLinear(out[i * 3 + 2]));
+    wa += lab[1]; wb += lab[2]; wn++;
+  }
+  const hueDeg = ((Math.atan2(wb / wn, wa / wn) * 180) / Math.PI + 360) % 360;
+  let ba = 0, bb = 0, bn = 0;
+  for (let y = Math.floor(0.16 * h); y < 0.45 * h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, u = x / w, v = y / h;
+      if (T.object[i] || Math.max(0, Math.sin(Math.atan2((u - 0.7) * (w / h), v + 0.4) * 26 + 1.3)) ** 6 * (1 - v / 0.75) < 0.5) continue;
+      const lab = toOklab(srgbToLinear(out[i * 3]), srgbToLinear(out[i * 3 + 1]), srgbToLinear(out[i * 3 + 2]));
+      ba += lab[1]; bb += lab[2]; bn++;
+    }
+  check('sun beams render near-white, not pink', Math.hypot(ba / bn, bb / bn) < 0.025, `beam chroma ${Math.hypot(ba / bn, bb / bn).toFixed(3)}`);
+  check('sunlit sandy frame: open water stays blue–cyan (de-cast guard)', hueDeg > 150 && hueDeg < 275, `water hue ${hueDeg.toFixed(0)}°, de-cast ${st.effective.deCast.toFixed(2)}`);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

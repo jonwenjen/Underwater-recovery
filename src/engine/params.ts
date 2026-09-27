@@ -43,6 +43,21 @@ export interface Params {
   deCast: number;
   /** 豐富色彩 strength (0 = off). The amounts it drives are computed per frame. */
   vivid: number;
+  // light: beams (光束) and surface highlights (水面高光); positions are uv
+  beams: number;
+  beamLength: number;
+  beamWarm: number;
+  beamX: number;
+  beamY: number;
+  surfaceHL: number;
+  surfaceTone: number;
+  surfaceWarm: number;
+  /** 光線去洋紅: take the pink out of pale sunlight (auto from light presence). */
+  lightNeutral: number;
+  surfAx: number;
+  surfAy: number;
+  surfBx: number;
+  surfBy: number;
   // tracking
   response: number;
 }
@@ -62,7 +77,23 @@ export const AUTO_KEYS = [
   'clahe',
   'vibrance',
   'deCast',
+  'beams',
+  'beamX',
+  'beamY',
+  'surfaceHL',
+  'surfAx',
+  'surfAy',
+  'surfBx',
+  'surfBy',
+  'lightNeutral',
+  'restore',
+  'denoise',
+  'threshold',
+  'sharpen',
+  'vivid',
 ] as const satisfies readonly NumKey[];
+/** Auto keys that are control-point positions (dragged on the image, not sliders). */
+export const POSITION_KEYS = ['beamX', 'beamY', 'surfAx', 'surfAy', 'surfBx', 'surfBy'] as const;
 export type AutoKey = (typeof AUTO_KEYS)[number];
 export const isAutoKey = (k: string): k is AutoKey => (AUTO_KEYS as readonly string[]).includes(k);
 
@@ -94,6 +125,19 @@ export const DEFAULT_PARAMS: Params = {
   saturation: 1,
   deCast: 0.4,
   vivid: 0,
+  beams: 0,
+  beamLength: 0.6,
+  beamWarm: 0.1,
+  beamX: 0.5,
+  beamY: -0.5,
+  surfaceHL: 0,
+  surfaceTone: 0,
+  surfaceWarm: 0,
+  lightNeutral: 0,
+  surfAx: 0.5,
+  surfAy: 0,
+  surfBx: 0.5,
+  surfBy: 0.3,
   response: 1.2,
 };
 
@@ -163,6 +207,18 @@ export const GROUPS: Group[] = [
     ],
   },
   {
+    title: '光線（光束／水面高光）',
+    sliders: [
+      { key: 'beams', label: '☀ 光束強度', min: -1, max: 1, step: 0.01, hint: '＋ 加強光束、－ 淡化光束；光源位置用畫面上的 ☀ 控制點拖曳' },
+      { key: 'beamLength', label: '光束長度', min: 0.1, max: 1, step: 0.01, hint: '光束從光源延伸的距離' },
+      { key: 'beamWarm', label: '光束色溫', min: -1, max: 1, step: 0.01, hint: '＋ 暖陽光、－ 冷藍光' },
+      { key: 'surfaceHL', label: '水面高光壓制', min: 0, max: 1, step: 0.01, hint: '救回水面過曝；範圍用畫面上 A（水面）→ B（漸層結束）兩個控制點拖曳' },
+      { key: 'surfaceTone', label: '水面亮度', min: -1, max: 1, step: 0.01, hint: '漸層範圍內整體亮度' },
+      { key: 'surfaceWarm', label: '水面色溫', min: -1, max: 1, step: 0.01, hint: '漸層範圍內的冷暖' },
+      { key: 'lightNeutral', label: '光線去洋紅', min: 0, max: 1, step: 0.01, hint: '紅色補償會讓淺色的陽光／光束偏粉紅：只把明亮、淡色的洋紅拉回白色，珊瑚等飽和粉紅不受影響' },
+    ],
+  },
+  {
     title: '自動追蹤',
     sliders: [
       { key: 'response', label: '反應時間 秒', min: 0.1, max: 5, step: 0.05, hint: '影片中自動參數跟隨畫面變化的平滑時間；場景切換時立即重算' },
@@ -188,21 +244,27 @@ const RAW: Partial<Record<NumKey, number>> = {
   exposure: 0, contrast: 0, highlights: 0, shadows: 0, blacks: 0, whites: 1,
   clahe: 0, clarity: 0, sharpen: 0, denoise: 0, restore: 0,
   vibrance: 0, saturation: 1, deCast: 0, vivid: 0,
+  beams: 0, surfaceHL: 0, surfaceTone: 0, surfaceWarm: 0, lightNeutral: 0,
 };
 
 export const PRESETS: Record<string, Preset> = {
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
   raw: { label: '原始', hint: '所有校正歸零、顯示原圖，從這裡手動調整（曲線／HSL 也重設）', set: RAW, raw: true },
+  // Values from scripts/optimize.ts: each preset searched on the ground-truth
+  // scene it is made for and kept only where it beats full auto there.
   sunny: {
     label: '淺水／陽光',
-    hint: '陽光射入的淺水：保護光束與水面高光、提亮暗部、加強光紋清晰度、保留清透藍綠水色；紅色與去霧仍由自動依畫面量測',
-    // Measured on the shallow ground-truth scenes: locking dehaze low or red
-    // compensation down made colour *worse* (water drifts violet), so those
-    // stay automatic — the preset only does what is specific to sunlight.
-    set: { highlights: -0.5, whites: 1, shadows: 0.2, clarity: 0.25, depthColor: 0.05, waterTint: 0.75, vibrance: 0.3 },
+    hint: '陽光射入的淺水：提亮暗部、光束與水面不過曝、加強光紋清晰度、保留清透藍綠水色；紅色、去霧、光束與水面高光仍由自動依畫面量測',
+    // locking dehaze or red compensation made colour worse (water drifts
+    // violet); the surface filter did no better locked than on auto
+    set: { highlights: -0.1, whites: 1, shadows: 0.45, clarity: 0.25, depthColor: 0, waterTint: 0.95, vibrance: -0.2 },
   },
-  blue: { label: '深藍海水', hint: '深水、強烈藍色偏色', set: { redComp: 1.4, depthColor: 0.45, dehaze: 0.85, vibrance: 0.35 } },
-  green: { label: '綠水／湖', hint: '湖泊、藻類多的綠水', set: { blueComp: 0.8, redComp: 1.1, tint: 0.25, dehaze: 0.8 } },
-  murky: { label: '混濁近攝', hint: '能見度差、懸浮粒子多', set: { dehaze: 0.95, clahe: 0.6, denoise: 0.55, sharpen: 0.35, clarity: 0.3, restore: 0.4 } },
-  strobe: { label: '閃燈', hint: '有閃燈／補光，紅色大多還在', set: { redComp: 0.3, depthColor: 0, dehaze: 0.35, wbStrength: 0.55, clahe: 0.25 } },
+  blue: { label: '深藍海水', hint: '15 m 以上的深水：紅色幾乎全失，少推飽和避免假色', set: { depthColor: 0.1, vibrance: -0.3 } },
+  green: { label: '綠水／湖', hint: '湖泊、藻類多的綠水：補藍、去綠', set: { blueComp: 0.95, tint: 0.6 } },
+  murky: {
+    label: '混濁近攝',
+    hint: '能見度差、懸浮粒子多',
+    set: { dehaze: 0.85, clahe: 0.3, denoise: 0.55, sharpen: 0.35, clarity: 0.3, restore: 0.4 },
+  },
+  strobe: { label: '閃燈', hint: '有閃燈／補光，近處紅色大多還在', set: { redComp: 0.8, depthColor: 0, dehaze: 0.4 } },
 };

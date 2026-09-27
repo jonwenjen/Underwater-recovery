@@ -429,6 +429,7 @@ try {
       }
       return (a - b) / c;
     };
+    U.setParam('restore', 0); // auto now engages 畫質修復 on grain: baseline is off
     const n0 = grab();
     U.setParam('restore', 0.8);
     const n1 = grab();
@@ -507,6 +508,149 @@ try {
     document.querySelectorAll('details.group').forEach((d, i) => { d.open = i < 3; });
   });
 
+  /* ============================================================ light */
+  console.log('\n— light: sun beams, surface highlights, control points, auto 畫質修復');
+  const light = await page.evaluate(async () => {
+    const S = window.__scene, U = window.__uw;
+    const W = 1200, H = 750;
+    const t = S.truth(W, H);
+    await U.addFiles([await S.toFile(S.degrade(t, 'blue', 2.5, 3, { beams: true, surface: true }), W, H, 'sun-beams.png')]);
+    U.preset('auto');
+    U.setView({ mode: 0 });
+    const luma = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const grab = () => {
+      U.render();
+      const cv = document.getElementById('view');
+      const c2 = new OffscreenCanvas(cv.width, cv.height);
+      const x2 = c2.getContext('2d');
+      x2.drawImage(cv, 0, 0);
+      return { w: cv.width, h: cv.height, px: x2.getImageData(0, 0, cv.width, cv.height).data };
+    };
+    // the scene's own beam geometry (verify-scene.js): source (0.7, −0.4)
+    const rayAt = (u, v, aspect) => Math.max(0, Math.sin(Math.atan2((u - 0.7) * aspect, v + 0.4) * 26 + 1.3)) ** 6 * Math.max(0, 1 - v / 0.75);
+    const beamContrast = (o) => {
+      let a = 0, na = 0, b = 0, nb = 0;
+      for (let y = Math.floor(0.16 * o.h); y < 0.45 * o.h; y += 2)
+        for (let x = 0; x < o.w; x += 2) {
+          const u = x / o.w, v = y / o.h;
+          if (t.object[Math.floor(v * H) * W + Math.floor(u * W)]) continue;
+          const r = rayAt(u, v, o.w / o.h), i = (y * o.w + x) * 4, L = luma(o.px[i], o.px[i + 1], o.px[i + 2]);
+          if (r > 0.5) { a += L; na++; } else if (r < 0.02) { b += L; nb++; }
+        }
+      return a / na - b / nb;
+    };
+    const band = (o, v0, v1) => {
+      let blown = 0, L = 0, n = 0;
+      for (let y = Math.floor(v0 * o.h); y < v1 * o.h; y++)
+        for (let x = 0; x < o.w; x++) {
+          const i = (y * o.w + x) * 4;
+          if (Math.min(o.px[i], o.px[i + 1], o.px[i + 2]) >= 250) blown++;
+          L += luma(o.px[i], o.px[i + 1], o.px[i + 2]); n++;
+        }
+      return { blown: blown / n, L: L / n };
+    };
+    const r0 = U.render();
+    const auto = { presence: r0.stats.beamPresence, surf: r0.stats.surfacePresence, eff: r0.effective, noise: r0.stats.noise };
+    const oAuto = grab();
+    // beams: off / enhanced / suppressed, source where the scene has it
+    U.setParam('beamX', 0.7); U.setParam('beamY', -0.4);
+    U.setParam('beams', 0); const oOff = grab();
+    U.setParam('beams', 0.8); const oOn = grab();
+    U.setParam('beams', -0.8); const oSup = grab();
+    // wrong source: enhancing toward a point far to the left helps the beams less
+    U.setParam('beamX', -1.2); U.setParam('beamY', 0.2); U.setParam('beams', 0.8); const oWrong = grab();
+    U.preset('auto');
+    // surface highlights: off vs full recovery
+    U.setParam('surfaceHL', 0); const sOff = grab();
+    U.setParam('surfaceHL', 1); const sOn = grab();
+    U.preset('auto');
+    const vivid0 = U.vividState();
+    document.getElementById('vivid').click();
+    const vivid1 = U.vividState();
+    document.getElementById('vivid').click();
+    const vivid2 = U.vividState();
+    const cv = document.getElementById('view').getBoundingClientRect();
+    return {
+      auto,
+      beams: { auto: beamContrast(oAuto), off: beamContrast(oOff), on: beamContrast(oOn), sup: beamContrast(oSup), wrong: beamContrast(oWrong) },
+      surface: { off: band(sOff, 0, 0.1), on: band(sOn, 0, 0.1), lowOff: band(sOff, 0.6, 1), lowOn: band(sOn, 0.6, 1) },
+      vivid: [vivid0, vivid1, vivid2],
+      canvas: { x: cv.left, y: cv.top, w: cv.width, h: cv.height },
+    };
+  });
+  const L = light;
+  check('auto detects sun beams and a bright surface', L.auto.presence > 0.3 && L.auto.surf > 0.3 && L.auto.eff.surfaceHL > 0.15,
+    `beam presence ${f3(L.auto.presence)}, surface ${f3(L.auto.surf)} → 水面高光壓制 ${f3(L.auto.eff.surfaceHL)}`);
+  check('auto places the beam source above the frame, near the true one (0.70, −0.40)',
+    Math.abs(L.auto.eff.beamX - 0.7) < 0.35 && L.auto.eff.beamY < 0 && L.auto.eff.beamY > -1.2,
+    `(${f3(L.auto.eff.beamX)}, ${f3(L.auto.eff.beamY)})`);
+  check('☀ 光束 + enhances the beams, − suppresses them',
+    L.beams.on > L.beams.off * 1.15 && L.beams.sup < L.beams.off * 0.85,
+    `beam − gap luma: off ${f1(L.beams.off)}, +0.8 ${f1(L.beams.on)}, −0.8 ${f1(L.beams.sup)} (auto ${f1(L.beams.auto)})`);
+  check('beam source position matters (true source > wrong source)', L.beams.on > L.beams.wrong,
+    `at (0.7, −0.4) ${f1(L.beams.on)} vs at (−1.2, 0.2) ${f1(L.beams.wrong)}`);
+  check('水面高光壓制 recovers the clipped surface, leaves the lower frame alone',
+    L.surface.on.blown < 0.5 * L.surface.off.blown && L.surface.on.L < L.surface.off.L && Math.abs(L.surface.lowOn.L - L.surface.lowOff.L) < 1,
+    `blown in top band ${f1(L.surface.off.blown * 100)} % → ${f1(L.surface.on.blown * 100)} %, lower frame Δ ${f1(Math.abs(L.surface.lowOn.L - L.surface.lowOff.L))}`);
+  check('✨ 豐富色彩 button: press locks a strong dose, press again hands back to auto',
+    !L.vivid[0].pressed && L.vivid[1].pressed && L.vivid[1].locked && L.vivid[1].value >= 0.7 && !L.vivid[2].pressed && !L.vivid[2].locked,
+    L.vivid.map((v) => `${v.pressed ? 'on' : 'off'}${v.locked ? '/locked' : ''}`).join(' → '));
+
+  // control points: drag the ☀ handle and the surface B handle with the mouse
+  const pts0 = await page.evaluate(() => window.__uw.showLightPoints(true));
+  const cvr = L.canvas;
+  const to = (u, v) => [cvr.x + u * cvr.w, cvr.y + v * cvr.h];
+  const drag = async (from, [x, y]) => {
+    await page.mouse.move(from[0], from[1]);
+    await page.mouse.down();
+    await page.mouse.move((from[0] + x) / 2, (from[1] + y) / 2, { steps: 4 });
+    await page.mouse.move(x, y, { steps: 4 });
+    await page.mouse.up();
+  };
+  const before = await page.evaluate(() => window.__uw.render().out);
+  await drag(pts0.beam, to(0.25, 0.05));
+  const pts1 = await page.evaluate(() => window.__uw.showLightPoints(true));
+  await drag(pts1.surfB, to(0.5, 0.45));
+  const lp = await page.evaluate(() => ({ lp: window.__uw.lightPoints(), out: window.__uw.render().out }));
+  check('dragging ☀ moves the beam source and locks it',
+    Math.abs(lp.lp.beam[0] - 0.25) < 0.03 && Math.abs(lp.lp.beam[1] - 0.05) < 0.03 && lp.lp.locked.includes('beamX') && lp.lp.locked.includes('beamY'),
+    `(${f3(lp.lp.beam[0])}, ${f3(lp.lp.beam[1])}), locked ${lp.lp.locked.join(',')}`);
+  check('dragging B moves the surface gradient end', Math.abs(lp.lp.surfB[1] - 0.45) < 0.03 && lp.lp.locked.includes('surfBy'),
+    `B (${f3(lp.lp.surfB[0])}, ${f3(lp.lp.surfB[1])})`);
+  check('moving the control points changes the picture', Math.abs(lp.out.r - before.r) + Math.abs(lp.out.g - before.g) + Math.abs(lp.out.b - before.b) > 0.5,
+    `mean RGB ${[before.r, before.g, before.b].map(f1).join('/')} → ${[lp.out.r, lp.out.g, lp.out.b].map(f1).join('/')}`);
+  await page.evaluate(() => {
+    window.__uw.setView({ mode: 1, split: 0.5 });
+    window.__uw.render();
+  });
+  await page.screenshot({ path: join(OUT, 'studio-light.png') });
+  const released = await page.evaluate(() => {
+    document.querySelector('.lp-bar button').click();
+    const r = window.__uw.lightPoints();
+    window.__uw.showLightPoints(false);
+    window.__uw.preset('auto');
+    return r.locked;
+  });
+  check('自動定位 hands every control point back to auto', released.length === 0, released.length ? released.join(',') : 'all auto');
+
+  // auto 畫質修復: engages on grain, stays off on a clean frame
+  const grain = await page.evaluate(async () => {
+    const S = window.__scene, U = window.__uw;
+    const W = 1200, H = 750;
+    const t = S.truth(W, H);
+    await U.addFiles([await S.toFile(S.degrade(t, 'blue', 8, 3, { noise: 10 }), W, H, 'grainy.png')]);
+    U.preset('auto');
+    const a = U.render();
+    await U.addFiles([await S.toFile(S.degrade(t, 'blue', 8), W, H, 'clean.png')]);
+    const b = U.render();
+    return { noisy: { sigma: a.stats.noise, restore: a.effective.restore, sharpen: a.effective.sharpen }, clean: { sigma: b.stats.noise, restore: b.effective.restore, sharpen: b.effective.sharpen } };
+  });
+  check('auto 畫質修復 engages on grain, stays off on a clean frame',
+    grain.noisy.restore > 0.3 && grain.clean.restore < 0.1 && grain.noisy.sigma > grain.clean.sigma + 3,
+    `σ ${f1(grain.clean.sigma)} → restore ${f3(grain.clean.restore)}; σ ${f1(grain.noisy.sigma)} → restore ${f3(grain.noisy.restore)}`);
+  check('auto sharpening backs off on grain', grain.noisy.sharpen < grain.clean.sharpen,
+    `sharpen ${f3(grain.clean.sharpen)} (clean) vs ${f3(grain.noisy.sharpen)} (grainy)`);
+
   /* ============================================================ video */
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');
   const clip = await page.evaluate(async () => {
@@ -551,10 +695,14 @@ try {
   // The clip descends 5 → 14 m: red light fades, so the estimated illuminant's
   // red must fall steadily (the synthetic camera auto-exposes, so brightness
   // is not the signal here — colour is).
+  // (red compensation runs first, so the illuminant keeps only the red deficit
+  // it leaves: the drop is small but must be steady)
+  let falls = 0;
+  for (let i = 1; i < blue.length; i++) if (blue[i].illumR <= blue[i - 1].illumR + 1e-4) falls++;
   check(
-    'auto white balance tracks the descent (illuminant red falls)',
-    blue.length > 5 && blue[blue.length - 1].illumR < blue[0].illumR - 0.03,
-    `illum R ${f3(blue[0]?.illumR)} → ${f3(blue[blue.length - 1]?.illumR)}`,
+    'auto white balance tracks the descent (illuminant red falls steadily)',
+    blue.length > 5 && blue[blue.length - 1].illumR < blue[0].illumR - 0.02 && falls >= 0.9 * (blue.length - 1),
+    `illum R ${f3(blue[0]?.illumR)} → ${f3(blue[blue.length - 1]?.illumR)}, falling in ${falls}/${blue.length - 1} steps`,
   );
   check('tracking is smooth within a scene (no jumps)', maxStep < 0.03, `max step ${f3(maxStep)} per sample`);
   const falseCuts = [...new Set(cuts.filter((t) => t < 2.7 || t > 3.6).map((t) => t.toFixed(1)))];
@@ -569,10 +717,24 @@ try {
   const vexp = await page.evaluate(() => window.__uw.exportVideo({ maxEdge: 640, format: 'webm' }));
   check('video export completes, frame-exact', !vexp.canceled && vexp.frames === 150 && vexp.probe?.frames === 150, `${vexp.frames} frames processed, ${vexp.probe?.frames} in file`);
   check('export codec & size', vexp.codec === 'vp9' && vexp.probe.width === 640 && vexp.probe.height === 360, `${vexp.codec} ${vexp.probe.width}×${vexp.probe.height} ${(vexp.size / 1024).toFixed(0)} KB in ${f1(vexp.ms / 1000)} s`);
-  const vf = await page.evaluate(async () => ({ blue: await window.__uw.exportedFrameStats(1.5), green: await window.__uw.exportedFrameStats(4.2) }));
+  const vf = await page.evaluate(async () => {
+    const S = window.__scene;
+    // true scene of each frame (the sand makes the truth itself yellowish)
+    const mean = (px) => { let r = 0, g = 0, b = 0; for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i + 1]; b += px[i + 2]; } const n = px.length / 4; return { r: r / n, g: g / n, b: b / n }; };
+    return {
+      blue: await window.__uw.exportedFrameStats(1.5),
+      green: await window.__uw.exportedFrameStats(4.2),
+      truthBlue: mean(S.clean(S.truth(320, 180, 45 * 0.004, 7))),
+      truthGreen: mean(S.clean(S.truth(320, 180, 0.3, 11))),
+    };
+  });
   const gcast = (s) => s.g - (s.r + s.b) / 2;
-  check('exported blue-water frame corrected', Math.abs(cast(vf.blue.out)) < 0.3 * cast(vf.blue.src), `blue cast ${f1(cast(vf.blue.src))} → ${f1(cast(vf.blue.out))}`);
-  check('exported green-water frame corrected', Math.abs(gcast(vf.green.out)) < 0.3 * gcast(vf.green.src), `green cast ${f1(gcast(vf.green.src))} → ${f1(gcast(vf.green.out))}`);
+  check('exported blue-water frame corrected (> 70 % of the way to truth)',
+    Math.abs(cast(vf.blue.out) - cast(vf.truthBlue)) < 0.3 * Math.abs(cast(vf.blue.src) - cast(vf.truthBlue)),
+    `blue cast ${f1(cast(vf.blue.src))} → ${f1(cast(vf.blue.out))} (truth ${f1(cast(vf.truthBlue))})`);
+  check('exported green-water frame corrected (> 70 % of the way to truth)',
+    Math.abs(gcast(vf.green.out) - gcast(vf.truthGreen)) < 0.3 * Math.abs(gcast(vf.green.src) - gcast(vf.truthGreen)),
+    `green cast ${f1(gcast(vf.green.src))} → ${f1(gcast(vf.green.out))} (truth ${f1(gcast(vf.truthGreen))})`);
 
   // speed + rotation in the exporter, and the preview speed control
   const spd = await page.evaluate(async () => {

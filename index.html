@@ -47,6 +47,7 @@
             <button id="clip" class="chip" aria-pressed="false" title="紅色＝高光溢出，藍色＝暗部死黑">過曝警告</button>
             <button id="dropper" class="chip" aria-pressed="false" title="點選畫面中應該是中性白／灰的物體（沙地、氣瓶、白板）">白點滴管</button>
             <button id="clearPick" class="chip hidden">清除白點</button>
+            <button id="lightPts" class="chip" aria-pressed="false" title="在畫面上顯示可拖曳的 ☀ 光束光源與水面高光 A→B 控制點">☀ 光線控制點</button>
             <div class="seg" role="group" aria-label="旋轉與翻轉">
               <button id="rotL" title="逆時針旋轉 90°" aria-label="逆時針旋轉 90°">⟲</button>
               <button id="rotR" title="順時針旋轉 90°" aria-label="順時針旋轉 90°">⟳</button>
@@ -95,6 +96,8 @@
               <div><dt>水體光</dt><dd><i class="sw" id="swA"></i></dd></div>
               <div><dt>光源</dt><dd><i class="sw" id="swI"></i></dd></div>
               <div><dt>色彩增益</dt><dd id="fGain">關</dd></div>
+              <div><dt>雜訊</dt><dd id="fNoise">—</dd></div>
+              <div><dt>光線</dt><dd id="fLight">—</dd></div>
             </dl>
           </div>
 
@@ -105,7 +108,7 @@
             </label>
             <div class="presets" id="presets"></div>
             <button id="vivid" class="vivid" aria-pressed="false" title="依畫面實測彩度自動補足色彩、暖色、亮度與水色；強度可在「色彩」群組微調">
-              ✨ 豐富色彩<small>自動把光線與色彩算得更飽滿</small>
+              ✨ 豐富色彩<small id="vividNote">自動把光線與色彩算得更飽滿</small>
             </button>
           </div>
 
@@ -173,7 +176,7 @@
       </main>
 
       <footer>
-        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩 → 使用者曲線／HSL。可選：畫質修復（保邊去雜訊）、旋轉翻轉、變速輸出。
+        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩 → 光束／水面高光（畫面控制點）→ 使用者曲線／HSL。可選：畫質修復（保邊去雜訊）、旋轉翻轉、變速輸出。
         影片自動追蹤：每幀分析、指數平滑、場景切換立即重算。MIT License · 影音 I/O：mediabunny
       </footer>
     </div>

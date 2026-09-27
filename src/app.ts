@@ -5,6 +5,7 @@ import {
   AUTO_KEYS,
   DEFAULT_PARAMS,
   GROUPS,
+  POSITION_KEYS,
   PRESETS,
   isAutoKey,
   type AutoKey,
@@ -16,6 +17,7 @@ import { cloneLook, identityLook, type Look } from './engine/look.ts';
 import { NO_ORIENT, orientedSize, Processor, type Orient, type View } from './engine/renderer.ts';
 import { curveEditor } from './ui/curves.ts';
 import { hslPanel } from './ui/hsl.ts';
+import { lightPoints, type PointId } from './ui/lightPoints.ts';
 
 type ExportMod = typeof import('./engine/export.ts');
 let exportMod: Promise<ExportMod> | null = null;
@@ -162,6 +164,9 @@ function renderAnalysis(st: FrameState) {
   $('swA').style.background = rgbCss(s.waterLight);
   $('swI').style.background = rgbCss(s.illum);
   $('fGain').textContent = st.chromaGain > 1.001 || st.warmGain > 0.001 ? `×${st.chromaGain.toFixed(2)}` : '關';
+  $('fNoise').textContent = s.noise > 0 ? `σ ${s.noise.toFixed(1)}` : '—';
+  const light = [s.beamPresence > 0.3 ? '光束' : '', s.surfacePresence > 0.3 ? '水面' : ''].filter(Boolean).join('＋');
+  $('fLight').textContent = light || '無';
   const px = proc.renderer.readScope(st);
   drawHistogram(px);
   curvesUi?.draw(px);
@@ -281,6 +286,7 @@ function buildControls() {
 
 function refreshControls(st: FrameState | null) {
   syncVivid();
+  lp?.update();
   for (const [k, r] of rows) {
     const auto = isFollowingAuto(k);
     const v = auto && st ? st.effective[k as AutoKey] : params[k];
@@ -311,10 +317,15 @@ function buildPresets() {
 
 function applyPreset(key: string) {
   const pr = PRESETS[key];
-  // presets choose the water model; rich colour and tracking speed are the
-  // user's taste and survive a preset change
-  params = { ...DEFAULT_PARAMS, auto: true, response: params.response, vivid: params.vivid, restore: params.restore };
+  // presets choose the water model; rich colour, restoration and tracking
+  // speed are the user's taste and survive a preset change — except 全自動,
+  // which hands everything back to auto
+  const prev = params;
+  params = { ...DEFAULT_PARAMS, auto: true, response: prev.response };
+  if (key !== 'auto') Object.assign(params, { vivid: prev.vivid, restore: prev.restore });
+  const keep = key === 'auto' ? [] : (['vivid', 'restore'] as AutoKey[]).filter((k) => locked.has(k));
   locked.clear();
+  for (const k of keep) locked.add(k);
   for (const [k, v] of Object.entries(pr.set) as [NumKey, number][]) {
     params[k] = v;
     if (isAutoKey(k)) locked.add(k);
@@ -338,18 +349,30 @@ function markPreset(key: string | null) {
   );
 }
 
-/* 豐富色彩: one tap on/off; the slider in 色彩 sets how strong */
+/* 豐富色彩: full auto already applies a mild dose (measured per frame); the
+ * button locks a strong one, pressing again hands it back to auto. The
+ * slider in 色彩 sets how strong. */
 const VIVID_ON = 0.7;
 let lastVivid = VIVID_ON;
+const vividPressed = () => !isFollowingAuto('vivid') && params.vivid > 0;
 function syncVivid() {
-  $('vivid').setAttribute('aria-pressed', String(params.vivid > 0));
+  $('vivid').setAttribute('aria-pressed', String(vividPressed()));
+  $('vividNote').textContent = vividPressed()
+    ? `強度 ${params.vivid.toFixed(2)} · 再按一下交還自動`
+    : isFollowingAuto('vivid')
+      ? `自動輕度套用中${lastState ? `（${lastState.effective.vivid.toFixed(2)}）` : ''} · 按一下加強`
+      : '自動把光線與色彩算得更飽滿';
 }
 $('vivid').addEventListener('click', () => {
-  if (params.vivid > 0) {
+  if (vividPressed()) {
     lastVivid = params.vivid;
-    params.vivid = 0;
-  } else params.vivid = lastVivid;
-  syncVivid();
+    if (params.auto) locked.delete('vivid');
+    else params.vivid = 0;
+  } else {
+    params.vivid = lastVivid;
+    if (params.auto) locked.add('vivid');
+  }
+  markPreset(null);
   refreshControls(lastState);
   requestRender();
 });
@@ -506,6 +529,7 @@ async function select(i: number) {
   }
   updateLabels();
   renderStrip();
+  lp.show($('lightPts').getAttribute('aria-pressed') === 'true');
   requestRender(true);
 }
 
@@ -757,6 +781,65 @@ $<HTMLSelectElement>('vspeed').addEventListener('change', (e) => {
   $('speedNote').classList.toggle('hidden', (e.target as HTMLSelectElement).value === '1');
 });
 
+/* --------------------------------------------- light control points */
+
+const BEAM_KEYS = ['beamX', 'beamY'] as const;
+const SURF_KEYS = ['surfAx', 'surfAy', 'surfBx', 'surfBy'] as const;
+const eff = (k: AutoKey) => (isFollowingAuto(k) && lastState ? lastState.effective[k] : params[k]);
+const lp = lightPoints(
+  viewer,
+  canvas,
+  {
+    points: () => ({
+      beam: [eff('beamX'), eff('beamY')],
+      surfA: [eff('surfAx'), eff('surfAy')],
+      surfB: [eff('surfBx'), eff('surfBy')],
+      beamAuto: BEAM_KEYS.every((k) => isFollowingAuto(k)),
+      surfAuto: SURF_KEYS.every((k) => isFollowingAuto(k)),
+      beamActive: Math.abs(eff('beams')) > 0.02,
+      surfActive: eff('surfaceHL') > 0.02 || params.surfaceTone !== 0 || params.surfaceWarm !== 0,
+    }),
+    move: (id: PointId, u: number, v: number) => movePoint(id, u, v),
+    release: (group) => releasePoints(group === 'beam' ? BEAM_KEYS : SURF_KEYS),
+  },
+  () => releasePoints(POSITION_KEYS),
+);
+function movePoint(id: PointId, u: number, v: number) {
+  // the whole group becomes manual, starting from what auto had
+  const group = id === 'beam' ? BEAM_KEYS : SURF_KEYS;
+  for (const k of group) if (isFollowingAuto(k)) params[k] = eff(k);
+  const [kx, ky] = id === 'beam' ? BEAM_KEYS : id === 'surfA' ? (['surfAx', 'surfAy'] as const) : (['surfBx', 'surfBy'] as const);
+  params[kx] = u;
+  params[ky] = v;
+  for (const k of group) if (isAutoKey(k)) locked.add(k);
+  // moving a point of an effect that is off turns it on, so the drag shows
+  if (id === 'beam' && Math.abs(eff('beams')) < 0.05) {
+    params.beams = 0.4;
+    locked.add('beams');
+  }
+  if (id !== 'beam' && eff('surfaceHL') < 0.05 && params.surfaceTone === 0 && params.surfaceWarm === 0) {
+    params.surfaceHL = 0.6;
+    locked.add('surfaceHL');
+  }
+  markPreset(null);
+  refreshControls(lastState);
+  requestRender();
+}
+function releasePoints(keys: readonly AutoKey[]) {
+  for (const k of keys) locked.delete(k);
+  refreshControls(lastState);
+  requestRender();
+}
+function showLightPoints(on: boolean) {
+  togglePressed('lightPts', on);
+  lp.show(on && current >= 0);
+  if (on) {
+    const g = [...document.querySelectorAll<HTMLDetailsElement>('#groups details')].find((d) => d.textContent?.includes('光束'));
+    if (g) g.open = true;
+  }
+}
+$('lightPts').addEventListener('click', () => showLightPoints($('lightPts').getAttribute('aria-pressed') !== 'true'));
+
 /* ------------------------------------------------------------------ init */
 
 buildControls();
@@ -803,6 +886,18 @@ Object.assign(window as unknown as Record<string, unknown>, {
     unlock(k: AutoKey) {
       locked.delete(k);
     },
+    /** Show the light control-point overlay; returns handle centres (client px). */
+    showLightPoints(on: boolean) {
+      showLightPoints(on);
+      return on ? { beam: lp.handleCenter('beam'), surfA: lp.handleCenter('surfA'), surfB: lp.handleCenter('surfB') } : null;
+    },
+    lightPoints: () => ({
+      beam: [eff('beamX'), eff('beamY')],
+      surfA: [eff('surfAx'), eff('surfAy')],
+      surfB: [eff('surfBx'), eff('surfBy')],
+      locked: POSITION_KEYS.filter((k) => locked.has(k)),
+    }),
+    vividState: () => ({ pressed: vividPressed(), locked: locked.has('vivid'), value: params.vivid }),
     preset: (k: string) => applyPreset(k),
     setView(v: Partial<View>) {
       Object.assign(view, v);

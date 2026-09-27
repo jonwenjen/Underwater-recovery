@@ -21,6 +21,8 @@
   const WATER = {
     blue: { beta: [0.4, 0.065, 0.035], K: [0.3, 0.05, 0.025], B: [0.015, 0.16, 0.3] },
     green: { beta: [0.35, 0.09, 0.16], K: [0.25, 0.06, 0.13], B: [0.02, 0.24, 0.12] },
+    // coastal / silty: strong scattering everywhere, olive veil
+    murky: { beta: [0.75, 0.42, 0.5], K: [0.35, 0.12, 0.16], B: [0.05, 0.13, 0.1] },
   };
 
   /**
@@ -110,28 +112,63 @@
     return { J, d, object, coral, slate, w, h };
   }
 
-  /** Degrade a truth scene. Returns 8-bit sRGB RGBA. */
-  function degrade(t, water = 'blue', depth = 8, seed = 3) {
+  /**
+   * Degrade a truth scene. Returns 8-bit sRGB RGBA. Options:
+   *  - strobe: strength of a white light at the camera (it travels to the
+   *    object and back, so near objects keep their red; falls off with d²)
+   *  - beams: sun shafts converging on a source above the frame (in-water
+   *    scattering, added to the radiance)
+   *  - surface: a bright, partly clipped surface band at the top
+   *  - noise: sensor grain σ in 8-bit steps
+   */
+  function degrade(t, water = 'blue', depth = 8, seed = 3, opts = {}) {
     const { J, d, w, h } = t;
     const W = WATER[water];
     const E = W.K.map((k) => Math.exp(-k * depth));
     const n = w * h;
     const lin = new Float32Array(n * 3);
+    const strobe = opts.strobe || 0;
     let lsum = 0;
     for (let i = 0; i < n; i++) {
       for (let c = 0; c < 3; c++) {
         const tc = Math.exp(-W.beta[c] * d[i]);
-        lin[i * 3 + c] = toLin(J[i * 3 + c]) * E[c] * tc + W.B[c] * (1 - tc);
+        const lamp = strobe ? (strobe * Math.exp(-W.beta[c] * d[i])) / (1 + 0.25 * d[i] * d[i]) : 0;
+        lin[i * 3 + c] = toLin(J[i * 3 + c]) * (E[c] + lamp) * tc + W.B[c] * (1 - tc);
       }
       lsum += 0.2126 * lin[i * 3] + 0.7152 * lin[i * 3 + 1] + 0.0722 * lin[i * 3 + 2];
     }
     // camera auto-exposure to a mid-grey average, as a real camera would
     const gain = 0.16 / (lsum / n);
+    if (opts.beams || opts.surface) {
+      const aspect = w / h;
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          const u = x / w,
+            v = y / h,
+            q = (y * w + x) * 3;
+          let add = 0;
+          if (opts.beams) {
+            // source at (0.7, −0.4): shafts fan out downward, fade with depth
+            const ang = Math.atan2((u - 0.7) * aspect, v + 0.4);
+            const ray = Math.max(0, Math.sin(ang * 26 + 1.3)) ** 6 * Math.max(0, 1 - v / 0.75);
+            add += 0.5 * ray * W.B[2] * 3;
+          }
+          if (opts.surface && v < 0.14) add += 1.6 * (1 - v / 0.14) ** 2 * (0.75 + 0.25 * Math.sin(u * 60 + Math.sin(u * 13) * 3));
+          if (add > 0) {
+            lin[q] += add * (0.6 / gain) * 0.8;
+            lin[q + 1] += add * (0.6 / gain);
+            lin[q + 2] += add * (0.6 / gain);
+          }
+        }
+    }
     const r = rng(seed);
+    const sigma = opts.noise || 0;
     const out = new Uint8ClampedArray(n * 4);
     for (let i = 0; i < n; i++) {
       const speck = r() < 0.0015 ? 0.25 : 0; // backscatter particles
-      for (let c = 0; c < 3; c++) out[i * 4 + c] = Math.round(toSrgb(lin[i * 3 + c] * gain + speck) * 255 + (r() - 0.5) * 3);
+      const gn = sigma ? (r() + r() + r() + r() - 2) * 1.732 * sigma : 0; // ≈ Gaussian, σ in 8-bit steps
+      for (let c = 0; c < 3; c++)
+        out[i * 4 + c] = Math.round(toSrgb(lin[i * 3 + c] * gain + speck) * 255 + (r() - 0.5) * 3 + gn);
       out[i * 4 + 3] = 255;
     }
     return out;
@@ -181,5 +218,5 @@
     return { err: err / Math.max(1, cnt), redChroma: rc / Math.max(1, cnt), n: cnt };
   }
 
-  window.__scene = { truth, degrade, clean, toFile, chromaError, WATER };
+  (typeof window !== 'undefined' ? window : globalThis).__scene = { truth, degrade, clean, toFile, chromaError, WATER };
 })();

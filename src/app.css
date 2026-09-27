@@ -333,7 +333,7 @@ details.group {
 }
 .facts {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 6px;
   margin: 10px 0 0;
 }
@@ -585,4 +585,91 @@ footer {
 #flipH[aria-pressed='true'] {
   background: rgba(52, 211, 238, 0.18);
   color: var(--accent);
+}
+
+/* light control points overlay */
+.lp {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.lp-svg {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+.lp-fan line {
+  stroke: rgba(255, 209, 102, 0.55);
+  stroke-width: 1;
+  stroke-dasharray: 4 6;
+}
+.lp-grad line {
+  stroke: rgba(52, 211, 238, 0.75);
+  stroke-width: 1.2;
+}
+.lp-grad line.end {
+  stroke-dasharray: 5 5;
+}
+.lp-grad line.axis {
+  stroke-width: 1.6;
+}
+.lp-fan.idle line,
+.lp-grad.idle line {
+  opacity: 0.35;
+}
+.lp-h {
+  pointer-events: all;
+  cursor: grab;
+  outline: none;
+}
+.lp-h.drag {
+  cursor: grabbing;
+}
+.lp-h circle {
+  fill: rgba(4, 16, 28, 0.72);
+  stroke: #fff;
+  stroke-width: 2;
+}
+.lp-h text {
+  fill: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: none;
+  user-select: none;
+}
+.lp-h.auto circle {
+  stroke: var(--accent-2);
+}
+.lp-h.auto text {
+  fill: var(--accent-2);
+}
+.lp-h.off circle {
+  stroke-dasharray: 4 3;
+}
+.lp-h.idle {
+  opacity: 0.6;
+}
+.lp-h:focus-visible circle,
+.lp-h:hover circle {
+  stroke-width: 3;
+}
+.lp-bar {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  pointer-events: auto;
+  font-size: 0.74rem;
+}
+.lp-bar button {
+  padding: 3px 9px;
+  font-size: 0.74rem;
+}
+.lp-bar span {
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--dim);
 }

@@ -40,7 +40,8 @@ import {
   type Vec3,
 } from './color.ts';
 import { boxMean, guidedCoefficients, minFilter, quantiles } from './filters.ts';
-import { buildClahe, buildCurve, sampleClahe } from './luts.ts';
+import { buildClahe, buildCurve, sampleClahe, sampleCurve } from './luts.ts';
+import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetect } from './light.ts';
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 
 /**
@@ -52,6 +53,27 @@ export const ANALYSIS_EDGE = 192;
 /** Mean surface chroma (OKLab) that 豐富色彩 at full strength aims for; the
  * ground-truth reef scene measures 0.077, the flat default output 0.03–0.06. */
 export const CHROMA_TARGET = 0.085;
+
+/**
+ * Every constant that maps a measurement to an auto value, in one place so
+ * scripts/optimize.ts can search them against the ground-truth scene suite.
+ * Values below are the optimizer's result (see README "How auto was tuned").
+ */
+export const TUNING = {
+  redGain: 1.6, // Ancuti α for red at full underwater confidence
+  blueGain: 1.15, // same for blue in green water
+  wbGain: 0.98, // white-balance strength
+  dehazeBase: 0.1, // dehaze on a non-underwater frame
+  dehazeGain: 0.9, // extra dehaze at full underwater confidence (sum ≤ 1)
+  depthGain: 0.7, // distance colour compensation per unit residual red deficit
+  claheBase: 0,
+  claheFlat: 0.22, // CLAHE on flat frames (dehaze already restores contrast)
+  kLo: 0.24, // auto exposure lifts frames whose log-average is below this
+  vibBase: 0,
+  vibGain: 0.34,
+  deCastGain: 0.88,
+  vividAuto: 0.25, // automatic 豐富色彩 in full-auto mode
+};
 export const T0 = 0.3; // transmission floor: keeps far water from turning to noise
 /**
  * Share of the dehazed *colour* kept; the rest of dehaze acts on luminance.
@@ -99,6 +121,10 @@ export interface FrameState {
   threshold: number;
   denoise: number;
   clarity: number;
+  beams: { x: number; y: number; amount: number; length: number; warm: number; thr: number };
+  surface: { ax: number; ay: number; bx: number; by: number; hl: number; tone: number; warm: number };
+  /** 光線去洋紅: highlights above `thr` (output luma) lose magenta by `amount`. */
+  neutral: { thr: number; amount: number };
   /** Values actually applied for every auto key (for the UI). */
   effective: Record<AutoKey, number>;
   stats: FrameStats;
@@ -114,6 +140,11 @@ export interface FrameStats {
   analysisMs: number;
   /** Mean OKLab chroma of surfaces before the colour stage. */
   chroma: number;
+  /** 0..1 detection confidence for sun beams / a bright surface band. */
+  beamPresence: number;
+  surfacePresence: number;
+  /** Grain σ in 8-bit steps at processing scale (0 when not probed). */
+  noise: number;
 }
 
 /** Eyedropper state: the illuminant it implies, and a residual gain fixed on first use. */
@@ -130,6 +161,8 @@ export interface StepOptions {
   dt: number;
   /** Force a snap (seek, new file). */
   snap?: boolean;
+  /** Processing-scale crop for the grain estimate (see Renderer.readNoise). */
+  noise?: { rgba: Uint8Array | Uint8ClampedArray; w: number; h: number };
 }
 
 export class AutoEngine {
@@ -144,6 +177,8 @@ export class AutoEngine {
   pick: Pick | null = null;
   private pool = new Map<string, Float32Array>();
   private bins = new Uint16Array(0);
+  private frameNo = 0;
+  private beamCache: BeamDetect | null = null;
   /** Per-frame scratch buffers, reused across frames to keep GC out of playback. */
   private buf(name: string, len: number): Float32Array {
     let b = this.pool.get(name);
@@ -155,6 +190,7 @@ export class AutoEngine {
   }
 
   reset() {
+    this.beamCache = null;
     this.smoothed.clear();
     this.sig = null;
     this.lastLut = null;
@@ -236,7 +272,7 @@ export class AutoEngine {
     // (score < 0.2) gets almost nothing, a clear underwater frame gets it all.
     const gate = smoothstep(0.2, 0.55, uw);
     // 豐富色彩 strength: every adaptive amount below scales with it
-    const vivid = clamp(p.vivid, 0, 1);
+    const vivid = clamp(E('vivid', TUNING.vividAuto * gate), 0, 1);
     const gateWb = smoothstep(0.15, 0.45, uw);
     const water: FrameStats['water'] = uw < 0.3 ? 'neutral' : mG > mB * 1.08 ? 'green' : 'blue';
 
@@ -245,8 +281,8 @@ export class AutoEngine {
     const defB = clamp((mG - mB) / Math.max(1e-4, mG), 0, 1);
     const dR = S('dR', Math.max(0, mG - mR));
     const dB = S('dB', Math.max(0, mG - mB));
-    const aR = E('redComp', defR > 0.04 ? 1.25 * gate : 0);
-    const aB = E('blueComp', clamp(defB / 0.25, 0, 1) * 0.8 * gate);
+    const aR = E('redComp', defR > 0.04 ? TUNING.redGain * gate : 0);
+    const aB = E('blueComp', clamp(defB / 0.25, 0, 1) * TUNING.blueGain * gate);
     const comp = this.buf('comp', n * 3);
     let cr = 0, cg = 0;
     for (let q = 0; q < n * 3; q += 3) {
@@ -273,7 +309,7 @@ export class AutoEngine {
     if (this.pick) ill = this.pick.illum;
     const iy = Math.max(1e-4, luma(ill[0], ill[1], ill[2]));
     const illum: Vec3 = [S('Ir', ill[0] / iy), S('Ig', ill[1] / iy), S('Ib', ill[2] / iy)];
-    const wbS = E('wbStrength', this.pick ? 1 : 0.95 * gateWb);
+    const wbS = E('wbStrength', this.pick ? 1 : TUNING.wbGain * gateWb);
     const wb = whiteBalanceMatrix(
       [mix(1, illum[0], wbS), mix(1, illum[1], wbS), mix(1, illum[2], wbS)],
       p.temp,
@@ -395,7 +431,7 @@ export class AutoEngine {
     // Only dehaze when there is a *spread* between near and far: a flat frame
     // (all dark ≈ A) has no depth cue and would collapse toward A.
     const hazeAct = S('hazeAct', smoothstep(0.06, 0.3, d90 - d10));
-    const omega = E('dehaze', 0.05 + 0.85 * gate) * hazeAct;
+    const omega = E('dehaze', TUNING.dehazeBase + TUNING.dehazeGain * gate) * hazeAct;
     const dehazeOn = omega > 0.005;
     const I = this.buf('I', n);
     const tRaw = this.buf('tRaw', n);
@@ -411,7 +447,7 @@ export class AutoEngine {
       coef[i * 4 + 1] = dehazeOn ? cb[i] : 1;
     }
     const resDef = clamp((cg - cr) / Math.max(1e-4, cg), 0, 1);
-    const depth = E('depthColor', clamp(resDef * 1.4, 0, 0.6) * gate);
+    const depth = E('depthColor', clamp(resDef * TUNING.depthGain, 0, 0.6) * gate);
     // Distance-weighted colour gain: light from far objects (low t) lost the
     // most red on the way, so red is lifted in proportion to (1 - t).
     const k: Vec3 = [1.6 * depth, 0, -0.35 * depth];
@@ -476,7 +512,7 @@ export class AutoEngine {
     const key = Math.exp(logSum / Math.ceil(n / 4));
     // Dead zone: lift dim frames, tame hot ones, leave a good exposure alone.
     const kk = Math.max(1e-4, key);
-    const kLo = 0.16 + 0.08 * vivid; // rich colour also means a more luminous frame
+    const kLo = TUNING.kLo + 0.08 * vivid; // rich colour also means a more luminous frame
     const evTarget = kk < kLo ? Math.log2(kLo / kk) * 0.7 : kk > 0.32 ? Math.log2(0.32 / kk) * 0.7 : 0;
     const ev = E('exposure', clamp(evTarget, -1, 1.5));
     const expMul = Math.pow(2, ev);
@@ -503,7 +539,7 @@ export class AutoEngine {
     const flat2 = clamp((0.24 - stdL) / 0.16, 0, 1);
     // Dehaze already restores most of the lost contrast; CLAHE only tops up
     // what is still flat, less so the more dehaze did.
-    const claheS = E('clahe', clamp((0.06 + 0.25 * flat2) * (1 - 0.4 * omega), 0, 0.35));
+    const claheS = E('clahe', clamp((TUNING.claheBase + TUNING.claheFlat * flat2) * (1 - 0.4 * omega), 0, 0.35));
     const tiles = clamp(Math.round(p.claheTiles), 2, 16);
     let clahe: Float32Array | null = null;
     const claheMix = claheS > 0.001 ? Math.min(1, 2 * claheS) : 0;
@@ -556,7 +592,7 @@ export class AutoEngine {
       S('gB', clamp(gAvg / Math.max(1e-4, gm[2]), 0.85, 1.2)),
     ];
     // de-cast pulls toward grey; ease it off when rich colour is wanted
-    const deCast = this.pick ? 0 : E('deCast', 0.6 * gate * (1 - 0.5 * vivid));
+    const deCast = this.pick ? 0 : E('deCast', S('deCastSafe', TUNING.deCastGain * gate * (1 - 0.5 * vivid) * this.deCastGuard(e, L, tMap, gain)));
     // Measure how colourful the surfaces actually are (mean OKLab chroma,
     // near surfaces, every 4th pixel) and derive the gain that brings them
     // toward a vivid target. Measured, so a frame that is already colourful
@@ -572,7 +608,7 @@ export class AutoEngine {
     const chroma = cW > 0 ? cSum / cW : 0;
     const chromaGain = S('cGain', 1 + vivid * (clamp(CHROMA_TARGET / Math.max(chroma, 0.01), 1, 2.6) - 1));
     const warmGain = S('warmG', 0.45 * vivid);
-    const vibrance = E('vibrance', 0.05 + 0.3 * gate);
+    const vibrance = E('vibrance', TUNING.vibBase + TUNING.vibGain * gate);
     const curve = buildCurve({
       blacks,
       whites,
@@ -580,6 +616,43 @@ export class AutoEngine {
       highlights: p.highlights,
       shadows,
     });
+
+    /* 8. light: beams + surface highlights ---------------------------- */
+    // streaks are measured on the *source* luminance: correction amplifies
+    // grain in open water far more than it amplifies the beams
+    // Beam geometry changes slowly: in video, re-detect every 3rd frame (and
+    // on every snap); stills always detect.
+    this.frameNo++;
+    if (snap || !this.beamCache || this.frameNo % 3 === 0) {
+      const Lraw = this.buf('Lraw', n);
+      for (let i = 0, j = 0; i < n; i++, j += 4) Lraw[i] = luma(rgba[j], rgba[j + 1], rgba[j + 2]) / 255;
+      this.beamCache = detectBeams(Lraw, w, h);
+    }
+    const bd = this.beamCache;
+    const sd = detectSurface(L, e, w, h);
+    const beamX = E('beamX', bd.x);
+    const beamY = E('beamY', bd.y);
+    // natural by default: only a gentle lift where beams are clearly there
+    const beams = E('beams', 0.2 * bd.presence * gate);
+    const beamThr = S('beamThr', bd.thr);
+    const surfaceHL = E('surfaceHL', clamp(sd.presence * (0.25 + 4 * sd.clip + 0.6 * Math.max(0, sd.top - 0.7)), 0, 0.9));
+    const surfAx = E('surfAx', sd.ax);
+    const surfAy = E('surfAy', sd.ay);
+    const surfBx = E('surfBx', sd.bx);
+    const surfBy = E('surfBy', sd.by);
+    // where there is sunlight in the frame, its bright part (upper 15 % of the
+    // upper frame, where beams and the surface are; through the tone curve)
+    // must not render pink
+    const [lTop] = quantiles(L.subarray(0, w * Math.max(1, Math.floor(h * 0.7))), [0.85], 512);
+    const neutralThr = S('nThr', sampleCurve(curve, clamp(lTop, 0, 1)));
+    const neutralAmt = E('lightNeutral', 0.85 * Math.max(bd.presence, sd.presence) * gate);
+
+    /* 9. grain → 畫質修復, 降噪, 銳化門檻, 銳化 ------------------------ */
+    const sigma = S('noise', o.noise ? estimateNoise(o.noise.rgba, o.noise.w, o.noise.h) : 1);
+    const restore = E('restore', 0.85 * smoothstep(2.5, 9, sigma));
+    const denoise = E('denoise', 0.15 + 0.5 * smoothstep(1.5, 7, sigma));
+    const threshold = E('threshold', clamp(0.012 + (2.2 * sigma) / 255, 0.015, 0.08));
+    const sharpen = E('sharpen', 0.35 * (1 - 0.7 * smoothstep(3, 10, sigma)));
 
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
@@ -589,8 +662,11 @@ export class AutoEngine {
       wb, expMul,
       clahe, claheTiles: tiles, claheMix, claheK,
       curve, gain, deCast, vibrance, saturation: p.saturation, chromaGain, warmGain,
-      sharpen: p.sharpen, sharpenRadius: p.sharpenRadius, threshold: p.threshold, restore: p.restore, shoulder: sh,
-      denoise: p.denoise, clarity: p.clarity,
+      sharpen, sharpenRadius: p.sharpenRadius, threshold, restore, shoulder: sh,
+      denoise, clarity: p.clarity,
+      beams: { x: beamX, y: beamY, amount: beams, length: p.beamLength, warm: p.beamWarm, thr: beamThr },
+      surface: { ax: surfAx, ay: surfAy, bx: surfBx, by: surfBy, hl: surfaceHL, tone: p.surfaceTone, warm: p.surfaceWarm },
+      neutral: { thr: neutralThr, amount: neutralAmt },
       effective: eff as Record<AutoKey, number>,
       stats: {
         underwater: uw,
@@ -601,6 +677,9 @@ export class AutoEngine {
         sceneCut: cut,
         analysisMs: performance.now() - t0,
         chroma,
+        noise: o.noise ? sigma : 0,
+        beamPresence: bd.presence,
+        surfacePresence: sd.presence,
       },
     };
   }
@@ -609,6 +688,48 @@ export class AutoEngine {
    * Scene-cut detector: total-variation distance between colour histograms of
    * consecutive frames. Camera pans score ~0.05–0.15; a cut scores > 0.3.
    */
+
+  /**
+   * How much of the de-cast gain is safe (0..1). The gain is grey-world on
+   * near surfaces, which is wrong on a bottom that is truly coloured (beige
+   * sand reads as a yellow cast): applied there it turns open water violet
+   * and sun beams / the surface magenta. Measured after the gain: open water
+   * must stay blue–green (OKLCh hue ≤ 275°) and bright light must not turn
+   * magenta; otherwise the strength is bisected down until both hold.
+   */
+  private deCastGuard(e: Float32Array, L: Float32Array, tMap: Float32Array, gain: Vec3): number {
+    const n = L.length;
+    const [, , lHi] = quantiles(L, [0.5, 0.9, 0.97], 512);
+    const water = [0, 0, 0, 0], bright = [0, 0, 0, 0];
+    for (let i = 0, q = 0; i < n; i += 2, q += 6) {
+      const far = 1 - smoothstep(0.3, 0.75, tMap[i]);
+      const acc = L[i] >= lHi ? bright : far > 0.5 ? water : null;
+      if (!acc) continue;
+      acc[0] += e[q]; acc[1] += e[q + 1]; acc[2] += e[q + 2]; acc[3]++;
+    }
+    const bad = (k: number) => {
+      for (const [acc, test] of [
+        [water, (h: number, c: number) => c > 0.02 && h > 275 && h < 345],
+        [bright, (h: number, c: number) => c > 0.025 && h > 290 && h < 350],
+      ] as const) {
+        if (acc[3] < 20) continue;
+        const m = [0, 1, 2].map((c) => clamp((acc[c] / acc[3]) * (1 + (gain[c] - 1) * k), 0, 1));
+        const lab = toOklab(srgbToLinear(m[0]), srgbToLinear(m[1]), srgbToLinear(m[2]));
+        const h = ((Math.atan2(lab[2], lab[1]) * 180) / Math.PI + 360) % 360;
+        if (test(h, Math.hypot(lab[1], lab[2]))) return true;
+      }
+      return false;
+    };
+    if (!bad(1)) return 1;
+    if (bad(0)) return 0; // already off-hue before de-cast: do not make it worse
+    let lo = 0, hi = 1;
+    for (let it = 0; it < 6; it++) {
+      const mid = 0.5 * (lo + hi);
+      if (bad(mid)) hi = mid;
+      else lo = mid;
+    }
+    return lo;
+  }
   private detectCut(rgba: Uint8Array | Uint8ClampedArray, n: number): boolean {
     // 4×4×4 histogram with *soft* (trilinear) binning: a uniform water body
     // drifting in colour moves weight smoothly between bins instead of
@@ -733,6 +854,7 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
           fr = encodeFast(rgb[0]); fg = encodeFast(rgb[1]); fb = encodeFast(rgb[2]);
         }
       }
+      if (s.neutral.amount > 0) [fr, fg, fb] = neutralLight([fr, fg, fb], s.neutral.thr, s.neutral.amount);
       out[q] = fr;
       out[q + 1] = fg;
       out[q + 2] = fb;

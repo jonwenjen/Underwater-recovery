@@ -13,7 +13,7 @@ import { toGLMat3 } from './color.ts';
 import { destroy, program, target, texture, type GL, type Program, type Target, type Tex } from './gl.ts';
 import { CLAHE_BINS, CURVE_N } from './luts.ts';
 import { buildCurveLut, HSL_CENTERS, identityLook, isIdentityCurves, isIdentityHsl, LOOK_N, type Look } from './look.ts';
-import { BLUR_FS, COPY_FS, FINAL_FS, GRADE_FS, PRE_FS } from './shaders.ts';
+import { BLUR_FS, COPY_FS, FINAL_FS, GRADE_FS, PRE_FS, RAYS_FS } from './shaders.ts';
 
 /** Quarter turns clockwise (0–3) and a horizontal mirror, applied before everything else. */
 export interface Orient {
@@ -38,7 +38,7 @@ export class Renderer {
   readonly canvas: Canvas;
   readonly floatTargets: boolean;
   readonly maxTexture: number;
-  private progs: { copy: Program; grade: Program; blur: Program; final: Program; pre: Program };
+  private progs: { copy: Program; grade: Program; blur: Program; final: Program; pre: Program; rays: Program };
   private vao: WebGLVertexArrayObject;
   private src: Tex | null = null;
   private small: Target | null = null;
@@ -50,6 +50,8 @@ export class Renderer {
   private lut: Tex | null = null;
   private curve: Tex;
   private pre: Target | null = null;
+  private rays: Target | null = null;
+  private noise: Target | null = null;
   private lookTex: Tex;
   private look: Look = identityLook();
   private lookCurves = false;
@@ -84,6 +86,7 @@ export class Renderer {
       blur: program(gl, BLUR_FS),
       final: program(gl, FINAL_FS),
       pre: program(gl, PRE_FS),
+      rays: program(gl, RAYS_FS),
     };
     this.vao = gl.createVertexArray()!;
     this.curve = texture(gl, CURVE_N, 1, gl.R16F, gl.RED, gl.FLOAT);
@@ -153,8 +156,11 @@ export class Renderer {
     this.ph = ph;
     this.canvas.width = pw;
     this.canvas.height = ph;
-    for (const t of [this.graded, this.blurA, this.blurB, this.pre]) destroy(gl, t);
+    for (const t of [this.graded, this.blurA, this.blurB, this.pre, this.rays]) destroy(gl, t);
     const f = this.floatTargets;
+    const rw = Math.max(2, pw >> 1),
+      rh = Math.max(2, ph >> 1);
+    this.rays = target(gl, texture(gl, rw, rh, f ? gl.R16F : gl.RGBA8, f ? gl.RED : gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE));
     this.pre = target(gl, texture(gl, pw, ph, f ? gl.RGBA16F : gl.RGBA8, gl.RGBA, f ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE));
     this.graded = target(
       gl,
@@ -171,11 +177,40 @@ export class Renderer {
     const gl = this.gl;
     this.ensureSmall();
     const out = new Uint8Array(this.sw * this.sh * 4);
-    this.pass(this.progs.copy, this.small!, () => this.bind(0, this.src!, 'u_src', this.progs.copy));
+    this.pass(this.progs.copy, this.small!, () => {
+      this.bind(0, this.src!, 'u_src', this.progs.copy);
+      this.gl.uniform4f(this.progs.copy.u.u_crop, 0, 0, 1, 1);
+    });
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.small!.fb);
     gl.readPixels(0, 0, this.sw, this.sh, gl.RGBA, gl.UNSIGNED_BYTE, out);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     return out;
+  }
+
+  /**
+   * Noise probe: a centred crop at *processing* scale (the scale the grade and
+   * 畫質修復 passes see), so the engine can measure grain the 192 px analysis
+   * frame has averaged away.
+   */
+  readNoise(): { rgba: Uint8Array; w: number; h: number } {
+    const gl = this.gl;
+    const cw = Math.min(256, this.pw),
+      ch = Math.min(256, this.ph);
+    if (!this.noise || this.noise.w !== cw || this.noise.h !== ch) {
+      destroy(gl, this.noise);
+      this.noise = target(gl, texture(gl, cw, ch, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
+    }
+    const zw = cw / this.pw,
+      zh = ch / this.ph;
+    this.pass(this.progs.copy, this.noise, () => {
+      this.bind(0, this.src!, 'u_src', this.progs.copy);
+      gl.uniform4f(this.progs.copy.u.u_crop, 0.5 - zw / 2, 0.5 - zh / 2, zw, zh);
+    });
+    const out = new Uint8Array(cw * ch * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.noise.fb);
+    gl.readPixels(0, 0, cw, ch, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { rgba: out, w: cw, h: ch };
   }
 
   /** Upload the per-frame maps and LUTs computed by the engine. */
@@ -263,6 +298,17 @@ export class Renderer {
       });
     blur(this.graded!, this.blurA!, [1 / this.pw, 0], true);
     blur(this.blurA!, this.blurB!, [0, 1 / this.ph], false);
+
+    // 光束: only when the control is in use
+    if (Math.abs(s.beams.amount) > 0.001) {
+      const rp = this.progs.rays;
+      this.pass(rp, this.rays!, () => {
+        this.bind(0, this.graded!, 'u_graded', rp);
+        gl.uniform2f(rp.u.u_sun, s.beams.x, s.beams.y);
+        gl.uniform1f(rp.u.u_thr, s.beams.thr);
+        gl.uniform1f(rp.u.u_len, 0.15 + 0.85 * s.beams.length);
+      });
+    }
   }
 
   /** Detail/tone/colour/compare pass to the canvas, or into the scope target. */
@@ -292,6 +338,17 @@ export class Renderer {
       gl.uniform1f(f.u.u_chroma, s.chromaGain);
       gl.uniform1f(f.u.u_warm, s.warmGain);
       this.bind(4, this.lookTex, 'u_look', f);
+      this.bind(5, this.rays!, 'u_rays', f);
+      gl.uniform1f(f.u.u_beams, s.beams.amount);
+      gl.uniform1f(f.u.u_beamWarm, s.beams.warm);
+      gl.uniform1f(f.u.u_rayGain, 1 / Math.max(0.08, 1 - s.beams.thr));
+      gl.uniform2f(f.u.u_surfA, s.surface.ax, s.surface.ay);
+      gl.uniform2f(f.u.u_surfB, s.surface.bx, s.surface.by);
+      gl.uniform1f(f.u.u_surfHL, s.surface.hl);
+      gl.uniform1f(f.u.u_surfTone, s.surface.tone);
+      gl.uniform1f(f.u.u_surfWarm, s.surface.warm);
+      gl.uniform1f(f.u.u_hiThr, s.neutral.thr);
+      gl.uniform1f(f.u.u_hiAmt, s.neutral.amount);
       gl.uniform1f(f.u.u_lookOn, this.lookCurves ? 1 : 0);
       gl.uniform1f(f.u.u_hslOn, this.lookHsl ? 1 : 0);
       if (this.lookHsl) {
@@ -339,7 +396,7 @@ export class Renderer {
 
   dispose() {
     const gl = this.gl;
-    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve, this.pre, this.lookTex])
+    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve, this.pre, this.lookTex, this.rays, this.noise])
       destroy(gl, t);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
@@ -354,6 +411,8 @@ export class Processor {
   readonly engine = new AutoEngine();
   state: FrameState | null = null;
   lastFrameMs = 0;
+  private frames = 0;
+  private noiseProbe: { rgba: Uint8Array; w: number; h: number } | null = null;
 
   constructor(canvas: Canvas, opts: { preserve?: boolean } = {}) {
     this.renderer = new Renderer(canvas, opts);
@@ -365,7 +424,10 @@ export class Processor {
     const r = this.renderer;
     if (source) r.upload(source, w, h);
     const small = r.readSmall();
-    this.state = this.engine.step(small, r.sw, r.sh, step);
+    // grain changes slowly: probe every frame for stills, every 4th in video
+    this.frames++;
+    if (!(step.dt > 0) || step.snap || this.frames % 4 === 1) this.noiseProbe = r.readNoise();
+    this.state = this.engine.step(small, r.sw, r.sh, { ...step, noise: this.noiseProbe ?? undefined });
     r.grade(this.state);
     r.finish(this.state, view);
     this.lastFrameMs = performance.now() - t0;
