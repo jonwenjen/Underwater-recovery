@@ -283,5 +283,58 @@ check(
   );
 }
 
+// Regression guard: white balance must not manufacture colour on pixels that
+// have no signal. A constant a/b offset is subtractive, so applying it to a
+// pure black pixel creates saturated red out of nothing — which showed up as a
+// red line along the left and top edges of exported video (a 1-2 px black edge
+// is normal there, from chroma subsampling or letterboxing).
+{
+  const bw = 64, bh = 48;
+  const framed = new ImageData(bw, bh);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = (y * bw + x) * 4;
+      const black = x < 3 || y < 3;
+      framed.data[i] = black ? 0 : 60;
+      framed.data[i + 1] = black ? 0 : 110;
+      framed.data[i + 2] = black ? 0 : 150;
+      framed.data[i + 3] = 255;
+    }
+  }
+  // analyse a version with no border, so the cast is the scene's, not the
+  // border's — this is the real situation: the black edge is not what the
+  // white balance is supposed to be reacting to.
+  const scene = new ImageData(bw, bh);
+  for (let i = 0; i < scene.data.length; i += 4) {
+    scene.data[i] = 60;
+    scene.data[i + 1] = 110;
+    scene.data[i + 2] = 150;
+    scene.data[i + 3] = 255;
+  }
+  const sa = analyse(asImg(scene));
+  const r = runPipeline(asImg(framed), { ...DEFAULT_PARAMS, auto: false }, sa).image;
+  const rEdge = Math.max(r.data[0], r.data[1], r.data[2]);
+  check(
+    'black border stays black',
+    rEdge <= 2,
+    `edge pixel rgb(${r.data[0]}, ${r.data[1]}, ${r.data[2]})`,
+  );
+  // The fix must not have weakened recovery in real shadow detail. Use the
+  // main test scene rather than a flat one: on a uniform patch the pipeline
+  // correctly drives everything to neutral, so "red now exceeds blue" says
+  // nothing. What matters is that the blue-cast scene is still corrected.
+  const uSrc = makeUnderwater();
+  const uScene = analyse(asImg(uSrc));
+  const uOut = runPipeline(asImg(uSrc), { ...DEFAULT_PARAMS, auto: false }, uScene)
+    .image;
+  const uBefore = stats(uSrc);
+  const uAfter = stats(uOut);
+  check(
+    'shadow recovery not weakened by the black guard',
+    uAfter.r > uBefore.r * 1.15 && uAfter.blueDominance < uBefore.blueDominance - 15,
+    `r ${uBefore.r.toFixed(1)} -> ${uAfter.r.toFixed(1)}, blueDom ${uBefore.blueDominance.toFixed(1)} -> ${uAfter.blueDominance.toFixed(1)}`,
+  );
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

@@ -262,6 +262,18 @@ function whiteBalance(
   const wbB = a.castB * (0.8 * p.wbStrength);
   const manA = p.greenBias * 0.5;
   const manB = p.warm * 0.5;
+  // A constant a/b offset is a *subtractive* correction, so it is only
+  // meaningful on pixels that actually have chroma to correct. Applied to a
+  // pixel with no signal (X=Y=Z=0) it manufactures colour out of nothing: the
+  // Lab round trip maps 0,0,0 to a non-zero a/b and back out as a saturated
+  // red. That is what turned the 1-2px black edge every video carries (chroma
+  // subsampling, letterboxing) into a visible red line.
+  //
+  // So fade the shift out at the bottom of the range. Below ~6/255 in sRGB the
+  // correction is fully applied, so normal shadow recovery is untouched and only
+  // genuine black is protected. See bench/black-wb-sweep.ts, which measured
+  // this threshold against both the edge tint and real shadow recovery.
+  const BLACK_WB = 0.006;
   for (let i = 0, p3 = 0; p3 < n; p3++, i += 3) {
     const r = buf[i],
       g = buf[i + 1],
@@ -274,8 +286,9 @@ function whiteBalance(
     const fx = f(X),
       fy = f(Y),
       fz = f(Z);
-    let la = 500 * (fx - fy) - wbA + manA;
-    let lb = 200 * (fy - fz) - wbB + manB;
+    const w = Y <= 0 ? 0 : Y >= BLACK_WB ? 1 : Y / BLACK_WB;
+    let la = 500 * (fx - fy) - wbA * w + manA * w;
+    let lb = 200 * (fy - fz) - wbB * w + manB * w;
     const L = 116 * fy - 16;
     // Back to XYZ. The forward matrix is already D65-normalised (white maps to
     // X=0.9505, Y=1, Z=1.0888), so scaling by the white point again here would
