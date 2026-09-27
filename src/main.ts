@@ -66,7 +66,9 @@ let seq = 0;
 const pending = new Map<number, (r: ImageData) => void>();
 let timer: number | undefined;
 let inflight = false;
-const dirty = new Set<number>();
+/** Items needing a re-process. References, not indices: `items.splice` shifts
+ *  indices, so an index-keyed set could re-process the wrong photo. */
+const dirty = new Set<Item>();
 
 worker.onmessage = (ev: MessageEvent) => {
   const { id, buffer, width, height } = ev.data as {
@@ -81,17 +83,17 @@ worker.onmessage = (ev: MessageEvent) => {
 };
 
 function schedule() {
-  dirty.add(current);
+  const it = items[current];
+  if (it) dirty.add(it);
   if (timer) clearTimeout(timer);
   timer = setTimeout(flush, 120) as unknown as number;
 }
 
 function flush() {
   if (inflight || dirty.size === 0) return;
-  const idx = dirty.values().next().value as number;
-  dirty.delete(idx);
-  const it = items[idx];
+  const it = dirty.values().next().value as Item | undefined;
   if (!it) return;
+  dirty.delete(it);
   inflight = true;
   busy.classList.remove('hidden');
   const id = ++seq;
@@ -100,7 +102,7 @@ function flush() {
     it.result = res;
     inflight = false;
     busy.classList.add('hidden');
-    if (idx === current) draw();
+    if (it === items[current]) draw();
     else renderQueue();
     if (dirty.size) flush();
   });
@@ -203,6 +205,11 @@ function select(i: number) {
   work.classList.remove('hidden');
   cv.width = items[i].w;
   cv.height = items[i].h;
+  // Re-derive the auto keys for this photo so the sliders show what is really
+  // being applied, then reprocess if that changed anything.
+  const before = JSON.stringify(params());
+  photoControls.refreshAuto(items[i].analysis);
+  if (JSON.stringify(params()) !== before) schedule();
   draw();
   flush();
 }
@@ -246,10 +253,6 @@ async function addFiles(files: FileList | File[]) {
   if (firstNew) select(items.indexOf(firstNew));
 }
 
-function toBlob(): Promise<Blob | null> {
-  return new Promise((res) => cv.toBlob(res, 'image/png'));
-}
-
 function triggerDownload(blob: Blob, filename: string) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -258,23 +261,32 @@ function triggerDownload(blob: Blob, filename: string) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
+/**
+ * Encode a processed result to PNG.
+ *
+ * Must render `it.result` into its own canvas: the on-screen `cv` shows the
+ * before/after split, so serialising it directly would save half-original,
+ * half-recovered output.
+ */
+async function encodeResult(it: Item): Promise<Blob | null> {
+  if (!it.result) return null;
+  const c = document.createElement('canvas');
+  c.width = it.w;
+  c.height = it.h;
+  c.getContext('2d')!.putImageData(it.result, 0, 0);
+  return new Promise((res) => c.toBlob(res, 'image/png'));
+}
+
 const suffixed = (name: string) => name.replace(/\.[^.]+$/, '') + '-recovered.png';
 
 async function downloadCurrent() {
-  if (!items[current]?.result) return;
-  const blob = await toBlob();
+  const blob = await encodeResult(items[current]);
   if (blob) triggerDownload(blob, suffixed(items[current].name));
 }
 
 async function downloadAll() {
-  const c = document.createElement('canvas');
-  const cx = c.getContext('2d')!;
   for (const it of items) {
-    if (!it.result) continue;
-    c.width = it.w;
-    c.height = it.h;
-    cx.putImageData(it.result, 0, 0);
-    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/png'));
+    const blob = await encodeResult(it);
     if (blob) triggerDownload(blob, suffixed(it.name));
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -415,6 +427,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
       const mod = await loadVideoModule();
       const { blob, name } = await mod.exportVideo(file, {
         params: videoParams(),
+        manual: videoControls.manual,
         maxEdge: opts.maxEdge,
         format: opts.format,
       });
@@ -538,7 +551,6 @@ async function loadVideo(f: File) {
     const meta = await mod.probeVideo(f);
     videoFile = f;
     videoMeta = meta;
-    mod.resetVideoAnalysis();
     preview?.dispose();
     preview = new mod.VideoPreview(f, vcv);
     await preview.ready();
@@ -570,7 +582,17 @@ async function grabAt(t: number) {
   if (!preview) return;
   vbusy.classList.remove('hidden');
   try {
-    await preview.grab(t, videoParams());
+    // Resolve auto from the frame we are about to show, then re-grade with it.
+    // Two frames are needed because refreshAuto changes the params, and the
+    // analysis that produced them is only known once a frame has been grabbed.
+    let a = await preview.grab(t, videoParams());
+    if (a) {
+      const before = JSON.stringify(videoParams());
+      videoControls.refreshAuto(a);
+      if (JSON.stringify(videoParams()) !== before) {
+        a = await preview.grab(t, videoParams());
+      }
+    }
     if (videoMeta) renderVideoDiag(videoMeta);
   } finally {
     vbusy.classList.add('hidden');
@@ -604,7 +626,7 @@ $('vplay').addEventListener('click', async () => {
   }
   btn.dataset.playing = '1';
   btn.textContent = '⏸ 暫停';
-  await preview.play(videoParams(), (t: number) => {
+  await preview.play(videoParams, (t: number) => {
     vtime.textContent = clock(t);
     if (videoMeta?.duration) {
       vseek.value = String(Math.round((t / videoMeta.duration) * 1000));
@@ -636,6 +658,7 @@ $('vexport').addEventListener('click', async () => {
     const mod = await loadVideoModule();
     const { blob, name } = await mod.exportVideo(videoFile, {
       params: videoParams(),
+      manual: videoControls.manual,
       maxEdge: parseInt(vres.value, 10),
       format: vformat.value as 'mp4' | 'webm',
       signal: cancelFlag,

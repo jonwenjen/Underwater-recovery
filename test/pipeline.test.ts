@@ -10,26 +10,13 @@ import {
   autoParams,
 } from '../src/pipeline.ts';
 
-// Node has no ImageData; the pipeline only needs {width,height,data}.
-class NodeImageData {
-  data: Uint8ClampedArray;
-  width: number;
-  height: number;
-  constructor(a: number | Uint8ClampedArray, b?: number, c?: number) {
-    if (typeof a === 'number') {
-      this.width = a;
-      this.height = b!;
-      this.data = new Uint8ClampedArray(this.width * this.height * 4);
-    } else {
-      this.data = a;
-      this.width = b!;
-      this.height = c!;
-    }
-  }
-}
-// @ts-expect-error test shim
-globalThis.ImageData = NodeImageData;
-type ImageData = NodeImageData;
+// Node has no ImageData; the pipeline only needs {width, height, data}.
+import {
+  NodeImageData as ImageData,
+  installImageDataShim,
+  asImg,
+} from './shim.ts';
+installImageDataShim();
 
 const W = 240,
   H = 160;
@@ -87,8 +74,12 @@ const stats = (img: ImageData) => {
 };
 
 const src = makeUnderwater();
-const a = analyse(src);
-const out = runPipeline(src, autoParams({ ...DEFAULT_PARAMS }, a), a).image;
+const a = analyse(asImg(src));
+const out = runPipeline(
+  asImg(src),
+  autoParams({ ...DEFAULT_PARAMS }, a),
+  a,
+).image;
 
 const before = stats(src);
 const after = stats(out);
@@ -152,8 +143,8 @@ for (let i = 0; i < grey.data.length; i += 4) {
   grey.data[i] = grey.data[i + 1] = grey.data[i + 2] = v;
   grey.data[i + 3] = 255;
 }
-const ga = analyse(grey);
-const gOut = runPipeline(grey, { ...DEFAULT_PARAMS, auto: false }, ga).image;
+const ga = analyse(asImg(grey));
+const gOut = runPipeline(asImg(grey), { ...DEFAULT_PARAMS, auto: false }, ga).image;
 check(
   'grey image not flagged underwater',
   ga.isUnderwater < 0.35,
@@ -165,6 +156,132 @@ check(
   Math.abs(gs.r - gs.b) < 12 && Math.abs(gs.g - gs.b) < 12,
   `r=${gs.r.toFixed(1)} g=${gs.g.toFixed(1)} b=${gs.b.toFixed(1)}`,
 );
+
+// A no-op configuration must not structurally change the image. The pipeline
+// dithers the final 8-bit write by up to half an LSB, so exact equality no
+// longer holds; anything beyond 1 LSB, or a mean shift, is a real regression.
+{
+  const src = makeUnderwater();
+  const noop = {
+    ...DEFAULT_PARAMS,
+    auto: false,
+    redStrength: 0,
+    dehazeStrength: 0,
+    gamma: 1,
+    claheClip: 0,
+    sharpenAmount: 0,
+    saturation: 1,
+    wbStrength: 0,
+    warm: 0,
+    greenBias: 0,
+    // the tone curve is on by default (0.02/0.98); a true no-op opens it up
+    blackPoint: 0,
+    whitePoint: 1,
+  };
+  const { image } = runPipeline(asImg(src), noop, analyse(asImg(src)));
+  let maxDelta = 0;
+  let sumDelta = 0;
+  let n = 0;
+  for (let i = 0; i < src.data.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(image.data[i + c] - src.data[i + c]);
+      if (d > maxDelta) maxDelta = d;
+      sumDelta += d;
+      n++;
+    }
+  }
+  const meanDelta = sumDelta / n;
+  check(
+    'no-op is byte-exact except dither',
+    maxDelta <= 1,
+    `maxDelta=${maxDelta} LSB`,
+  );
+  check(
+    'no-op has no mean shift',
+    meanDelta < 0.5,
+    `meanDelta=${meanDelta.toFixed(3)} LSB`,
+  );
+}
+
+// Smooth underwater gradients are where banding shows. Feed a wide, very gradual
+// blue ramp and count the distinct output levels across one row: a float path
+// fills the gaps between 8-bit steps, a quantised one leaves them empty.
+{
+  const gw = 512;
+  const gh = 32;
+  const grad = new ImageData(gw, gh);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const i = (y * gw + x) * 4;
+      const t = x / (gw - 1);
+      grad.data[i] = 20 + 40 * t;
+      grad.data[i + 1] = 60 + 50 * t;
+      grad.data[i + 2] = 90 + 60 * t;
+      grad.data[i + 3] = 255;
+    }
+  }
+  const { image } = runPipeline(asImg(grad), { ...DEFAULT_PARAMS, auto: false });
+  const levels = new Set<number>();
+  const row = (gh >> 1) * gw;
+  let lo = 255, hi = 0;
+  for (let x = 0; x < gw; x++) {
+    const v = image.data[(row + x) * 4 + 2];
+    levels.add(v);
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  // A float path fills the gaps between 8-bit steps, so nearly every level in
+  // the output range is actually hit. A quantised path plateaus and shows far
+  // fewer distinct values across the same 512 samples.
+  const span = hi - lo + 1;
+  check(
+    'no banding in smooth gradient',
+    levels.size >= span * 0.75,
+    `${levels.size}/${span} distinct levels over 512 samples`,
+  );
+}
+
+// Regression guard for a real bug: table interpolation at exactly 1.0 read one
+// entry past the end, produced NaN, and Uint8ClampedArray stored 0 — so every
+// fully clipped channel came out black. Pure white and hard-clipped highlights
+// must survive the pipeline.
+{
+  const sw = 32, sh = 32;
+  const swatch = new ImageData(sw, sh);
+  for (let i = 0; i < swatch.data.length; i += 4) {
+    swatch.data[i] = 255;
+    swatch.data[i + 1] = 255;
+    swatch.data[i + 2] = 255;
+    swatch.data[i + 3] = 255;
+  }
+  const white = runPipeline(asImg(swatch), { ...DEFAULT_PARAMS, auto: false }).image;
+  check(
+    'pure white survives',
+    white.data[0] > 250 && white.data[1] > 250 && white.data[2] > 250,
+    `rgb=${white.data[0]},${white.data[1]},${white.data[2]}`,
+  );
+
+  // A single hot pixel surrounded by dim ones: the saturated blue channel must
+  // not be driven to zero.
+  const spot = new ImageData(sw, sh);
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      const i = (y * sw + x) * 4;
+      const hot = x === 16 && y === 16;
+      spot.data[i] = hot ? 255 : 20;
+      spot.data[i + 1] = hot ? 255 : 30;
+      spot.data[i + 2] = hot ? 255 : 40;
+      spot.data[i + 3] = 255;
+    }
+  }
+  const sp = runPipeline(asImg(spot), { ...DEFAULT_PARAMS, auto: false }).image;
+  const si = (16 * sw + 16) * 4;
+  check(
+    'clipped highlight does not go black',
+    sp.data[si + 2] > 200,
+    `hot pixel blue=${sp.data[si + 2]} (was 255)`,
+  );
+}
 
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

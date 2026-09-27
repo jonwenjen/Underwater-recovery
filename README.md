@@ -7,8 +7,8 @@ browser. Fixes the four things that go wrong underwater:
 |---|---|
 | Heavy blue / green cast | Gray-world white balance on LAB chroma, referenced against a neutral grey so colour-accurate photos are left alone |
 | Missing red & warm tones | Jaffe–McGlamery spectral expansion of the red channel, anchored at the observed maximum so nothing clips |
-| Low contrast / water haze | Dark channel prior dehazing with guided transmission, self-limiting so clean images are untouched |
-| Blurry fine detail | CLAHE on the luminance plane + edge-aware unsharp mask |
+| Low contrast / water haze | Dark channel prior dehazing, self-limiting so clean images are untouched. The transmission map is smoothed with a windowed **minimum** filter, not He's guided filter — see limitations |
+| Blurry fine detail | CLAHE on the luminance plane + an unsharp mask. The mask is a plain box blur, **not** edge-aware and not noise-aware — see limitations |
 
 **No server, no upload, no account.** Every pixel is processed in a Web Worker
 in the tab. Nothing leaves your machine. Video is decoded, graded and re-encoded
@@ -18,13 +18,20 @@ locally via WebCodecs; the file is never sent anywhere.
 
 ```bash
 npm install
-npm run dev      # http://localhost:5173
-npm test         # numeric pipeline tests (no browser needed)
-npm run build    # typecheck + production bundle
+npm run dev        # http://localhost:5173
+npm test           # numeric pipeline tests (no browser needed)
+npm run typecheck  # src + test + bench
+npm run build      # typecheck + production bundle
+npm run bench      # per-resolution frame timings
 
-# video end-to-end test (drives a throwaway headless Chrome, never your own)
-node scripts/e2e-video.mjs http://localhost:4173/Underwater-recovery/ clip.mp4 out.mp4
+# video end-to-end test — drives a throwaway headless Chrome with its own
+# profile, so it never touches your own browser
+node scripts/e2e-video.mjs \
+  http://localhost:4173/Underwater-recovery/ test/fixtures/underwater.mp4 /tmp/out.mp4
 ```
+
+CI runs typecheck, the pipeline tests, the production build and that same
+video e2e on every push and pull request.
 
 ## Using it
 
@@ -33,6 +40,9 @@ them. Pick a preset or let auto mode tune itself, then adjust any stage by hand.
 
 - **Auto** — scales every correction by how strongly the image actually reads as
   underwater, so a strobe-lit shot with its reds intact is not pushed into neon.
+  Auto is a *starting point*, not an override: it writes its values onto the
+  sliders, and any slider you move — or any preset you pick — pins that value
+  for the rest of the session. Click 自動判斷 to hand everything back to Auto.
 - **深藍海水 / 綠水 / 混濁近攝 / 淺水自然** — fixed starting points for common
   conditions. Tweak from there.
 - Batch: drop many files, switch between them in the strip, then 下載全部.
@@ -67,6 +77,10 @@ Implementation notes worth knowing if you touch this code:
 - `quality` must be a `Quality` instance (`QUALITY_HIGH`), not a string. The
   pipeline sharpens, and sharpening amplifies compression artefacts, so this is
   not cosmetic.
+- The export analyses the clip itself, from 7 frames spread across 5–95 % of the
+  runtime, taking a per-field median. It never reuses the preview's analysis:
+  the preview analyses a single ≤480 px frame at the playhead, so reusing it made
+  the same file export differently depending on where you last scrubbed.
 
 ## How the pipeline works
 
@@ -116,6 +130,25 @@ regression guards that caught real bugs during development:
 - a neutral grey must not be flagged underwater, and must stay grey
 - a no-op configuration must not change a single byte
 
+## Numerics
+
+The colour transforms are table-driven: a 256-entry LUT into linear light, and a
+4096-entry LUT out of it with linear interpolation. The tone curve is likewise
+indexed on the float sRGB value rather than a rounded byte. Nothing in the
+pipeline re-quantises to 8 bits until the final write, where a half-LSB of
+zero-mean dither breaks up the contour banding that stretched 8-bit steps cause
+in smooth water.
+
+Two consequences worth knowing:
+
+- Any table lookup that interpolates at exactly 1.0 must guard the last index.
+  Reading one entry past the end yields `NaN`, and a `NaN` written to a
+  `Uint8ClampedArray` becomes `0` — so a missing guard turns every fully clipped
+  channel black. There are regression tests for exactly this.
+- Removing the mid-pipeline quantisation changes individual pixels by a few LSB
+  (the unsharp stage differences nearby values, so it amplifies small changes),
+  while leaving global colour statistics unchanged to within 0.1 LSB.
+
 ## Honest limitations
 
 - **Red is guessed, not recovered.** Water physically absorbs red; that
@@ -124,6 +157,17 @@ regression guards that caught real bugs during development:
   deliberate trade for a private, offline, dependency-free tool.
 - Deep shadows in a strobe-lit scene can keep a residual purple cast, and very
   turbid water still fights you. The sliders are there for that.
+- **The unsharp mask is not edge-aware.** It is a plain box USM applied
+  everywhere, so it also amplifies backscatter and sensor noise in flat water.
+  A variance-gated or cored version is the obvious next step.
+- **Transmission is smoothed with a windowed minimum filter, not a guided
+  filter.** That can leave mild halos and blocky edges around silhouettes
+  (a diver against open water). His is O(n) and `boxBlur` already exists here,
+  so swapping it in is cheap.
+- Red restoration rescales the red that survives; it does not borrow signal from
+  the green channel the way Ancuti et al. (2018) do, which is why deep shadows
+  stay the weakest part of the result.
+- Photo export is capped at 1600 px on the long edge. Video export is not.
 - Images are processed at up to 1600 px on the long edge; the original file is
   not written back.
 - Video re-encodes rather than stream-copying the video track, so quality is

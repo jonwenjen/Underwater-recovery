@@ -9,7 +9,7 @@
  *   node scripts/e2e-video.mjs <url> <mp4-path> <out-path>
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -17,7 +17,18 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const APP_URL = process.argv[2] ?? 'http://localhost:5199/';
 const VIDEO = process.argv[3];
 const OUT = process.argv[4] ?? '/tmp/uw-exported.mp4';
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+/**
+ * Chrome/Chromium path. Hard-coding the macOS app bundle meant the e2e could
+ * only ever run on one developer's machine; CI needs the Linux path too.
+ */
+const CHROME =
+  process.env.CHROME_PATH ??
+  ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+   '/usr/bin/google-chrome',
+   '/usr/bin/google-chrome-stable',
+   '/usr/bin/chromium',
+   '/usr/bin/chromium-browser'].find((p) => existsSync(p)) ??
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const PORT = 9333 + Math.floor(Math.random() * 400);
 
 const profile = mkdtempSync(join(tmpdir(), 'uw-e2e-'));
@@ -215,6 +226,81 @@ if (prev.lumaMax - prev.lumaMin < 10) {
   fail(`preview canvas is flat (min ${prev.lumaMin}, max ${prev.lumaMax}) — nothing was drawn`);
 }
 if (prev.meanR === 0 && prev.meanB === 0) fail('preview canvas is empty');
+
+/* ------------------------------------------- photo controls actually work */
+
+const photo = await evaluate(`(async () => {
+  const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
+  // use a still frame of the video as a photo
+  const v = document.createElement('video');
+  v.src = URL.createObjectURL(new Blob([bin], { type: 'video/mp4' }));
+  v.muted = true; document.body.appendChild(v);
+  await new Promise((r) => v.addEventListener('loadeddata', r, { once: true }));
+  v.currentTime = 2;
+  await new Promise((r) => v.addEventListener('seeked', r, { once: true }));
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  const url = c.toDataURL('image/png');
+  v.remove();
+
+  await window.__uw.loadDataURL(url);
+  // Wait for a full process cycle: the debounce is 120ms, so we must first see
+  // the busy flag appear, then wait for it to clear again.
+  const settle = async () => {
+    let sawBusy = false;
+    for (let i = 0; i < 150; i++) {
+      const on = !document.getElementById('busy').classList.contains('hidden');
+      if (on) sawBusy = true;
+      else if (sawBusy) return;
+      await new Promise(r => setTimeout(r, 60));
+    }
+  };
+  await settle();
+
+  const sliderValues = () => Object.fromEntries(
+    [...document.querySelectorAll('#sliders .row input')].map(i => [
+      i.parentElement.querySelector('span').textContent, parseFloat(i.value)]));
+
+  const out = {};
+  // 1. auto should have written real values onto the sliders
+  out.autoSliders = sliderValues();
+
+  // 2. each preset must change the sliders AND the rendered result
+  const results = [];
+  for (const name of ['blue', 'green', 'murky', 'shallow']) {
+    document.querySelector('#photoPane [data-preset="' + name + '"]').click();
+    await settle();
+    results.push({
+      preset: name,
+      sliders: sliderValues(),
+      px: window.__uw.stats().after,
+    });
+  }
+  out.presets = results;
+
+  // 3. moving a slider must change the output
+  const red = [...document.querySelectorAll('#sliders .row')]
+    .find(r => r.querySelector('span').textContent.includes('紅色復原')).querySelector('input');
+  const before = window.__uw.stats().after;
+  red.value = '0';
+  red.dispatchEvent(new Event('input', { bubbles: true }));
+  await settle();
+  out.sliderMoved = { before, after: window.__uw.stats().after, value: parseFloat(red.value) };
+
+  return out;
+})()`);
+console.log('PHOTO CONTROLS:');
+console.log('  auto slider values:', JSON.stringify(photo.autoSliders));
+let distinct = new Set(photo.presets.map(p => JSON.stringify(p.px)));
+console.log('  presets produced', distinct.size, 'distinct outputs of', photo.presets.length);
+for (const p of photo.presets) {
+  console.log('   ', p.preset.padEnd(8), 'red=' + p.sliders['紅色復原'], 'dehaze=' + p.sliders['去水霧'], 'clahe=' + p.sliders['局部對比 CLAHE'], '-> meanR', p.px.r.toFixed(1));
+}
+console.log('  slider 0 -> meanR', photo.sliderMoved.before.r.toFixed(1), 'then', photo.sliderMoved.after.r.toFixed(1));
+if (distinct.size < 4) fail('presets are not producing distinct output (B2 not fixed)');
+if (Math.abs(photo.sliderMoved.before.r - photo.sliderMoved.after.r) < 1)
+  fail('moving the red slider did not change the output (B2 not fixed)');
 
 /* ----------------------------------------------------------------- export */
 

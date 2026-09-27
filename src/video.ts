@@ -4,9 +4,11 @@ import {
   BufferTarget,
   Conversion,
   Input,
+  InputVideoTrack,
   Mp4OutputFormat,
   Output,
   QUALITY_HIGH,
+  VideoSampleSink,
   WebMOutputFormat,
   canEncodeVideo,
 } from 'mediabunny';
@@ -39,7 +41,6 @@ export interface VideoMeta {
 }
 
 const PREVIEW_MAX_EDGE = 480;
-const ANALYSIS_REUSE = 12;
 
 /* ------------------------------------------------------------------ worker */
 
@@ -49,40 +50,40 @@ const pending = new Map<number, (r: FrameResult) => void>();
 
 interface FrameResult {
   image: ImageData;
-  analysis?: Analysis;
 }
 
 function ensureWorker(): Worker {
   if (worker) return worker;
-  worker = new VideoWorker();
-  worker.onmessage = (ev: MessageEvent) => {
-    const { id, buffer, width, height, analysis } = ev.data as {
+  const w: Worker = new VideoWorker();
+  worker = w;
+  w.onmessage = (ev: MessageEvent) => {
+    const { id, buffer, width, height } = ev.data as {
       id: number;
       buffer: ArrayBuffer;
       width: number;
       height: number;
-      analysis?: Analysis;
     };
     const cb = pending.get(id);
     pending.delete(id);
     cb?.({
       image: new ImageData(new Uint8ClampedArray(buffer), width, height),
-      analysis,
     });
   };
-  return worker;
+  return w;
 }
 
-let cachedAnalysis: Analysis | null = null;
-
-export function resetVideoAnalysis() {
-  cachedAnalysis = null;
-}
-
+/**
+ * Grade one frame.
+ *
+ * `analysis` is always supplied by the caller. The worker no longer infers
+ * anything: an implicit per-frame re-analysis made the grade flicker, and
+ * reusing the preview's cached analysis made an export depend on where the
+ * user last scrubbed.
+ */
 function processFrame(
   data: ImageData,
   params: Params,
-  opts: { fresh: boolean },
+  analysis: Analysis,
 ): Promise<FrameResult> {
   const w = ensureWorker();
   const id = ++seq;
@@ -90,21 +91,87 @@ function processFrame(
   const p = new Promise<FrameResult>((res) => pending.set(id, res));
   w.postMessage(
     {
-      kind: 'video',
       id,
       width: data.width,
       height: data.height,
       buffer: copy,
       params,
-      analysis: opts.fresh ? undefined : (cachedAnalysis ?? undefined),
-      wantAnalysis: opts.fresh,
+      analysis,
     },
     [copy],
   );
   return p;
 }
 
+/**
+ * Analyse a clip once, from frames spread across its whole duration.
+ *
+ * Sampling evenly rather than only the first few frames matters: clips
+ * commonly open on a black fade-in, and grading the whole video from frame 0
+ * means grading it from black. Taking the per-field median across the samples
+ * also stops one strobe-lit frame from dragging the white balance.
+ */
+async function analyseClip(
+  track: InputVideoTrack,
+  duration: number,
+  w: number,
+  h: number,
+  signal?: { cancelled: boolean },
+): Promise<Analysis | null> {
+  const sink = new VideoSampleSink(track);
+  const canvas = new OffscreenCanvas(w, h);
+  const cx = canvas.getContext('2d', { willReadFrequently: true })!;
+  const samples: Analysis[] = [];
+
+  const N = 7;
+  for (let i = 0; i < N; i++) {
+    if (signal?.cancelled) break;
+    // 5%..95% of the clip: skip the fade-in and the tail
+    const t = duration * (0.05 + (0.9 * i) / (N - 1));
+    try {
+      const sample = await sink.getSample(t);
+      if (!sample) continue;
+      try {
+        sample.draw(cx, 0, 0, w, h);
+        samples.push(analyse(cx.getImageData(0, 0, w, h)));
+      } finally {
+        sample.close();
+      }
+    } catch {
+      // a frame we cannot decode is not fatal; the median copes
+    }
+  }
+
+  if (!samples.length) return null;
+  const pick = (f: (a: Analysis) => number) => {
+    const v = samples.map(f).sort((a, b) => a - b);
+    return v[v.length >> 1];
+  };
+  return {
+    ...samples[0],
+    meanA: pick((a) => a.meanA),
+    meanB: pick((a) => a.meanB),
+    castA: pick((a) => a.castA),
+    castB: pick((a) => a.castB),
+    redDeficit: pick((a) => a.redDeficit),
+    blueDominance: pick((a) => a.blueDominance),
+    contrast: pick((a) => a.contrast),
+    isUnderwater: pick((a) => a.isUnderwater),
+    suggestedRed: pick((a) => a.suggestedRed),
+    suggestedDehaze: pick((a) => a.suggestedDehaze),
+    suggestedGamma: pick((a) => a.suggestedGamma),
+  };
+}
+
 /* ------------------------------------------------------------------- probe */
+
+/** Thrown when the user cancels an export, so the UI can say so rather than "匯出失敗". */
+export class CancelledError extends Error {
+  constructor() {
+    super('cancelled');
+    this.name = 'CancelledError';
+  }
+}
 
 export async function probeVideo(file: File): Promise<VideoMeta> {
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
@@ -133,7 +200,6 @@ export class VideoPreview {
   private ctx: CanvasRenderingContext2D;
   private video: HTMLVideoElement;
   private raf = 0;
-  private frameNo = 0;
   private playing = false;
   private disposed = false;
 
@@ -193,11 +259,12 @@ export class VideoPreview {
     await this.waitForFrame();
   }
 
-  private async renderOnce(params: Params): Promise<void> {
-    if (this.disposed) return;
+  /** @returns the analysis of the frame just drawn, for the auto UI. */
+  private async renderOnce(params: Params): Promise<Analysis | null> {
+    if (this.disposed) return null;
     const vw = this.video.videoWidth;
     const vh = this.video.videoHeight;
-    if (!vw) return;
+    if (!vw) return null;
     const scale = Math.min(1, PREVIEW_MAX_EDGE / Math.max(vw, vh));
     const w = Math.max(2, Math.round((vw * scale) / 2) * 2);
     const h = Math.max(2, Math.round((vh * scale) / 2) * 2);
@@ -207,31 +274,42 @@ export class VideoPreview {
     }
     this.ctx.drawImage(this.video, 0, 0, w, h);
     const frame = this.ctx.getImageData(0, 0, w, h);
-    const fresh = this.frameNo % ANALYSIS_REUSE === 0;
-    this.frameNo++;
-    const res = await processFrame(frame, params, { fresh });
-    if (res.analysis) cachedAnalysis = res.analysis;
-    if (this.disposed) return;
+    // The preview analyses the frame it is actually showing, so Auto tracks
+    // the frame under the playhead and the diagnosis panel matches what is on
+    // screen. The export path analyses the clip separately and never reuses
+    // this.
+    const analysis = analyse(frame);
+    const res = await processFrame(frame, params, analysis);
+    if (this.disposed) return analysis;
     this.ctx.putImageData(res.image, 0, 0);
+    return analysis;
   }
 
   /** Render the frame at `time` once — used for scrubbing. */
-  async grab(time: number, params: Params): Promise<void> {
+  async grab(time: number, params: Params): Promise<Analysis | null> {
     this.pause();
     await this.seek(time);
-    await this.renderOnce(params);
+    return this.renderOnce(params);
   }
 
-  /** Play through, processing each frame as it arrives. */
-  async play(params: Params, onTick?: (t: number) => void): Promise<void> {
+  /**
+   * Play through, processing each frame as it arrives.
+   *
+   * `getParams` is called per frame rather than capturing `params` once, so a
+   * slider moved mid-playback takes effect immediately instead of only after
+   * the next preset click replaced the captured object.
+   */
+  async play(
+    getParams: () => Params,
+    onTick?: (t: number) => void,
+  ): Promise<void> {
     await this.ready();
     this.playing = true;
-    this.frameNo = 0;
     this.video.currentTime = 0;
     await this.video.play().catch(() => {});
     const loop = async () => {
       if (this.disposed || !this.playing) return;
-      await this.renderOnce(params);
+      await this.renderOnce(getParams());
       if (this.disposed || !this.playing) return;
       onTick?.(this.video.currentTime);
       if (this.video.ended) {
@@ -271,6 +349,12 @@ export interface ExportOptions {
   format: 'mp4' | 'webm';
   onProgress?: (p: number, note: string) => void;
   signal?: { cancelled: boolean };
+  /**
+   * Keys the user pinned via a slider or preset. Auto must not overwrite them
+   * here either, or the video export would ignore the same controls the photo
+   * mode now respects.
+   */
+  manual?: ReadonlySet<keyof Params>;
 }
 
 export async function exportVideo(
@@ -313,13 +397,32 @@ export async function exportVideo(
 
   onProgress(0, '準備中');
 
-  // Auto params are resolved from the first frames and then held, so the clip
-  // is graded consistently instead of flickering frame to frame.
-  let resolved = params;
-  let analysedFrames = 0;
+  // Analyse the clip ONCE, up front, from frames spread across its duration.
+  //
+  // This used to read the analysis the preview last cached — a single
+  // <=480p frame from wherever the user scrubbed to — so the same file exported
+  // differently depending on preview position, and if no preview had run, the
+  // worker re-derived auto params per frame and the grade flickered.
+  const clipAnalysis = await analyseClip(track, duration, outW, outH, opts.signal);
+  const clipParams = { ...DEFAULT_PARAMS, ...params };
+  const resolved = params.auto && clipAnalysis
+    ? { ...autoParams(clipParams, clipAnalysis, opts.manual), auto: false }
+    : { ...params, auto: false };
+  if (opts.signal?.cancelled) {
+    throw new CancelledError();
+  }
+
   let processed = 0;
   let outCanvas: OffscreenCanvas | null = null;
   let outCtx: OffscreenCanvasRenderingContext2D | null = null;
+  // Every frame is graded with the same analysis; if we could not analyse the
+  // clip (unreadable frames), fall back to analysing frame 0 inline.
+  let fallbackAnalysis: Analysis | null = null;
+  const analysisFor = (frame: ImageData): Analysis => {
+    if (clipAnalysis) return clipAnalysis;
+    fallbackAnalysis ??= analyse(frame);
+    return fallbackAnalysis;
+  };
 
   const conversion = await Conversion.init({
     input,
@@ -342,7 +445,7 @@ export async function exportVideo(
       // bitrate from the codec's default quantizer, which is lower than we want.
       quality: QUALITY_HIGH,
       process: async (sample) => {
-        if (opts.signal?.cancelled) throw new Error('cancelled');
+        if (opts.signal?.cancelled) throw new CancelledError();
         if (!outCanvas) {
           outCanvas = new OffscreenCanvas(outW, outH);
           outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
@@ -354,15 +457,7 @@ export async function exportVideo(
         sample.draw(outCtx!, 0, 0, outW, outH);
         const frame = outCtx!.getImageData(0, 0, outW, outH);
 
-        if (params.auto && analysedFrames < 3) {
-          const a = analyse(frame);
-          if (analysedFrames === 0) {
-            resolved = autoParams({ ...DEFAULT_PARAMS, ...params }, a);
-          }
-          analysedFrames++;
-        }
-
-        const res = await processFrame(frame, resolved, { fresh: false });
+        const res = await processFrame(frame, resolved, analysisFor(frame));
         processed++;
         if (processed % 5 === 0) {
           onProgress(

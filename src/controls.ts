@@ -1,5 +1,5 @@
-import { DEFAULT_PARAMS } from './pipeline';
-import type { Params } from './pipeline';
+import { DEFAULT_PARAMS, autoParams } from './pipeline';
+import type { Analysis, Params } from './pipeline';
 
 /** Shared control definitions and the slider/preset wiring used by both modes. */
 
@@ -69,12 +69,24 @@ const fmt = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(2));
 
 export interface Controls {
   params: Params;
+  /**
+   * Keys the user has taken ownership of, by moving a slider or picking a
+   * preset. Auto leaves these alone.
+   */
+  manual: ReadonlySet<keyof Params>;
   /** Re-render the panel to match `params`. */
   sync(): void;
   /** Replace the params wholesale (preset or reset). */
   set(next: Params): void;
   /** Push the auto checkbox state into params. */
   setAuto(on: boolean): void;
+  /**
+   * Re-derive the auto-tuned keys from `analysis` and show the result on the
+   * sliders, so the UI always displays what is actually being applied.
+   */
+  refreshAuto(analysis: Analysis | null): void;
+  /** Forget user-owned keys, so auto governs everything again. */
+  clearManual(): void;
 }
 
 export function buildControls(
@@ -84,6 +96,9 @@ export function buildControls(
   onChange: () => void,
 ): Controls {
   let params: Params = { ...DEFAULT_PARAMS };
+  // Sliders the user has deliberately set. Auto must not overwrite these —
+  // that was the bug where 5 of 9 sliders looked live but did nothing.
+  const manual = new Set<keyof Params>();
 
   const build = () => {
     sliderHost.innerHTML = '';
@@ -101,6 +116,7 @@ export function buildControls(
       input.addEventListener('input', () => {
         (params[s.key] as number) = parseFloat(input.value);
         out.textContent = fmt(params[s.key] as number);
+        manual.add(s.key);
         onChange();
       });
       row.appendChild(input);
@@ -123,15 +139,26 @@ export function buildControls(
 
   presetHost.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((b) => {
     b.addEventListener('click', () => {
-      presetHost.querySelectorAll('[data-preset]').forEach((x) => x.classList.remove('on'));
+      presetHost
+        .querySelectorAll('[data-preset]')
+        .forEach((x) => x.classList.remove('on'));
       b.classList.add('on');
       const key = b.dataset.preset!;
-      params = {
-        ...DEFAULT_PARAMS,
-        ...PRESETS[key],
-        auto: key === 'auto' ? true : autoBox.checked,
-      };
-      autoBox.checked = params.auto;
+      if (key === 'auto') {
+        // back to fully automatic: hand every key back to auto
+        manual.clear();
+        autoBox.checked = true;
+        params = { ...DEFAULT_PARAMS, auto: true };
+      } else {
+        // A preset is a set of deliberate choices, so it *pins* those keys
+        // rather than being overwritten by auto. Everything else still tracks
+        // the image, which is what makes presets feel like a starting point.
+        const preset = PRESETS[key];
+        for (const [k, v] of Object.entries(preset)) {
+          (params as unknown as Record<string, number>)[k] = v as number;
+          manual.add(k as keyof Params);
+        }
+      }
       sync();
       onChange();
     });
@@ -148,6 +175,9 @@ export function buildControls(
     get params() {
       return params;
     },
+    get manual() {
+      return manual;
+    },
     sync,
     set(next: Params) {
       params = next;
@@ -158,6 +188,14 @@ export function buildControls(
       params = { ...params, auto: on };
       autoBox.checked = on;
       sync();
+    },
+    refreshAuto(analysis: Analysis | null) {
+      if (!analysis || !params.auto) return;
+      params = autoParams(params, analysis, manual);
+      sync();
+    },
+    clearManual() {
+      manual.clear();
     },
   };
 }

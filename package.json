@@ -7,9 +7,13 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types test/pipeline.test.ts"
+    "test": "node --experimental-strip-types test/pipeline.test.ts",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json",
+    "bench": "node --experimental-strip-types bench/bench.ts",
+    "e2e:video": "node scripts/e2e-video.mjs"
   },
   "devDependencies": {
+    "@types/node": "^26.6.3",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   },
