@@ -52,6 +52,10 @@ export class Renderer {
   /** 自動化流程 maps: analysis-res aux (depth coef, fusion weights), local WB grid. */
   private aux: Tex | null = null;
   private lwb: Tex | null = null;
+  /** 🤖 AI 風格 transform grid (ai.ts): 3 RGBA32F texels per tile. */
+  private ai: Tex | null = null;
+  private aiKey: Float32Array | null = null;
+  private aiReadT: Target | null = null;
   private lut: Tex | null = null;
   private curve: Tex;
   private pre: Target | null = null;
@@ -193,6 +197,27 @@ export class Renderer {
   }
 
   /**
+   * The oriented source at w × h (the 🤖 AI 風格 network input), top row first.
+   * Downscaling reads the source mips, like the analysis frame.
+   */
+  readAt(w: number, h: number): Uint8Array {
+    const gl = this.gl;
+    if (!this.aiReadT || this.aiReadT.w !== w || this.aiReadT.h !== h) {
+      destroy(gl, this.aiReadT);
+      this.aiReadT = target(gl, texture(gl, w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE));
+    }
+    this.pass(this.progs.copy, this.aiReadT, () => {
+      this.bind(0, this.src!, 'u_src', this.progs.copy);
+      gl.uniform4f(this.progs.copy.u.u_crop, 0, 0, 1, 1);
+    });
+    const out = new Uint8Array(w * h * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.aiReadT.fb);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+  }
+
+  /**
    * Noise probe: a centred crop at *processing* scale (the scale the grade and
    * 畫質修復 passes see), so the engine can measure grain the 192 px analysis
    * frame has averaged away.
@@ -254,6 +279,18 @@ export class Renderer {
     }
     gl.bindTexture(gl.TEXTURE_2D, this.lwb.tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, LWB_GRID, LWB_GRID, 0, gl.RGBA, gl.FLOAT, g4);
+    const ai = s.ai.guide;
+    if (ai && ai.m !== this.aiKey) {
+      // float32: the offsets and cross terms need more than half precision; texelFetch only
+      if (!this.ai || this.ai.w !== ai.gx * 3 || this.ai.h !== ai.gy) {
+        destroy(gl, this.ai);
+        this.ai = texture(gl, ai.gx * 3, ai.gy, gl.RGBA32F, gl.RGBA, gl.FLOAT, { filter: gl.NEAREST });
+      }
+      gl.bindTexture(gl.TEXTURE_2D, this.ai.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, ai.gx * 3, ai.gy, 0, gl.RGBA, gl.FLOAT, ai.m);
+      this.aiKey = ai.m;
+    }
+    if (!this.ai) this.ai = texture(gl, 3, 1, gl.RGBA32F, gl.RGBA, gl.FLOAT, { filter: gl.NEAREST });
   }
 
   /** Full-resolution grade + blur passes. Call when the state or source changed. */
@@ -261,6 +298,7 @@ export class Renderer {
     const gl = this.gl;
     this.uploadState(s);
     const restore = s.restore > 0.001;
+    const ai = s.ai.guide && s.ai.amount > 0.001 ? s.ai.guide : null;
     if (restore) {
       const pp = this.progs.pre;
       this.pass(pp, this.pre!, () => {
@@ -319,6 +357,10 @@ export class Renderer {
       gl.uniform2f(g.u.u_labShift, s.lab.shift[0], s.lab.shift[1]);
       gl.uniform1f(g.u.u_labAmt, s.lab.amount);
       gl.uniform1f(g.u.u_fuse, s.clahe ? s.fusion : 0);
+      // 🤖 AI 風格
+      this.bind(8, this.ai!, 'u_ai', g);
+      gl.uniform2f(g.u.u_aiGrid, ai ? ai.gx : 1, ai ? ai.gy : 1);
+      gl.uniform1f(g.u.u_aiAmt, ai ? s.ai.amount : 0);
     });
     gl.bindTexture(gl.TEXTURE_2D, this.graded!.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
@@ -442,7 +484,7 @@ export class Renderer {
 
   dispose() {
     const gl = this.gl;
-    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.aux, this.lwb, this.lut, this.curve, this.pre, this.lookTex, this.rays, this.noise])
+    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.aux, this.lwb, this.ai, this.aiReadT, this.lut, this.curve, this.pre, this.lookTex, this.rays, this.noise])
       destroy(gl, t);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
   }

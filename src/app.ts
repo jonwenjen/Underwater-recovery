@@ -1,7 +1,9 @@
 import './app.css';
+import { AI_REFRESH_S, blendGuide, type AiGuide } from './engine/ai.ts';
 import type { FrameState } from './engine/auto.ts';
 import type { Vec3 } from './engine/color.ts';
 import {
+  AI_STYLE,
   AUTO_KEYS,
   DEFAULT_PARAMS,
   GROUPS,
@@ -18,6 +20,8 @@ import { NO_ORIENT, orientedSize, Processor, type Orient, type View } from './en
 import { curveEditor } from './ui/curves.ts';
 import { hslPanel } from './ui/hsl.ts';
 import { lightPoints, type PointId } from './ui/lightPoints.ts';
+
+import type { Funie } from './engine/funie.ts';
 
 type ExportMod = typeof import('./engine/export.ts');
 let exportMod: Promise<ExportMod> | null = null;
@@ -105,7 +109,7 @@ function renderNow() {
   const src = it.kind === 'image' ? it.bitmap : it.video;
   const upload = needUpload || !proc.state;
   needUpload = false;
-  const st = proc.frame(upload ? src : null, it.w, it.h, { params, locked, dt: 0, snap: true }, view);
+  const st = proc.frame(upload ? src : null, it.w, it.h, { params, locked, dt: 0, snap: true, ai: aiGuide }, view);
   afterFrame(st);
 }
 
@@ -117,7 +121,7 @@ function onVideoFrame(_now: number, meta: VideoFrameCallbackMetadata) {
   const snap = lastMediaTime < 0 || dt < 0 || dt > 1;
   lastMediaTime = meta.mediaTime;
   sizeFor(it);
-  const st = proc.frame(it.video, it.w, it.h, { params, locked, dt: snap ? 0 : dt, snap }, view);
+  const st = proc.frame(it.video, it.w, it.h, { params, locked, dt: snap ? 0 : dt, snap, ai: aiGuide }, view);
   afterFrame(st);
   updateTime(it);
   it.video.requestVideoFrameCallback(onVideoFrame);
@@ -128,6 +132,7 @@ function afterFrame(st: FrameState) {
   framesSinceTick++;
   msAccum += proc.lastFrameMs;
   if (st.stats.sceneCut) cutUntil = performance.now() + 900;
+  refreshAi(st.stats.sceneCut);
   const now = performance.now();
   if (now - lastUi > 120 || !playing) {
     const span = now - lastUi;
@@ -289,6 +294,7 @@ function buildControls() {
 function refreshControls(st: FrameState | null) {
   syncVivid();
   syncFlow();
+  syncAi();
   lp?.update();
   for (const [k, r] of rows) {
     const auto = isFollowingAuto(k);
@@ -386,7 +392,7 @@ $('vivid').addEventListener('click', () => {
 const FLOW_LOCK: Partial<Record<NumKey, number>> = { fusion: 1, labCast: 0.5, seathru: 0.5, localWB: 0.5 };
 const isSwitch = (k: NumKey) => k === 'autoPipeline' || k === 'qaGuard';
 const flowPressed = (k: NumKey) => (isSwitch(k) ? params[k] >= 0.5 : !isFollowingAuto(k) && params[k] > 0);
-const flowButtons = [...document.querySelectorAll<HTMLButtonElement>('#flow button')];
+const flowButtons = [...document.querySelectorAll<HTMLButtonElement>('#flow button[data-flow]')];
 function syncFlow() {
   const st = lastState;
   const eff = (k: AutoKey) => (st ? st.effective[k] : params[k]);
@@ -439,6 +445,132 @@ for (const b of flowButtons)
     refreshControls(lastState);
     requestRender();
   });
+
+/* 🤖 AI 風格 (FUnIE-GAN, optional): the first press downloads the runtime and
+ * the model; the network then runs on a small copy of each still (every
+ * AI_REFRESH_S of video, and on cuts) and the GRADE pass applies its colour
+ * and tone at full resolution. Pressing again returns to 全自動. */
+const MODEL_URL = `${import.meta.env.BASE_URL}models/funie-gan.fp16.onnx`;
+let funie: Funie | null = null;
+let funieLoad: Promise<Funie> | null = null;
+let aiGuide: AiGuide | null = null;
+let aiFor = '';
+let aiBusy = false;
+let aiMs = 0;
+let aiMsg = '';
+const aiKey = () => {
+  const it = items[current];
+  const t = it?.kind === 'video' ? Math.floor(it.video.currentTime / AI_REFRESH_S) : 0;
+  return `${current}|${orient.rot}${orient.flip ? 'f' : ''}|${t}`;
+};
+function loadFunie(): Promise<Funie> {
+  funieLoad ??= import('./engine/funie.ts')
+    .then((m) =>
+      m.Funie.create(MODEL_URL, (f) => {
+        aiMsg = `下載模型 ${Math.round(f * 100)}%…`;
+        syncAi();
+      }),
+    )
+    .then(
+      (f) => {
+        funie = f;
+        aiMsg = '';
+        return f;
+      },
+      (err) => {
+        funieLoad = null;
+        aiMsg = `載入失敗：${(err as Error).message}`;
+        syncAi();
+        throw err;
+      },
+    );
+  return funieLoad;
+}
+/** Run the network on the frame now in the source texture. */
+function aiInput(f: Funie): [Uint8Array, number, number] {
+  const [nw, nh] = f.inputSize(proc.renderer.outW, proc.renderer.outH);
+  return [proc.renderer.readAt(nw, nh), nw, nh];
+}
+/** After each frame: when AI 風格 is on and the guide is for another frame, refresh it (async). */
+function refreshAi(cut: boolean) {
+  if (params.aiStyle <= 0.001 || aiBusy || !items[current]) return;
+  if (!funie) {
+    if (!funieLoad) loadFunie().then(() => requestRender(), () => {});
+    return;
+  }
+  const key = aiKey();
+  if (key === aiFor && !cut) return;
+  const blend = playing && !cut && aiFor.split('|')[0] === key.split('|')[0];
+  aiFor = key;
+  aiBusy = true;
+  const [rgba, nw, nh] = aiInput(funie);
+  const t0 = performance.now();
+  funie.guide(rgba, nw, nh).then(
+    (g) => {
+      aiGuide = blendGuide(aiGuide, g, blend ? 0.5 : 1);
+      aiMs = performance.now() - t0;
+      aiBusy = false;
+      syncAi();
+      if (!playing) requestRender();
+    },
+    (err) => {
+      aiBusy = false;
+      aiMsg = `推論失敗：${(err as Error).message}`;
+      syncAi();
+    },
+  );
+}
+const aiBtn = $<HTMLButtonElement>('aiStyle');
+function syncAi() {
+  const on = params.aiStyle > 0.001;
+  aiBtn.setAttribute('aria-pressed', String(on && !!funie));
+  aiBtn.classList.toggle('busy', !!funieLoad && !funie);
+  const [nw, nh] = funie && proc.renderer.outW ? funie.inputSize(proc.renderer.outW, proc.renderer.outH) : [0, 0];
+  $('aiNote').textContent =
+    aiMsg ||
+    (funie
+      ? `${funie.backend === 'webgpu' ? 'WebGPU' : 'WASM'} · 推論 ${nw}×${nh}${aiMs ? ` · ${Math.round(aiMs)} ms` : ''}` +
+        (on ? ` · 強度 ${params.aiStyle.toFixed(2)} · 再按一下回全自動` : '')
+      : '選用 · 首次按下載入 14 MB 模型');
+}
+async function pressAi() {
+  if (params.aiStyle > 0.001 && funie) {
+    applyPreset('auto');
+    syncAi();
+    return;
+  }
+  if (!items[current] || !proc.state) return;
+  aiBtn.disabled = true;
+  try {
+    const f = await loadFunie();
+    // the guide first, so the first AI frame is already the network's
+    const [rgba, nw, nh] = aiInput(f);
+    const t0 = performance.now();
+    aiGuide = await f.guide(rgba, nw, nh);
+    aiMs = performance.now() - t0;
+    aiFor = aiKey();
+  } catch {
+    return;
+  } finally {
+    aiBtn.disabled = false;
+  }
+  // the network's colour and tone alone (see AI_STYLE); restoration and speed stay
+  const prev = params;
+  params = { ...DEFAULT_PARAMS, auto: true, response: prev.response, restore: prev.restore };
+  const keepRestore = locked.has('restore');
+  locked.clear();
+  if (keepRestore) locked.add('restore');
+  for (const [k, v] of Object.entries(AI_STYLE) as [NumKey, number][]) {
+    params[k] = v;
+    if (isAutoKey(k)) locked.add(k);
+  }
+  $<HTMLInputElement>('auto').checked = true;
+  markPreset(null);
+  refreshControls(lastState);
+  syncAi();
+  requestRender();
+}
+aiBtn.addEventListener('click', () => void pressAi());
 
 $<HTMLInputElement>('auto').addEventListener('change', (e) => {
   const on = (e.target as HTMLInputElement).checked;
@@ -707,7 +839,15 @@ document.addEventListener(
 
 /* ---------------------------------------------------------------- export */
 
-const grade = () => ({ params: { ...params }, locked: new Set(locked), pick: proc.engine.pick, orient: { ...orient }, look: cloneLook(look) });
+const grade = () => ({
+  params: { ...params },
+  locked: new Set(locked),
+  pick: proc.engine.pick,
+  orient: { ...orient },
+  look: cloneLook(look),
+  ai: params.aiStyle > 0.001 ? aiGuide : null,
+  aiModel: funie ?? undefined,
+});
 const baseName = (n: string) => n.replace(/\.[^.]+$/, '');
 function download(blob: Blob, name: string) {
   const a = document.createElement('a');
@@ -1005,7 +1145,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
       const t0 = performance.now();
       let last = 0;
       for (let i = 0; i < n; i++) {
-        proc.frame(src, it.w, it.h, { params, locked, dt: 1 / 30 }, view);
+        proc.frame(src, it.w, it.h, { params, locked, dt: 1 / 30, ai: aiGuide }, view);
         last = proc.renderer.readScope(proc.state!)[0]; // forces GPU completion
       }
       return { msPerFrame: (performance.now() - t0) / n, size: [proc.renderer.pw, proc.renderer.ph], last };
@@ -1088,5 +1228,23 @@ Object.assign(window as unknown as Record<string, unknown>, {
       return { size: blob.size, type: blob.type, w: bmp.width, h: bmp.height, stats: outputStats(new Uint8Array(px)) };
     },
     state: () => ({ params: { ...params }, locked: [...locked], preset: activePreset, view: { ...view } }),
+    /** 🤖 AI 風格: press the button (awaits model load + first guide). */
+    pressAi: () => pressAi(),
+    aiState: () => ({
+      loaded: !!funie,
+      backend: funie?.backend ?? null,
+      guide: aiGuide ? [aiGuide.gx, aiGuide.gy] : null,
+      ms: aiMs,
+      busy: aiBusy,
+      msg: aiMsg,
+      pressed: aiBtn.getAttribute('aria-pressed') === 'true',
+    }),
+    /** Network output vs the grid approximation, both at network size (test hook). */
+    async aiFidelity() {
+      if (!funie || !aiGuide) return null;
+      const [rgba, nw, nh] = aiInput(funie);
+      const net = await funie.enhance(rgba, nw, nh);
+      return { w: nw, h: nh, src: Array.from(rgba), net: Array.from(net), guide: { gx: aiGuide.gx, gy: aiGuide.gy, m: Array.from(aiGuide.m) } };
+    },
   },
 });

@@ -23,6 +23,7 @@ import {
   canEncodeVideo,
   type VideoCodec,
 } from 'mediabunny';
+import { AI_REFRESH_S, blendGuide, type AiGuide } from './ai.ts';
 import type { Pick } from './auto.ts';
 import { identityLook, type Look } from './look.ts';
 import type { AutoKey, Params } from './params.ts';
@@ -34,6 +35,14 @@ export interface GradeSettings {
   pick: Pick | null;
   orient?: Orient;
   look?: Look;
+  /** 🤖 AI 風格 transform grid for this picture (photo; a video's first guide). */
+  ai?: AiGuide | null;
+}
+
+/** The FUnIE-GAN runner (funie.ts), for refreshing the AI guide through a video. */
+export interface AiModel {
+  inputSize(w: number, h: number): [number, number];
+  guide(rgba: Uint8Array, w: number, h: number): Promise<AiGuide>;
 }
 
 function prepare(proc: Processor, g: GradeSettings) {
@@ -66,7 +75,7 @@ export async function exportPhoto(
     prepare(proc, g);
     const [ow, oh] = orientedSize(w, h, g.orient ?? NO_ORIENT);
     proc.renderer.resize(ow, oh);
-    proc.frame(src, w, h, { params: g.params, locked: g.locked, dt: 0 }, RESULT_VIEW);
+    proc.frame(src, w, h, { params: g.params, locked: g.locked, dt: 0, ai: g.ai }, RESULT_VIEW);
     return await canvas.convertToBlob({ type, quality });
   } finally {
     proc.renderer.dispose();
@@ -112,6 +121,8 @@ export interface VideoExportOptions extends GradeSettings {
    * of scope, and silent is better than chipmunks.
    */
   speed?: number;
+  /** With 🤖 AI 風格 on: re-run the network every AI_REFRESH_S and on cuts. */
+  aiModel?: AiModel;
 }
 
 export interface VideoExportResult {
@@ -160,6 +171,9 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
   let frames = 0;
   let lastT: number | null = null;
   let nextEmit = -Infinity;
+  const aiModel = o.params.aiStyle > 0.001 ? o.aiModel : undefined;
+  let ai: AiGuide | null = o.ai ?? null;
+  let aiT: number | null = null;
 
   const conversion = await Conversion.init({
     input,
@@ -169,7 +183,7 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
       quality: QUALITY_HIGH,
       processedWidth: outW,
       processedHeight: outH,
-      process: (sample) => {
+      process: async (sample) => {
         const outT = sample.timestamp / speed;
         const srcDur = sample.duration > 0 ? sample.duration : 1 / 30;
         // faster than real time: keep only as many frames as the source rate
@@ -185,7 +199,19 @@ export async function exportVideo(file: Blob, o: VideoExportOptions): Promise<Vi
           // user's response time, and snaps on cuts.
           const dt = lastT === null ? 0 : Math.max(0, Math.min(1, t - lastT));
           lastT = t;
-          proc.frame(frame, frame.displayWidth, frame.displayHeight, { params: o.params, locked: o.locked, dt }, RESULT_VIEW);
+          const fw = frame.displayWidth,
+            fh = frame.displayHeight;
+          let upload = true;
+          if (aiModel && (aiT === null || proc.state?.stats.sceneCut || t - aiT >= AI_REFRESH_S)) {
+            // the network sees this frame, oriented, at its input size
+            proc.renderer.upload(frame, fw, fh);
+            upload = false;
+            const [nw, nh] = aiModel.inputSize(proc.renderer.outW, proc.renderer.outH);
+            const g = await aiModel.guide(proc.renderer.readAt(nw, nh), nw, nh);
+            ai = blendGuide(ai, g, aiT === null || proc.state?.stats.sceneCut ? 1 : 0.5);
+            aiT = t;
+          }
+          proc.frame(upload ? frame : null, fw, fh, { params: o.params, locked: o.locked, dt, ai }, RESULT_VIEW);
         } finally {
           frame.close();
         }

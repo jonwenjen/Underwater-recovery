@@ -12,7 +12,8 @@ import { buildClahe, buildCurve, sampleCurve } from '../src/engine/luts.ts';
 import { applyHsl, buildCurveLut, curveFn, hslWeights, identityCurves, identityHsl, sampleCurveLut, type Pt } from '../src/engine/look.ts';
 import { applySurface, detectBeams, detectSurface, estimateNoise, neutralLight, surfaceMask } from '../src/engine/light.ts';
 import { applyLabShift, fitSeaThru, fuseL, fusionWeights, localWhiteBalance, LWB_GRID, quality, seaThruChannel } from '../src/engine/pipeline.ts';
-import { DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
+import { AI_STYLE, DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
+import { applyGuide, blendGuide, fitGuide, gridFor, identityGuide, netSize } from '../src/engine/ai.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -580,6 +581,74 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     }
   check('自動判斷流程 changes a non-underwater frame no more than full auto does', c1 <= c0 + 1e-6,
     `mean change ${(c0 / (W * H * 3)).toFixed(2)} → ${(c1 / (W * H * 3)).toFixed(2)} levels`);
+}
+
+/* ---------------------------------------------------- 🤖 AI 風格 guide */
+
+{
+  console.log('\n— 🤖 AI 風格: transform grid (ai.ts)');
+  const src = underwater('blue');
+  // a spatially varying colour transform standing in for the network: red
+  // gain rising left → right, blue cut rising top → bottom, a cross term
+  const net = (r: number, g: number, b: number, u: number, v: number): Vec3 => [
+    Math.min(1, r * (1.1 + 0.4 * u) + 0.04),
+    Math.min(1, 0.9 * g + 0.1 * r),
+    Math.min(1, b * (1 - 0.35 * v)),
+  ];
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      const o = net(src[i] / 255, src[i + 1] / 255, src[i + 2] / 255, (x + 0.5) / W, (y + 0.5) / H);
+      out[i] = Math.round(o[0] * 255);
+      out[i + 1] = Math.round(o[1] * 255);
+      out[i + 2] = Math.round(o[2] * 255);
+      out[i + 3] = 255;
+    }
+  const [gx, gy] = gridFor(W, H);
+  const g = fitGuide(src, out, W, H, gx, gy);
+  const t = new Float32Array(12), px = new Float32Array(3);
+  let err = 0, idErr = 0;
+  const id = identityGuide(gx, gy);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      for (let c = 0; c < 3; c++) px[c] = src[i + c] / 255;
+      applyGuide(px, g, (x + 0.5) / W, (y + 0.5) / H, 1, t);
+      for (let c = 0; c < 3; c++) err += Math.abs(px[c] * 255 - out[i + c]);
+      for (let c = 0; c < 3; c++) px[c] = src[i + c] / 255;
+      applyGuide(px, id, (x + 0.5) / W, (y + 0.5) / H, 1, t);
+      for (let c = 0; c < 3; c++) idErr += Math.abs(px[c] * 255 - src[i + c]);
+    }
+  err /= W * H * 3;
+  check('grid reproduces a smoothly varying colour transform', err < 2, `grid ${gx}×${gy}, mean error ${err.toFixed(2)} levels`);
+  check('identity grid leaves the picture alone', idErr / (W * H * 3) < 1e-3);
+  const b = blendGuide(id, g, 0.5);
+  check('video blend moves the grid halfway', near(b.m[0], (id.m[0] + g.m[0]) / 2, 1e-6) && blendGuide(identityGuide(2, 2), g, 0.5) === g);
+  const [nw, nh] = netSize(1920, 1080, 512);
+  check('network input: multiples of 32, long edge ≈ 512', nw % 32 === 0 && nh % 32 === 0 && nw === 512 && Math.abs(nh - 288) <= 16, `${nw}×${nh}`);
+
+  // the engine: AI 風格 applies the grid before everything else; with the
+  // button's settings the result follows the network, not the engine
+  const run = (p: Partial<Params>, ai = g) => {
+    const locked = new Set(Object.keys(p).filter(isAutoKey)) as Set<AutoKey>;
+    const st = new AutoEngine().step(src, W, H, { params: { ...DEFAULT_PARAMS, ...p }, locked, dt: 0, ai });
+    return mirrorRender(src, W, H, st);
+  };
+  const plain = run({}, null as never), off = run({ aiStyle: 0 });
+  let d0 = 0;
+  for (let i = 0; i < plain.length; i++) d0 = Math.max(d0, Math.abs(plain[i] - off[i]));
+  check('aiStyle 0: a loaded guide changes nothing', d0 < 1e-6);
+  const style = run(AI_STYLE);
+  const mean = (f: (i: number, c: number) => number) => [0, 1, 2].map((c) => { let s2 = 0; for (let i = 0; i < W * H; i++) s2 += f(i, c); return s2 / (W * H); });
+  const mS = mean((i, c) => style[i * 3 + c] * 255), mN = mean((i, c) => out[i * 4 + c]);
+  const dm = Math.max(...mS.map((v, c) => Math.abs(v - mN[c])));
+  check('AI 風格 button: output follows the network (engine colour/tone off)', dm < 3,
+    `mean ${mS.map((v) => v.toFixed(1)).join('/')} vs network ${mN.map((v) => v.toFixed(1)).join('/')}`);
+  const half = run({ ...AI_STYLE, aiStyle: 0.5 }), none = run({ ...AI_STYLE, aiStyle: 0 });
+  const mH = mean((i, c) => half[i * 3 + c] * 255), m0 = mean((i, c) => none[i * 3 + c] * 255);
+  check('AI 風格強度 0.5 lands halfway', mH.every((v, c) => Math.abs(v - (mS[c] + m0[c]) / 2) < 2),
+    `${mH.map((v) => v.toFixed(1)).join('/')}`);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

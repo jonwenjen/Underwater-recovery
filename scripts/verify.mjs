@@ -788,6 +788,71 @@ try {
       `colour error ${f3(flow.sunny.auto.err)} → ${f3(flow.sunny.autoPipeline.err)}, newly blown ${f1(flow.sunny.auto.blown * 100)} % → ${f1(flow.sunny.autoPipeline.blown * 100)} %`);
   }
 
+  console.log('\n— 🤖 AI 風格 (FUnIE-GAN, optional): lazy model load, GPU follows the network, export');
+  {
+    const ai = await page.evaluate(async () => {
+      const S = window.__scene, U = window.__uw;
+      const W = 800, H = 500;
+      const t = S.truth(W, H, 0.35, 11);
+      await U.addFiles([await S.toFile(S.degrade(t, 'green', 6, 3), W, H, 'ai-green.png')]);
+      U.setView({ mode: 0 });
+      U.preset('auto');
+      const before = U.aiState();
+      const auto = U.render();
+      const oa = U.outputPixels();
+      const t0 = performance.now();
+      await U.pressAi();
+      const loadMs = performance.now() - t0;
+      const r = U.render();
+      const o = U.outputPixels();
+      const fid = await U.aiFidelity();
+      const mean = (px) => { const a = [0, 0, 0]; for (let i = 0; i < px.length; i += 4) for (let c = 0; c < 3; c++) a[c] += px[i + c]; return a.map((v) => v / (px.length / 4)); };
+      const ts = S.truth(o.w, o.h, 0.35, 11);
+      const photo = await U.exportPhoto('image/png');
+      const state = U.aiState();
+      const note = document.getElementById('aiNote').textContent;
+      // video: a 1 s clip graded with the network re-run through it
+      const mod = await U.loadExport();
+      const cv = new OffscreenCanvas(320, 192);
+      const cx = cv.getContext('2d');
+      const tv = S.truth(320, 192, 0, 7);
+      const clip = await mod.encodeCanvasClip(cv, 30, 30, (i) => {
+        cx.putImageData(new ImageData(S.degrade(tv, 'blue', 6 + i / 15, i), 320, 192), 0, 0);
+      });
+      await U.addFiles([new File([clip], 'ai-clip.webm', { type: 'video/webm' })]);
+      await new Promise((res) => setTimeout(res, 300));
+      // AI 風格 stays on across items: the new item's guide is computed after its first frame
+      U.render();
+      for (let i = 0; i < 200 && U.aiState().busy; i++) await new Promise((res) => setTimeout(res, 50));
+      const vAi = U.state().params.aiStyle;
+      const vprev = U.render().out;
+      const vid = await U.exportVideo({ maxEdge: 0, format: 'mp4' });
+      const vout = await U.exportedFrameStats(0.1);
+      document.querySelector('#aiStyle').click();
+      await new Promise((res) => setTimeout(res, 50));
+      const back = U.state();
+      return {
+        before, loadMs, state, note,
+        autoErr: S.chromaError(oa.px, oa.w, oa.h, ts).err, aiErr: S.chromaError(o.px, o.w, o.h, ts).err,
+        gpu: mean(o.px), net: mean(fid.net), auto: [auto.out.r, auto.out.g, auto.out.b],
+        preview: r.out, photo: photo.stats,
+        video: { frames: vid.frames, canceled: vid.canceled, prev: vprev, out: vout.out, ai: vAi },
+        back: { aiStyle: back.params.aiStyle, preset: back.preset, pressed: document.querySelector('#aiStyle').getAttribute('aria-pressed') },
+      };
+    });
+    const d = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+    const rgb = (x) => [x.r, x.g, x.b];
+    check('AI 風格 loads on demand (nothing before the press)', !ai.before.loaded && ai.state.loaded && !!ai.state.guide && ai.state.pressed,
+      `${ai.state.backend}, grid ${ai.state.guide?.join('×')}, first press ${f1(ai.loadMs)} ms (runtime + model + inference), inference ${f1(ai.state.ms)} ms · "${ai.note}"`);
+    check('AI 風格: the full-resolution GPU result follows the network', d(ai.gpu, ai.net) < 4,
+      `mean ${ai.gpu.map(f1).join('/')} vs network ${ai.net.map(f1).join('/')} (full auto ${ai.auto.map(f1).join('/')}); colour error vs truth ${f3(ai.autoErr)} full auto → ${f3(ai.aiErr)} AI`);
+    check('AI 風格: photo export matches the preview', d(rgb(ai.photo), rgb(ai.preview)) < 6, `max channel-mean diff ${f1(d(rgb(ai.photo), rgb(ai.preview)))}`);
+    check('AI 風格: video export re-runs the network and matches the preview',
+      ai.video.ai === 1 && ai.video.frames === 30 && !ai.video.canceled && !!ai.video.out && d(rgb(ai.video.out), rgb(ai.video.prev)) < 8,
+      `${ai.video.frames} frames, first-frame mean diff ${ai.video.out ? f1(d(rgb(ai.video.out), rgb(ai.video.prev))) : '—'}`);
+    check('AI 風格: pressing again returns to 全自動', ai.back.aiStyle === 0 && ai.back.preset === 'auto' && ai.back.pressed === 'false', JSON.stringify(ai.back));
+  }
+
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');
   const clip = await page.evaluate(async () => {
     const S = window.__scene;

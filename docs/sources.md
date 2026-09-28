@@ -16,6 +16,13 @@ description; algorithms are not copyrightable, only their expression is.
 
 測試 / Tests: `test/methods.test.ts` (50 checks).
 
+**Model weights (🤖 AI 風格).** One exception to "no upstream code or data":
+`public/models/funie-gan.fp16.onnx` is the FUnIE-GAN generator (Islam, Xia &
+Sattar, RA-L 2020, github.com/xahidbuffon/FUnIE-GAN), **MIT**, redistributed
+with its licence in `public/models/FUnIE-GAN-LICENSE`. The PyTorch weights
+were exported to ONNX and converted to float16; no source code was copied.
+The runtime is onnxruntime-web (MIT, npm dependency).
+
 ---
 
 ## 1. bornfree/dive-color-corrector

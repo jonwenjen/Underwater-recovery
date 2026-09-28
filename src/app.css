@@ -718,3 +718,13 @@ footer {
 .flowbtn.engaged:not([aria-pressed='true']) {
   border-color: rgba(255, 209, 102, 0.6);
 }
+.flowbtn.ai {
+  border-style: dashed;
+}
+.flowbtn.ai[aria-pressed='true'] {
+  border-style: solid;
+}
+.flowbtn.busy {
+  opacity: 0.75;
+  cursor: progress;
+}

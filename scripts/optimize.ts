@@ -539,3 +539,42 @@ for (const [name, amtKey] of Object.entries(PIPELINE_ONLY ? {} : PROFILE_AMOUNT)
     report('自動判斷 (tuned)', ap());
   }
 }
+
+/* ------------------------- 5. stacking 自動化流程 modules on full auto (--combos) */
+// Every subset of the modules on top of full auto: which combinations help,
+// on the ground-truth suite (per scene) and on the real photographs.
+if (process.argv.includes('--combos')) {
+  const MODS: [string, Record<string, number>][] = [
+    ['融合', { fusion: 1 }],
+    ['Lab', { labCast: 0.5 }],
+    ['Sea-thru', { seathru: 0.5 }],
+    ['補光', { localWB: 0.5 }],
+    ['品質', { qaGuard: 1 }],
+  ];
+  const rows: { name: string; suite: number; real: number; per: number[] }[] = [];
+  for (let mask = 0; mask < 1 << MODS.length; mask++) {
+    const set: Record<string, number> = {};
+    const names: string[] = [];
+    MODS.forEach(([n, s], i) => {
+      if (mask & (1 << i)) {
+        Object.assign(set, s);
+        names.push(n);
+      }
+    });
+    const st = fromSet(set);
+    const per = SCENES.map((sc) => score(sc, st.params, st.locked).total);
+    rows.push({ name: names.join('+') || '全自動', suite: per.reduce((a, b) => a + b, 0) / per.length, real: REAL.length ? mean(REAL, st, (b) => b.dE) : 0, per });
+  }
+  const base = rows[0];
+  console.log('\nstacking on full auto (suite total; real ΔE) — best 12 by suite, then best by real');
+  const show = (r: (typeof rows)[number]) =>
+    console.log(`  ${r.name.padEnd(28)} suite ${f3(r.suite)} (${r.suite <= base.suite ? '' : '+'}${f3(r.suite - base.suite)})  real ΔE ${f3(r.real)}`);
+  [...rows].sort((a, b) => a.suite - b.suite).slice(0, 12).forEach(show);
+  console.log('  —');
+  [...rows].sort((a, b) => a.real - b.real).slice(0, 6).forEach(show);
+  console.log('\nbest combination per scene (Δ vs full auto):');
+  SCENES.forEach((sc, i) => {
+    const best = [...rows].sort((a, b) => a.per[i] - b.per[i])[0];
+    console.log(`  ${sc.name.padEnd(10)} ${best.name.padEnd(28)} ${f3(best.per[i] - base.per[i])}`);
+  });
+}

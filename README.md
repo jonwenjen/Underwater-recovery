@@ -97,9 +97,75 @@ card whenever quality is measured.
 **Why two targets.** Heavily degraded ground-truth scenes reward full
 restoration (full auto); mild real footage rewards natural, gentle processing
 (自動判斷流程). The table shows both honestly; neither mode wins everywhere.
-Not included: GAN, transformer and diffusion enhancers (FUnIE-GAN, U-Shape,
-UIEDP, AquaDiff) — they need trained networks and model weights, which this
-real-time, in-browser engine does not run.
+
+**Does stacking modules on full auto help?** Every one of the 32 on/off
+combinations of the five modules was scored on full auto
+(`node --experimental-strip-types scripts/optimize.ts --combos`, strengths as
+the buttons lock them). On average, barely: the best stack, 融合 + 補光, improves
+the ground-truth suite by 1.6 % (0.794 → 0.781); most stacks are worse, and
+adding Sea-thru or 品質把關 costs the heavily degraded scenes 11–40 %. The gains
+are per scene, from one or two modules:
+
+| Scene | Best stack on full auto | Δ total |
+|---|---|---|
+| Strobe close-up | 融合 + Sea-thru | **−0.314** |
+| Green water | 融合 + 補光 | −0.149 |
+| Murky | 融合 | −0.091 |
+| Sunlit shallows | 融合 + Lab | −0.083 |
+| Clean / blue 4–8 m | 補光 or 融合 + 補光 | −0.02…−0.04 |
+| Blue 12 m | none (full auto alone) | 0 |
+
+On the real EUVP photographs the picture flips: anything with 品質把關 lands at
+ΔE 0.089–0.093 against 0.136 for full auto, Sea-thru alone at 0.114, the rest
+at 0.134–0.140. So: don't press everything — pick the one or two modules the
+scene calls for (or let 自動判斷流程 pick for mild real footage).
+
+### 🤖 AI 風格 (FUnIE-GAN, optional)
+
+The one neural network, and only on request. FUnIE-GAN (Islam, Xia & Sattar,
+RA-L 2020, MIT licence — `public/models/FUnIE-GAN-LICENSE`) is a 7 M-parameter
+U-Net GAN trained on EUVP. Its PyTorch weights were exported to ONNX and
+converted to float16 (14 MB; BatchNorm / Resize / Pad kept in float32, which
+keeps it within 1.4 of 255 levels of the float32 model).
+
+- **Nothing loads until the button is pressed.** Then the ONNX Runtime Web
+  build this device can use (WebGPU on a real adapter with `shader-f16`,
+  otherwise single-threaded WASM, 3.7 MB gzipped) and the model are fetched
+  once; the main bundle is unchanged.
+- **The network runs small, the picture stays full resolution.** It sees a
+  copy with a long edge of 256 px (WASM) or 512 px (WebGPU); what it did is
+  fitted as an 8-tile grid of 3 × 4 colour transforms (weighted least squares,
+  regularised toward the whole-frame fit) that the GRADE pass interpolates and
+  applies to the full-resolution source — so detail is the camera's and the
+  colour and tone are the network's. Grid vs network: ΔE 0.02 on EUVP.
+- **Video:** the network re-runs every 0.5 s of footage (snapping on cuts,
+  otherwise blending), in the preview and in video export.
+- **It replaces the engine's colour and tone, it does not stack on them.**
+  Measured with the grid on the CPU mirror (OKLab ΔE, lower is better):
+
+| | EUVP real pairs (×23) | Ground-truth scenes (×7) |
+|---|---|---|
+| FUnIE-GAN itself (full network output) | 0.058 | 0.209 |
+| **🤖 AI 風格 button** (network colour/tone, engine detail stages) | **0.057** | 0.208 |
+| AI stacked on full auto | 0.136 | 0.172 |
+| AI stacked on 自動判斷流程 | 0.088 | 0.191 |
+| 全自動 (no AI) | 0.141 | **0.138** |
+| 自動判斷流程 (no AI) | 0.091 | 0.170 |
+
+  Stacking double-corrects (the network already removed the cast the engine
+  then removes again), so the button turns the engine's colour, dehaze,
+  CLAHE, tone and 豐富色彩 stages off and keeps sharpening, noise reduction and
+  畫質修復; 🤖 AI 風格強度 blends it. On EUVP-like footage (the network's own
+  domain) it is the best option measured; on heavily degraded water it is a
+  look, not a restoration — full auto restores truer colour there.
+- **Cost:** first press downloads ~18 MB (model + WASM runtime; WebGPU runtime
+  6.7 MB instead of 3.7 MB). In the software-GPU test browser a 256 px
+  inference takes 0.4–0.7 s on WASM (the grid then renders at full frame rate);
+  the test browser has no WebGPU, so that path's speed is not measured here.
+  Not included: U-Shape Transformer (31.6 M parameters, 63 MB even in float16,
+  fixed 256 × 256 input, 361 ms per frame on a server CPU, 2–3× FUnIE-GAN),
+  UIEDP and AquaDiff (diffusion: many network passes per image, a server GPU in
+  practice, which would break "files never leave your device").
 
 ### ☀ Light: beams and surface highlights, with on-image control points
 
@@ -287,11 +353,12 @@ model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
 | Sea-thru / 品質把關 on a strobe close-up | colour error 0.188 → 0.140 / 0.152; newly blown 0.3 % → 0.0 % |
 | 多分支融合 / 區域白平衡 in green water | colour error 0.175 → 0.169 / 0.164 |
 | 自動判斷流程 on sunlit shallows | colour error 0.163 → 0.140, no new clipping |
+| 🤖 AI 風格 (FUnIE-GAN) | nothing loads before the press; then WASM, 8 × 5 grid, first press 1.8–2.4 s, 256 × 160 inference 0.4–0.5 s; full-res GPU result within 0.7 levels of the network's mean (colour error vs truth 0.174 full auto → 0.108 on this green-water scene); photo export Δ 0.1, video export (network re-run) Δ 0.5 vs preview; press again → 全自動 |
 | Imported profiles | each applies only its own method, replaces the engine colour stages, beats the source (colour error 0.544 → 0.23–0.33; 全自動 0.085), red 37 → 83–176; switching does not stack |
 | Export speed | 2×: 2.5 s, 75 frames, rotated 360×640 · 0.5×: 9.9 s, all 150 frames |
 | Phone layout (390 px) | no horizontal scroll |
 
-`test/engine.test.ts` (70 checks) covers the colour math, LUTs, guided
+`test/engine.test.ts` (76 checks) covers the colour math, LUTs, guided
 filter, recovery goals on the CPU mirror, manual overrides, EMA tracking,
 scene cuts, the eyedropper, 豐富色彩 (mild in auto, richer when locked, not
 darker, greys stay grey, gamut fit keeps hue), 「原始」 as an exact identity,
@@ -300,8 +367,10 @@ grain σ within 15 %, surface mask and recovery, 光線去洋紅 keeping coral
 pink, sun beams near-white, open water not violet on a sandy bottom), the
 自動化流程 modules (fusion weights, Lab direction and protection, Sea-thru
 fit recovering known parameters, local white balance, the quality measures,
-品質把關 ending within its limits, the natural mode on a land photo), and the
-analysis time budget. `test/methods.test.ts` (50 checks) covers the imported methods
+品質把關 ending within its limits, the natural mode on a land photo), the
+🤖 AI 風格 grid (fit of a known varying transform, identity, video blend,
+network input size, no effect at strength 0, the button's output following the
+network, strength 0.5 landing halfway), and the analysis time budget. `test/methods.test.ts` (50 checks) covers the imported methods
 (published coefficient tables, the matrix's blue row, the GLSL twins, one
 method per profile, profiles replacing the engine's colour stages, warplab
 engaging on a red-starved frame, every profile beating the source, and the
@@ -327,6 +396,7 @@ source ─────────────▶ GRADE ─mips─▶ BLUR H ─
 | `src/engine/color.ts`, `filters.ts`, `luts.ts` | Colour math, guided / box / min filters, CLAHE & tone-curve LUTs |
 | `src/engine/params.ts` | Every control: range, default, auto or manual, presets |
 | `src/engine/look.ts` | Curves (monotone cubic → LUT) and the 8-band OKLCh HSL mixer |
+| `src/engine/ai.ts`, `src/engine/funie.ts` | 🤖 AI 風格: transform-grid fit / apply (CPU twin of the shader), lazy FUnIE-GAN runtime (onnxruntime-web) |
 | `src/engine/pipeline.ts` | 自動化流程: fusion weights, Lab cast, Sea-thru fit, local white balance, UIQM / UCIQE and over-processing measures |
 | `src/engine/light.ts` | Beam / surface detection, grain σ, JS twins of the light shader maths |
 | `src/ui/lightPoints.ts` | Draggable ☀ / A / B control points over the viewer |

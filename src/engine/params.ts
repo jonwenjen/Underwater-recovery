@@ -67,6 +67,8 @@ export interface Params {
   qaGuard: number;
   /** 自動判斷流程: 1 = the modules above are switched on by the frame's needs. */
   autoPipeline: number;
+  /** 🤖 AI 風格 (FUnIE-GAN): strength of the network's colour / tone (0 = off). */
+  aiStyle: number;
   surfAx: number;
   surfAy: number;
   surfBx: number;
@@ -172,6 +174,7 @@ export const DEFAULT_PARAMS: Params = {
   localWB: 0,
   qaGuard: 0,
   autoPipeline: 0,
+  aiStyle: 0,
   surfAx: 0.5,
   surfAy: 0,
   surfBx: 0.5,
@@ -270,6 +273,7 @@ export const GROUPS: Group[] = [
       { key: 'seathru', label: 'Sea-thru 深度感知', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz：以最暗像素擬合各深度的後向散射，再依距離補回衰減；深度取自去霧的穿透率圖' },
       { key: 'localWB', label: '補光區域白平衡', min: 0, max: 1, step: 0.01, hint: '閃燈／手電筒只照亮近處：偵測到畫面中光源色溫不一致時，分區修正白平衡' },
       { key: 'qaGuard', label: '品質把關', min: 0, max: 1, step: 1, hint: '1 ＝計算 UIQM／UCIQE 並檢查過曝、雜訊放大、局部對比過度；超標時自動降低增強強度' },
+      { key: 'aiStyle', label: '🤖 AI 風格強度', min: 0, max: 1, step: 0.01, hint: 'FUnIE-GAN 神經網路（按「AI 風格」按鈕載入）：在低解析度推論，把它的色彩與影調以平滑網格套到全解析度' },
       { key: 'autoPipeline', label: '自動判斷流程', min: 0, max: 1, step: 1, hint: '1 ＝依畫面分析自動決定要開哪些模組（綠／藍偏 → Lab、深度差大 → Sea-thru、補光 → 區域白平衡、平淡 → 融合），並開啟品質把關' },
     ],
   },
@@ -318,6 +322,21 @@ const RAW: Partial<Record<NumKey, number>> = {
 const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0 } as const;
 /** The engine's own colour correction, off while a profile does that job. */
 const ENGINE_COLOUR_OFF = { redComp: 0, blueComp: 0, depthColor: 0, wbStrength: 0, deCast: 0, labCast: 0, localWB: 0, seathru: 0 } as const;
+
+/**
+ * 🤖 AI 風格: the network's colour and tone alone. Measured (README): stacking
+ * it on the engine's own colour/tone correction double-corrects — worse on
+ * both the ground-truth scenes and the EUVP pairs than either alone — so the
+ * button turns those stages off (tone included: the default contrast and
+ * highlight roll-off pulled the result ~10 % darker than the network) and
+ * keeps only detail, noise and 畫質修復.
+ */
+export const AI_STYLE: Partial<Record<NumKey, number>> = {
+  ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, fusion: 0, autoPipeline: 0,
+  dehaze: 0, clahe: 0, vivid: 0, exposure: 0, shadows: 0, blacks: 0, whites: 1,
+  contrast: 0, highlights: 0, clarity: 0,
+  vibrance: 0, lightNeutral: 0, beams: 0, surfaceHL: 0, aiStyle: 1,
+};
 
 export const PRESETS: Record<string, Preset> = {
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },

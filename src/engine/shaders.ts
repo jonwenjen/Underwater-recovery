@@ -90,6 +90,9 @@ uniform vec3 u_stB, u_stb, u_stBeta;
 uniform vec2 u_labShift;       // Lab 分軸校正: OKLab (a, b) shift toward red / yellow
 uniform float u_labAmt;
 uniform float u_fuse;          // 多分支融合
+uniform sampler2D u_ai;        // 🤖 AI 風格: grid of 3×4 colour transforms (ai.ts), 3 texels per tile
+uniform vec2 u_aiGrid;
+uniform float u_aiAmt;
 const float FUSE_GAMMA = ${FUSE_GAMMA.toFixed(3)};
 const float SEATHRU_MAX = ${SEATHRU_MAX_GAIN.toFixed(1)};
 
@@ -165,6 +168,22 @@ vec3 physical(vec3 e) {
 }
 
 
+// mirrors guideAt() / applyGuide() in ai.ts: bilinear over tile centres, sRGB
+vec3 aiGuide(vec3 e, vec2 uv) {
+  vec2 f = clamp(uv * u_aiGrid - 0.5, vec2(0.0), u_aiGrid - 1.0);
+  ivec2 i0 = ivec2(floor(f));
+  ivec2 i1 = min(i0 + 1, ivec2(u_aiGrid) - 1);
+  vec2 w = f - vec2(i0);
+  vec4 x = vec4(e, 1.0);
+  vec3 y;
+  for (int c = 0; c < 3; c++) {
+    vec4 m = mix(mix(texelFetch(u_ai, ivec2(i0.x * 3 + c, i0.y), 0), texelFetch(u_ai, ivec2(i1.x * 3 + c, i0.y), 0), w.x),
+                 mix(texelFetch(u_ai, ivec2(i0.x * 3 + c, i1.y), 0), texelFetch(u_ai, ivec2(i1.x * 3 + c, i1.y), 0), w.x), w.y);
+    y[c] = dot(m, x);
+  }
+  return clamp(mix(e, clamp(y, 0.0, 1.0), u_aiAmt), 0.0, 1.0);
+}
+
 float claheMap(float L, vec2 uv) {
   float T = u_tiles;
   vec2 f = clamp(uv * T - 0.5, vec2(0.0), vec2(T - 1.0));
@@ -182,6 +201,8 @@ float claheMap(float L, vec2 uv) {
 
 void main() {
   vec3 c = u_direct > 0.5 ? texture(u_pre, v_uv).rgb : texture(u_src, srcUV(v_uv)).rgb;
+  // 🤖 AI 風格: the network's colour and tone, on the sRGB source like the network
+  if (u_aiAmt > 0.0001) c = aiGuide(c, v_uv);
   // imported 全自動 profile: the method's own colour correction, on the source
   if (u_mixAmt > 0.0001) c = mixMatrix(c);
   if (u_pullAmt > 0.0001) c = vec3(meanPull(c.r, u_pull[0]), meanPull(c.g, u_pull[1]), meanPull(c.b, u_pull[2]));

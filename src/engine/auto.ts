@@ -46,6 +46,7 @@ import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 import { analyzeColorMatrix, applyMixGL } from './matrix.ts';
 import { analyzeMeanPull, meanPullGL } from './twostep.ts';
 import { JERLOV, physicalGL } from './physical.ts';
+import { applyGuide, type AiGuide } from './ai.ts';
 import {
   applyLabShift,
   depthOf,
@@ -191,6 +192,8 @@ export interface FrameState {
   seathru: { B: Vec3; b: Vec3; beta: Vec3; amount: number };
   /** 補光區域白平衡: LWB_GRID² RGB gains and the amount. */
   lwb: { gains: Float32Array; amount: number };
+  /** 🤖 AI 風格: the guide applied at the head of GRADE, and its strength. */
+  ai: { guide: AiGuide | null; amount: number };
   /** Values actually applied for every auto key (for the UI). */
   effective: Record<AutoKey, number>;
   stats: FrameStats;
@@ -235,6 +238,8 @@ export interface StepOptions {
   snap?: boolean;
   /** Processing-scale crop for the grain estimate (see Renderer.readNoise). */
   noise?: { rgba: Uint8Array | Uint8ClampedArray; w: number; h: number };
+  /** 🤖 AI 風格: the FUnIE-GAN guide for this frame (see ai.ts), when computed. */
+  ai?: AiGuide | null;
 }
 
 export class AutoEngine {
@@ -251,6 +256,7 @@ export class AutoEngine {
   private bins = new Uint16Array(0);
   private frameNo = 0;
   private g8: Uint8ClampedArray | null = null;
+  private a8: Uint8ClampedArray | null = null;
   private beamCache: BeamDetect | null = null;
   /** Per-frame scratch buffers, reused across frames to keep GC out of playback. */
   private buf(name: string, len: number): Float32Array {
@@ -394,12 +400,17 @@ export class AutoEngine {
     // compensation gate follow it, not the frame mean (a sandy bottom makes
     // shallow blue water read "green" on average).
     const raw = rgba;
+    // 🤖 AI 風格: the network's colour / tone, as the GRADE pass applies it to
+    // the source first; everything below analyses the result
+    const aiGuide = o.ai && p.aiStyle > 0.001 ? o.ai : null;
+    const aiAmt = aiGuide ? clamp(p.aiStyle, 0, 1) : 0;
+    if (aiGuide) rgba = this.applyAi(rgba, w, h, aiGuide, aiAmt);
     const rawWater = this.waterVotes(raw, w, h, WATER_BODY_FLOOR);
     // A profile does the colour correction with its own method, on the
     // source, in place of the engine's compensation and white balance (its
     // preset locks those off). Everything below — dehaze, exposure, CLAHE —
     // then works on the method's output, as the GRADE pass does.
-    const prof = this.profiles(raw, w, h, p, rawWater.colour, S);
+    const prof = this.profiles(rgba, w, h, p, rawWater.colour, S);
     if (prof.rgba) rgba = prof.rgba;
 
     /* 1. linearise + scene statistics ------------------------------- */
@@ -883,6 +894,7 @@ export class AutoEngine {
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
     return {
+      ai: { guide: aiGuide, amount: aiAmt },
       aux, fusion: fuseAmt,
       lab: { shift: labShift, amount: labAmt },
       seathru: { B: stB, b: stb, beta: stBeta, amount: stAmt },
@@ -981,6 +993,20 @@ export class AutoEngine {
     }
     c = Math.max(1, c);
     return { take, colour: [r / c, g / c, b / c] };
+  }
+
+  /** A copy of the frame with the AI guide applied (as GRADE applies it). */
+  private applyAi(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, g: AiGuide, amount: number): Uint8ClampedArray {
+    if (!this.a8 || this.a8.length !== w * h * 4) this.a8 = new Uint8ClampedArray(w * h * 4);
+    const dst = this.a8, px = new Float32Array(3), t = new Float32Array(12);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const j = (y * w + x) * 4;
+        px[0] = rgba[j] / 255; px[1] = rgba[j + 1] / 255; px[2] = rgba[j + 2] / 255;
+        applyGuide(px, g, (x + 0.5) / w, (y + 0.5) / h, amount, t);
+        dst[j] = px[0] * 255 + 0.5; dst[j + 1] = px[1] * 255 + 0.5; dst[j + 2] = px[2] * 255 + 0.5; dst[j + 3] = 255;
+      }
+    return dst;
   }
 
   /**
@@ -1192,6 +1218,8 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
   const px3 = new Float32Array(3);
   const profile = s.mixAmt > 0.0001 || s.pullAmt > 0.0001 || s.physAmt > 0.0001;
   const lwbOn = s.lwb.amount > 0.001;
+  const aiOn = !!s.ai.guide && s.ai.amount > 0.001;
+  const t12 = new Float32Array(12);
   const st = s.seathru;
   const g3: Vec3 = [1, 1, 1];
   const [kr, kg, kb] = s.k;
@@ -1201,9 +1229,10 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
         j = i * 4,
         q = i * 3;
       let r: number, g: number, b: number;
-      if (profile) {
+      if (aiOn || profile) {
         px3[0] = rgba[j] / 255; px3[1] = rgba[j + 1] / 255; px3[2] = rgba[j + 2] / 255;
-        applyProfile(px3, s);
+        if (aiOn) applyGuide(px3, s.ai.guide!, (x + 0.5) / w, (y + 0.5) / h, s.ai.amount, t12);
+        if (profile) applyProfile(px3, s);
         r = srgbToLinear(px3[0]); g = srgbToLinear(px3[1]); b = srgbToLinear(px3[2]);
       } else {
         r = LIN8[rgba[j]]; g = LIN8[rgba[j + 1]]; b = LIN8[rgba[j + 2]];

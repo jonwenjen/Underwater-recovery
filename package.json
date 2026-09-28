@@ -26,6 +26,7 @@
   },
   "description": "Underwater Recovery Studio: GPU real-time recovery of underwater photos and video, with scene-tracking auto mode and pro controls, fully in the browser",
   "dependencies": {
-    "mediabunny": "^1.60.0"
+    "mediabunny": "^1.60.0",
+    "onnxruntime-web": "^1.30.0"
   }
 }
