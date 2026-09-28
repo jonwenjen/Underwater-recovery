@@ -14,7 +14,7 @@ description; algorithms are not copyrightable, only their expression is.
 | `全自動-T77701` | Fu et al., ISPACS 2017, Eq. 2 | `src/engine/twostep.ts` |
 | `全自動-warplab` | Akkaynak–Treibitz formation model, closed form | `src/engine/physical.ts` |
 
-測試 / Tests: `test/methods.test.ts` (39 checks).
+測試 / Tests: `test/methods.test.ts` (50 checks).
 
 ---
 
@@ -31,9 +31,7 @@ description; algorithms are not copyrightable, only their expression is.
 - **The difference from #2:** it analyses a `cv2.resize(mat, (256,256))`
   downscale, which pins the sparse threshold at 65536/2000 = 32.768 and makes
   the result independent of input resolution. That is the whole reason
-  `全自動-bornfree` and `全自動-nikolajbech` are separate presets — and the
-  fixed grid is the better choice for video, where a per-frame
-  resolution-dependent threshold makes the correction breathe.
+  `全自動-bornfree` and `全自動-nikolajbech` are separate presets.
 
 ## 2. nikolajbech/underwater-image-color-correction
 
@@ -129,49 +127,71 @@ description; algorithms are not copyrightable, only their expression is.
 
 ---
 
-## Measured behaviour on UIEB, and the cast budget
+## Where a profile runs, and how it scored
 
-Scored on 10 UIEB images with ground-truth references
-(`npm run profiles:bench`), reporting colour-cast error against truth and
-cast drift away from the engine's own 全自動 result.
+**A profile replaces the engine's colour correction; it does not stack on it.**
+Each `全自動-<source>` preset locks the engine's own colour stages off — red
+and blue compensation, white balance, distance compensation, de-cast — and
+runs its method as the colour front-end instead: on the sRGB-encoded source,
+at the head of the GRADE pass, before dehaze. The engine's dehaze, exposure,
+CLAHE, detail and light stages then work on the method's output, as they do
+on their own compensation's output in 全自動.
 
-**At full strength, all four were far worse than the engine's own auto result:**
+The method is **measured on the same frame it is applied to** (the raw
+analysis frame, where all four are defined by their authors), and every
+per-frame statistic — matrix coefficients, channel statistics, attenuation —
+goes through the engine's tracker, so video glides instead of breathing with
+the histogram (`AutoEngine.profiles`, `applyProfile`; the CPU mirror applies
+it at the same point, so tests and the optimizer see it).
 
-| Profile | cast error vs truth | drift from 全自動 |
-|---|---|---|
-| 全自動 (engine) | 14.1 | — |
-| 全自動-bornfree | 36.9 | 31.3 |
-| 全自動-nikolajbech | 36.9 | 31.5 |
-| 全自動-T77701 | 39.3 | 27.2 |
-| 全自動-warplab | 45.3 | 37.9 |
+### History: the earlier version and what was wrong with it
 
-Re-enabling the engine's own `redComp` alongside them changed nothing
-(36.9 → 37.1), so this was **not** double-counting: the methods simply pull in
-a direction the engine's measured pipeline does not. Undisciplined, all four
-turn every image warm — which is exactly what was reported.
+The first version ran each method *after* the engine's full correction,
+with statistics taken from the raw frame but applied to the already-corrected
+image — the same cast was corrected twice, which is why every profile turned
+images warm (UIEB, 10 images: cast error 36.9–45.3 against the engine's 14.1).
+A per-frame "cast budget" then scaled the method back, but it had three bugs:
 
-**The fix is a budget, not a fudge factor.** Each frame the engine measures
-the colour cast the method would introduce and scales the profile back until
-that shift fits inside `MAX_CAST_DRIFT` (1.5). The measurement is taken on a
-grey-world-normalised copy of the analysis buffer, because the method is
-applied to the already-de-blued graded output — measuring against the raw
-frame under-reports the shift by roughly an order of magnitude, since on a
-still-blue frame the red lift and blue subtraction cancel in the cast metric.
+- its measurement buffer copied 4-channel RGBA with a 3-channel stride, so it
+  measured scrambled data, and it measured on a grey-world-normalised copy
+  of the raw frame rather than the graded image the method changed — on the
+  GPU a bornfree frame still moved red by +48 levels while the budget
+  believed it had moved the cast by 1.5;
+- `全自動-warplab` measured red starvation on that normalised copy, where red
+  and green means are equal by construction, so it was **always 0** — a no-op
+  on every frame, including a 12 m frame with red/green = 0.29;
+- the budgeted amount was not smoothed, so it swung 3× between frames.
 
-| Profile | cast error vs truth | drift from 全自動 |
-|---|---|---|
-| 全自動 (engine) | 14.1 | — |
-| 全自動-bornfree | 16.3 | 4.4 |
-| 全自動-nikolajbech | 16.4 | 4.6 |
-| 全自動-T77701 | 16.0 | 2.1 |
-| 全自動-warplab | 14.1 | 0.0 |
+Separately, the matrix's blue row read the upstream 4×5 colour matrix with a
+stride of 3 and multiplied **green** by the blue gain. All of this is fixed;
+the budget is gone because the domain it compensated for is gone.
 
-They keep their tonal and structural work and lose the ability to hijack the
-white balance. `全自動-warplab` collapses to a no-op on these frames, and that
-is honest rather than a bug: the physical model is gated on measured red
-starvation, and on UIEB — where the engine's auto pipeline has already put the
-red back — there is nothing left for it to restore. On a deeper, unlit frame it
-does act.
+### Measured now
+
+`node --experimental-strip-types scripts/optimize.ts --report --real`:
+mean OKLab ΔE to the true colours on the ground-truth scene suite (8
+underwater scenes), and on 23 real EUVP pairs (report only — see the caveat
+in `scripts/optimize.ts`: EUVP references keep much of the water colour).
+Strengths were searched on the ground-truth suite.
+
+| Profile | strength | synthetic ΔE | real (EUVP) ΔE |
+|---|---|---|---|
+| 全自動 (engine) | — | **0.129** | 0.136 |
+| 全自動-bornfree | matrix 0.9 | 0.205 | 0.141 |
+| 全自動-nikolajbech | matrix 1.0 | 0.204 | 0.146 |
+| 全自動-T77701 | mean pull 1.0 | 0.150 | 0.140 |
+| 全自動-warplab | physical 1.0 | 0.158 | **0.129** |
+| untouched source | — | 0.231 (12 m frame) | 0.089 |
+
+Every profile moves a degraded frame toward the true colours (unit test:
+12 m frame, source ΔE 0.231), none beats the engine's own correction on the
+ground-truth scenes, and the histogram-gap matrix is the weakest of the four:
+it stretches each channel to its own histogram gap, which is a levels
+operation, not a colour model. That is the method, reproduced faithfully,
+not a tuning failure.
+
+`scripts/bench-profiles.mjs` (UIEB, images not in the repository) measured
+the earlier version; its numbers above are history.
 
 ### Guards added, and why each exists
 
@@ -193,8 +213,13 @@ These are deviations from the published methods, all deliberate:
 - **Backscatter capped at half a channel.** Subtracting the full backscatter
   term from a red-starved channel removes more than is there and sends it to
   zero.
-- **`physicalMix` scales with measured red starvation**, and the whole profile
-  is then bounded by the cast budget above.
+- **`physicalMix` scales with measured red starvation** of the source frame,
+  and the distance is one value for the frame (red loss × haze × 虛擬深度),
+  not a per-pixel depth map: the browser has none.
+- **Eq. 2's shift/stretch switch is blended over a dark fraction of 0.6–0.8**
+  (`meanPullGL`) instead of switching at exactly 0.7, so a video whose channel
+  hovers there does not flip between two looks. Outside that band the result
+  is the published one (pinned by a test).
 
 ## Deliberate omissions
 

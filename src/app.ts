@@ -874,6 +874,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
         src: outputStats(proc.renderer.readSmall()),
         stats: st.stats,
         effective: st.effective,
+        profile: { mix: st.mixAmt, pull: st.pullAmt, phys: st.physAmt },
         ms: proc.lastFrameMs,
         size: [proc.renderer.pw, proc.renderer.ph],
       };

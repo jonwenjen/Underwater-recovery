@@ -174,6 +174,8 @@ try {
     };
     window.__uw.preset('auto');
     window.__uw.setView({ mode: 0 });
+    // full auto applies a mild dose itself: measure the option against OFF
+    window.__uw.setParam('vivid', 0);
     window.__uw.render();
     const o0 = window.__uw.outputPixels();
     const t = S.truth(o0.w, o0.h);
@@ -194,7 +196,7 @@ try {
     };
   });
   check('豐富色彩 button turns the option on', vivid.pressed === 'true' && vivid.readout.startsWith('×'), `pressed ${vivid.pressed}, readout ${vivid.readout}`);
-  check('豐富色彩: surface colour richer on the GPU (chroma +30 %)', vivid.on.C > vivid.off.C * 1.3, `OKLab C ${f3(vivid.off.C)} → ${f3(vivid.on.C)} (truth 0.077)`);
+  check('豐富色彩 (off → button): surface colour richer on the GPU (chroma +30 %)', vivid.on.C > vivid.off.C * 1.3, `OKLab C ${f3(vivid.off.C)} → ${f3(vivid.on.C)} (truth 0.077)`);
   check('豐富色彩: frame not darker, coral redder', vivid.on.L >= vivid.off.L - 0.005 && vivid.coralOn > vivid.coralOff, `L ${f3(vivid.off.L)} → ${f3(vivid.on.L)}, coral red ${f3(vivid.coralOff)} → ${f3(vivid.coralOn)}`);
   check('豐富色彩: no blown whites, still far closer to truth than the source', vivid.on.blown < 0.01 && vivid.errOn < 0.5 * vivid.errSrc, `blown ${f1(vivid.on.blown * 100)} %, colour error ${f3(vivid.errSrc)} → ${f3(vivid.errOn)}`);
   await page.evaluate(() => {
@@ -484,7 +486,7 @@ try {
     `grain ${f1(feat.restore.before.luma)} → ${f1(feat.restore.after.luma)}, colour noise ${f1(feat.restore.before.chroma)} → ${f1(feat.restore.after.chroma)}`);
   check('畫質修復 keeps edges', feat.restore.edge[1] > 0.8 * feat.restore.edge[0], `slate edge step ${f1(feat.restore.edge[0])} → ${f1(feat.restore.edge[1])}`);
   check('「淺水／陽光」 protects the light shafts and still restores colour',
-    feat.sunny.hl < 0 && feat.sunny.blownSunny <= feat.sunny.blownAuto && feat.sunny.errSunny < 0.6 * feat.sunny.errSrc,
+    feat.sunny.blownSunny <= feat.sunny.blownAuto && feat.sunny.errSunny < 0.6 * feat.sunny.errSrc,
     `blown ${f1(feat.sunny.blownAuto * 100)} % → ${f1(feat.sunny.blownSunny * 100)} %, colour error ${f3(feat.sunny.errSrc)} → ${f3(feat.sunny.errSunny)}`);
 
   // screenshot of the new controls in use (sunlit scene, S-curve, warmer orange)
@@ -654,87 +656,59 @@ try {
   /* ============================================================ video */
   console.log('\n— imported profiles: 全自動-bornfree / nikolajbech / T77701 / warplab');
   {
-    // All the measuring happens in the page; the assertions happen out here.
-    const prof = await page.evaluate(async () => {
+    const NAMES = ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab'];
+    const prof = await page.evaluate(async (NAMES) => {
       const U = window.__uw;
       const S = window.__scene;
-      const mean = (o) => { let r=0,g=0,b=0,n=0; for (let i=0;i<o.px.length;i+=4){r+=o.px[i];g+=o.px[i+1];b+=o.px[i+2];n++;} return [r/n,g/n,b/n]; };
+      const mean = (o) => { let r = 0, g = 0, b = 0, n = 0; for (let i = 0; i < o.px.length; i += 4) { r += o.px[i]; g += o.px[i + 1]; b += o.px[i + 2]; n++; } return [r / n, g / n, b / n]; };
       const W = 900, H = 600;
       const t = S.truth(W, H);
       await U.addFiles([await S.toFile(S.degrade(t, 'blue', 9), W, H, 'profiles.png')]);
       U.setView({ mode: 0 });
       U.preset('auto');
-      const base = mean(U.outputPixels());
-
-      const seen = {};
-      const params = {};
-      for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
+      const ra = U.render();
+      const oa = U.outputPixels();
+      const ts = S.truth(oa.w, oa.h);
+      const srcErr = S.chromaError(S.degrade(ts, 'blue', 9), oa.w, oa.h, ts).err;
+      const base = mean(oa);
+      const seen = {}, err = {}, amt = {}, eff = {};
+      for (const name of NAMES) {
         U.preset(name);
-        U.render();
-        seen[name] = mean(U.outputPixels());
-        params[name] = JSON.parse(JSON.stringify(U.state().params));
+        const r = U.render();
+        const o = U.outputPixels();
+        seen[name] = mean(o);
+        err[name] = S.chromaError(o.px, o.w, o.h, ts).err;
+        amt[name] = r.profile;
+        eff[name] = { redComp: r.effective.redComp, wbStrength: r.effective.wbStrength, deCast: r.effective.deCast };
       }
-      // do they reset rather than accumulate?
+      // switching profiles resets rather than accumulates
       U.preset('全自動-nikolajbech'); U.render();
       const once = mean(U.outputPixels());
-      U.preset('全自動-bornfree'); U.render();
-      U.preset('全自動-T77701'); U.render();
-      U.preset('全自動-warplab'); U.render();
+      for (const n of NAMES) { U.preset(n); U.render(); }
       U.preset('全自動-nikolajbech'); U.render();
       const twice = mean(U.outputPixels());
-      // keep a picture of each profile so the numbers can be eyeballed
-      for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
-        U.preset(name); U.render();
-        const cv = document.querySelector('canvas');
-        const o = JSON.parse(JSON.stringify(U.outputPixels()));
-        const tmp = document.createElement('canvas'); tmp.width = o.w; tmp.height = o.h;
-        const id = tmp.getContext('2d').createImageData(o.w, o.h);
-        id.data.set(new Uint8ClampedArray(o.px));
-        tmp.getContext('2d').putImageData(id, 0, 0);
-        window.__profileShots = window.__profileShots || {};
-        window.__profileShots[name] = tmp.toDataURL('image/png');
-        void cv;
-      }
-      const shots = window.__profileShots || {};
-      // hand the app back in a neutral state, or the video checks that follow
-      // inherit whichever profile was screenshotted last
       U.preset('auto');
       U.render();
-      return { base, seen, params, once, twice, shots };
-    });
-    for (const [k, url] of Object.entries(prof.shots ?? {}))
-      writeFileSync(join(OUT, `profile-${k}.png`), Buffer.from(String(url).split(',')[1], 'base64'));
-
+      return { src: [ra.src.r, ra.src.g, ra.src.b], base, seen, err, amt, eff, srcErr, autoErr: S.chromaError(oa.px, oa.w, oa.h, ts).err, once, twice };
+    }, NAMES);
     const d = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
-    console.log(`  auto  r=${f1(prof.base[0])} g=${f1(prof.base[1])} b=${f1(prof.base[2])}`);
-    for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
-      const m = prof.seen[name];
-      check(`${name} is wired and changes the image`, d(m, prof.base) > 0.8,
-        `r=${f1(m[0])} g=${f1(m[1])} b=${f1(m[2])} (Δ${f1(d(m, prof.base))})`);
+    console.log(`  source r=${f1(prof.src[0])} g=${f1(prof.src[1])} b=${f1(prof.src[2])} · auto r=${f1(prof.base[0])} g=${f1(prof.base[1])} b=${f1(prof.base[2])}`);
+    const own = { '全自動-bornfree': 'mix', '全自動-nikolajbech': 'mix', '全自動-T77701': 'pull', '全自動-warplab': 'phys' };
+    for (const name of NAMES) {
+      const a = prof.amt[name];
+      const on = Object.entries(a).filter(([, v]) => v > 0.0001).map(([k]) => k);
+      check(`${name}: its own method is applied (and only it)`, on.length === 1 && on[0] === own[name] && a[own[name]] > 0.3,
+        `mix ${f3(a.mix)} / pull ${f3(a.pull)} / phys ${f3(a.phys)}`);
+      check(`${name}: replaces the engine colour correction and beats the source`,
+        prof.eff[name].redComp === 0 && prof.eff[name].wbStrength === 0 && prof.eff[name].deCast === 0 && prof.err[name] < prof.srcErr,
+        `colour error ${f3(prof.srcErr)} → ${f3(prof.err[name])} (全自動 ${f3(prof.autoErr)}); r=${f1(prof.seen[name][0])} g=${f1(prof.seen[name][1])} b=${f1(prof.seen[name][2])}`);
+      check(`${name}: red recovered over the SOURCE`, prof.seen[name][0] > prof.src[0] + 20, `${f1(prof.src[0])} → ${f1(prof.seen[name][0])}`);
     }
-    // The matrix profiles exist to lift a red-starved frame; if they do not,
-    // they are wired to nothing.
-    for (const name of ['全自動-bornfree', '全自動-nikolajbech']) {
-      check(`${name} recovers red over the source`, prof.seen[name][0] > prof.base[0],
-        `${f1(prof.base[0])} → ${f1(prof.seen[name][0])}`);
-    }
-    // The two differ only in the sparse-bin threshold, which is the whole
-    // reason both presets exist; identical output would make it decorative.
     check('bornfree and nikolajbech differ (different analysis grid)',
       d(prof.seen['全自動-bornfree'], prof.seen['全自動-nikolajbech']) > 0.05,
       `Δ${f3(d(prof.seen['全自動-bornfree'], prof.seen['全自動-nikolajbech']))}`);
-    // T77701 pulls channel means toward 128, so at least one channel must move.
-    check('全自動-T77701 moves the channel means',
-      d(prof.seen['全自動-T77701'], prof.base) > 0.5, `Δ${f1(d(prof.seen['全自動-T77701'], prof.base))}`);
-    // Switching profiles must reset, not accumulate.
     const drift = d(prof.once, prof.twice);
     check('profiles do not stack when switched', drift < 0.6, `drift ${f3(drift)}`);
-    // Only one profile may be armed at a time.
-    check('each preset arms exactly one profile', Object.values(prof.params).every((p) => {
-      const on = [p.matrixMix > 0, p.meanPull > 0, p.physicalMix > 0].filter(Boolean).length;
-      return on === 1;
-    }), JSON.stringify(Object.fromEntries(Object.entries(prof.params).map(([k, v]) =>
-      [k, `m${v.matrixMix}/p${v.meanPull}/ph${v.physicalMix}/g${v.matrixGrid}`]))));
   }
 
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');

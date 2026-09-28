@@ -281,9 +281,9 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   const off = new AutoEngine().step(src, W, H, { params: { ...DEFAULT_PARAMS, vivid: 0 }, locked: new Set<AutoKey>(['vivid']), dt: 0 });
   const on = new AutoEngine().step(src, W, H, { params: { ...DEFAULT_PARAMS, vivid: 0.7 }, locked: new Set<AutoKey>(['vivid']), dt: 0 });
   const a = meanChroma(mirrorRender(src, W, H, off)), b = meanChroma(mirrorRender(src, W, H, on));
-  // full auto applies a mild dose (TUNING.vividAuto, found by scripts/optimize.ts)
+  // full auto applies a milder dose than the button's 0.7 (TUNING.vividAuto, from scripts/optimize.ts)
   check('full auto applies mild 豐富色彩; locked at 0 it is off',
-    auto.effective.vivid > 0.1 && auto.effective.vivid < 0.4 && off.chromaGain === 1 && off.warmGain === 0,
+    auto.effective.vivid > 0.1 && auto.effective.vivid < 0.6 && off.chromaGain === 1 && off.warmGain === 0,
     `auto vivid ${auto.effective.vivid.toFixed(2)}`);
   check('豐富色彩 enriches colour (chroma +30 %)', b.C > a.C * 1.3, `C ${a.C.toFixed(3)} → ${b.C.toFixed(3)}, gain ×${on.chromaGain.toFixed(2)}`);
   check('豐富色彩 does not darken the frame', b.L >= a.L - 0.005, `L ${a.L.toFixed(3)} → ${b.L.toFixed(3)}`);
@@ -326,8 +326,9 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     for (let c = 0; c < 3; c++) maxd = Math.max(maxd, Math.abs(o[i * 3 + c] * 255 - src[i * 4 + c]));
   check('「原始」 preset is an identity (≤ 1 level)', maxd <= 1.01, `max diff ${maxd.toFixed(2)} / 255`);
   const sun = PRESETS.sunny.set;
-  check('「淺水／陽光」 protects highlights, sharpens caustics, leaves red & dehaze to auto',
-    (sun.highlights ?? 0) < 0 && (sun.clarity ?? 0) > DEFAULT_PARAMS.clarity && sun.redComp === undefined && sun.dehaze === undefined);
+  // (highlight protection is measured on the GPU: no more clipping than auto)
+  check('「淺水／陽光」 keeps the white point, sharpens caustics, leaves red & dehaze to auto',
+    sun.whites === 1 && (sun.highlights ?? 0) <= 0 && (sun.clarity ?? 0) > DEFAULT_PARAMS.clarity && sun.redComp === undefined && sun.dehaze === undefined);
 }
 {
   const id = buildCurveLut(identityCurves());

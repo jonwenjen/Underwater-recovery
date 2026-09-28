@@ -10,6 +10,7 @@
  */
 import { ANALYSIS_EDGE, AutoEngine, DEHAZE_CHROMA, T0, type FrameState, type StepOptions } from './auto.ts';
 import { toGLMat3 } from './color.ts';
+import { MAX_GAIN } from './physical.ts';
 import { destroy, program, target, texture, type GL, type Program, type Target, type Tex } from './gl.ts';
 import { CLAHE_BINS, CURVE_N } from './luts.ts';
 import { buildCurveLut, HSL_CENTERS, identityLook, isIdentityCurves, isIdentityHsl, LOOK_N, type Look } from './look.ts';
@@ -255,6 +256,20 @@ export class Renderer {
       this.bind(3, this.pre!, 'u_pre', g);
       gl.uniform1f(g.u.u_direct, restore ? 1 : 0);
       gl.uniform1f(g.u.u_shoulder, s.shoulder);
+      // imported 全自動 profile (colour front-end); inert when its amount is 0
+      if (s.mixAmt > 0.0001) {
+        gl.uniformMatrix3fv(g.u.u_mixMat, false, toGLMat3(s.mixMat));
+        gl.uniform3fv(g.u.u_mixOff, s.mixOff);
+      }
+      gl.uniform1f(g.u.u_mixAmt, s.mixAmt);
+      if (s.pullAmt > 0.0001) gl.uniform4fv(g.u.u_pull, s.pull);
+      gl.uniform1f(g.u.u_pullAmt, s.pullAmt);
+      if (s.physAmt > 0.0001) {
+        gl.uniform3fv(g.u.u_physA, s.physA);
+        gl.uniform1f(g.u.u_physBack, s.physBack);
+      }
+      gl.uniform1f(g.u.u_physAmt, s.physAmt);
+      gl.uniform1f(g.u.u_physMaxGain, MAX_GAIN);
       this.bind(1, this.coef!, 'u_coef', g);
       this.bind(2, this.lut!, 'u_lut', g);
       gl.uniform1f(g.u.u_aR, s.aR);
@@ -331,20 +346,6 @@ export class Renderer {
         f.u.u_clarityLod,
         Math.max(0, Math.min(Math.log2(Math.max(this.pw, this.ph) / 48), Math.log2(Math.max(this.pw, this.ph)))),
       );
-      // borrowed-method profiles; all inert when their amount is 0
-      if (s.mixAmt > 0.0001) {
-        gl.uniformMatrix3fv(f.u.u_mixMat, false, toGLMat3(s.mixMat));
-        gl.uniform3fv(f.u.u_mixOff, s.mixOff);
-      }
-      gl.uniform1f(f.u.u_mixAmt, s.mixAmt);
-      if (s.pullAmt > 0.0001) gl.uniform4fv(f.u.u_pull, s.pull);
-      gl.uniform1f(f.u.u_pullAmt, s.pullAmt);
-      if (s.physAmt > 0.0001) {
-        gl.uniform3fv(f.u.u_physA, s.physA);
-        gl.uniform1f(f.u.u_physBack, s.physBack);
-      }
-      gl.uniform1f(f.u.u_physAmt, s.physAmt);
-      gl.uniform1f(f.u.u_physMaxGain, 3);
       gl.uniform3fv(f.u.u_gain, s.gain);
       gl.uniform1f(f.u.u_deCast, s.deCast);
       gl.uniform1f(f.u.u_sat, s.saturation);

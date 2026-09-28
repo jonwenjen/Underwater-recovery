@@ -134,3 +134,17 @@ export function fitAttenuation(zs: Float32Array, obs: Float32Array, w: WaterType
   }
   return out as [number, number, number];
 }
+
+/**
+ * The restoration as the FINAL shader applies it (`physical` in shaders.ts),
+ * on sRGB-encoded 0..1 colour: per-channel attenuation `a` (a_c·z, already
+ * differential against green), backscatter scale `back` (β folded in), gain
+ * clamped at MAX_GAIN, never more than half a channel subtracted.
+ */
+export function physicalGL(c: number, a: number, back: number): number {
+  const A = Math.exp(-a);
+  const B = back * (1 - A);
+  const g = clamp(Math.exp(a), 0, MAX_GAIN);
+  const b = Math.min(B, c * 0.5);
+  return Math.max(0, (c - b) * g);
+}

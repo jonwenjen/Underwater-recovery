@@ -21,9 +21,11 @@ import {
   widestGap,
   type ColorMatrix,
 } from '../src/engine/matrix.ts';
-import { meanPull, toneAdjust } from '../src/engine/twostep.ts';
-import { MAX_CAST_DRIFT } from '../src/engine/auto.ts';
-import { physicalRestoreRGB, JERLOV, fitBackscatter, fitAttenuation } from '../src/engine/physical.ts';
+import { meanPull, meanPullGL, toneAdjust } from '../src/engine/twostep.ts';
+import { AutoEngine, mirrorRender } from '../src/engine/auto.ts';
+import { physicalGL, physicalRestoreRGB, JERLOV, fitBackscatter, fitAttenuation, MAX_GAIN } from '../src/engine/physical.ts';
+import { srgbToLinear, toOklab } from '../src/engine/color.ts';
+import { DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -110,6 +112,9 @@ const near = (a: number, b: number, tol: number) => Math.abs(a - b) <= tol;
   check('R-row red term is shifted*redGain (no 1.2)', near(mh.m[0], s[0] * gain0, 1e-9));
   check('R-row gain equals the G-row gain', near(gain0, mh.m[4], 1e-9), `R=${gain0.toFixed(4)} G=${mh.m[4].toFixed(4)}`);
   check('green row stays a pure diagonal', mh.m[3] === 0 && mh.m[5] === 0);
+  // regression: the blue row once read the 4×5 upstream matrix with a
+  // stride of 3 and multiplied GREEN by the blue gain
+  check('blue row is blue × blue gain (pure diagonal)', mh.m[6] === 0 && mh.m[7] === 0 && mh.m[8] > 0, `B row ${mh.m.slice(6).map((v) => v.toFixed(3))}`);
 }
 
 /* ------------------------------------------------- end to end on a scene */
@@ -260,19 +265,80 @@ function scene(w: number, h: number, fn: (x: number, y: number) => [number, numb
   void resid; void meanPull; void fitArr;
 }
 
-console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
-process.exit(failures ? 1 : 0);
-
-/* ================== the cast budget that keeps the profiles honest ======== */
+/* ======================= the profiles inside the engine ================ */
 
 {
-  // Regression: the imported profiles are allowed to move the colour cast by
-  // at most this much. On UIEB with ground truth, at full strength they moved
-  // it 27-40 units and scored 2.5-3x worse than the engine's own auto result.
-  check('the cast budget is small enough to be meaningful', MAX_CAST_DRIFT > 0 && MAX_CAST_DRIFT <= 3, `${MAX_CAST_DRIFT}`);
-  // A limiter that is a no-op, or unbounded, is the bug this guards.
-  const shift = 53.4; // the measured shift of a real blue-water frame
-  const k = shift > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / shift : 1;
-  check('a large method shift is scaled down hard', k < 0.1, `k=${k.toFixed(4)} from shift ${shift}`);
-  check('a small method shift is left alone', (1.2 > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / 1.2 : 1) === 1);
+  // GLSL twins agree with the reference functions away from the blend band
+  const st = { mean: 70, min: 12, max: 200 };
+  const s4 = [st.mean / 255, st.min / 255, st.max / 255, 0.2];
+  let same = true;
+  for (let v = 0; v <= 255; v += 17) if (Math.abs(meanPullGL(v / 255, s4, 0, 1) * 255 - toneAdjust(v, st, 0.2)) > 0.01) same = false;
+  const s4d = [st.mean / 255, st.min / 255, st.max / 255, 0.95];
+  for (let v = 0; v <= 255; v += 17) if (Math.abs(meanPullGL(v / 255, s4d, 0, 1) * 255 - toneAdjust(v, st, 0.95)) > 0.01) same = false;
+  check('meanPullGL matches Eq. 2 outside the 0.6–0.8 blend band', same);
+  const lo = meanPullGL(0.3, [70 / 255, 12 / 255, 200 / 255, 0.69], 0, 1), hi = meanPullGL(0.3, [70 / 255, 12 / 255, 200 / 255, 0.71], 0, 1);
+  const jump = Math.abs(toneAdjust(0.3 * 255, st, 0.69) - toneAdjust(0.3 * 255, st, 0.71)) / 255;
+  check('meanPullGL: a 0.02 change in dark fraction moves the output far less than the published switch (video)',
+    Math.abs(lo - hi) < 0.25 * jump, `${Math.abs(lo - hi).toFixed(3)} vs published jump ${jump.toFixed(3)}`);
+  check('physicalGL: a channel with no attenuation passes through', physicalGL(0.4, 0, 0.05) === 0.4);
+  check('physicalGL: gain never exceeds the clamp', physicalGL(0.2, 5, 0) <= 0.2 * MAX_GAIN + 1e-9);
+
+  // scenes with known truth (scripts/verify-scene.js)
+  (globalThis as unknown as { window: unknown }).window ??= globalThis;
+  await import('../scripts/verify-scene.js');
+  type Scene = {
+    truth(w: number, h: number, pan?: number, seed?: number): { J: Float32Array; object: Uint8Array };
+    degrade(t: unknown, water: string, depth: number, seed?: number): Uint8ClampedArray;
+  };
+  const SC = (globalThis as unknown as { __scene: Scene }).__scene;
+  const w = 192, h = 108;
+  const T = SC.truth(w, h);
+  const run = (name: string, img: Uint8ClampedArray, eng = new AutoEngine(), dt = 0) => {
+    const set = PRESETS[name].set as Record<string, number>;
+    const params = { ...DEFAULT_PARAMS, auto: true, ...set } as Params;
+    const locked = new Set(Object.keys(set).filter((k) => isAutoKey(k as keyof Params)) as AutoKey[]);
+    return eng.step(img, w, h, { params, locked, dt });
+  };
+  const deep = SC.degrade(T, 'blue', 12);
+  const PROF = ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab'];
+  const amounts = PROF.map((p) => run(p, deep));
+  check('each profile arms exactly its own method (effective amounts)',
+    amounts.every((st) => [st.mixAmt, st.pullAmt, st.physAmt].filter((v) => v > 0.0001).length === 1),
+    amounts.map((st, i) => `${PROF[i].slice(4)} m${st.mixAmt.toFixed(2)}/p${st.pullAmt.toFixed(2)}/ph${st.physAmt.toFixed(2)}`).join(' '));
+  check('a profile replaces the engine colour correction (red comp, WB, de-cast off)',
+    amounts.every((st) => st.effective.redComp === 0 && st.effective.wbStrength === 0 && st.effective.deCast === 0));
+  check('全自動-warplab engages on a red-starved 12 m frame', amounts[3].physAmt > 0.3 && amounts[3].physA[0] > 0.3,
+    `amount ${amounts[3].physAmt.toFixed(2)}, a_r·z ${amounts[3].physA[0].toFixed(2)}`);
+
+  // colour vs truth: every profile must beat the untouched source
+  const dE = (px: ArrayLike<number>, stride: number, scale: number) => {
+    let d = 0, c = 0;
+    for (let i = 0; i < w * h; i++) {
+      if (!T.object[i]) continue;
+      const a = toOklab(srgbToLinear(px[i * stride] * scale), srgbToLinear(px[i * stride + 1] * scale), srgbToLinear(px[i * stride + 2] * scale));
+      const b = toOklab(srgbToLinear(T.J[i * 3]), srgbToLinear(T.J[i * 3 + 1]), srgbToLinear(T.J[i * 3 + 2]));
+      d += Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+      c++;
+    }
+    return d / c;
+  };
+  const src = dE(deep, 4, 1 / 255);
+  const res = amounts.map((st) => dE(mirrorRender(deep, w, h, st), 3, 1));
+  check('every profile moves a 12 m frame closer to the true colours than the source', res.every((v) => v < src),
+    `source ΔE ${src.toFixed(3)} → ${res.map((v, i) => `${PROF[i].slice(4)} ${v.toFixed(3)}`).join(', ')}`);
+
+  // video: the per-frame method statistics are smoothed by the tracker
+  const eng = new AutoEngine();
+  let maxStep = 0, prev: number[] | null = null;
+  for (let f = 0; f < 20; f++) {
+    const img = SC.degrade(SC.truth(w, h, f * 0.01), 'blue', 8, f);
+    const st = run('全自動-bornfree', img, eng, f === 0 ? 0 : 1 / 30);
+    const cur = [...st.mixMat, ...st.mixOff];
+    if (prev) maxStep = Math.max(maxStep, ...cur.map((v, i) => Math.abs(v - prev![i])));
+    prev = cur;
+  }
+  check('bornfree matrix glides while the camera pans (no per-frame jumps)', maxStep < 0.1, `max coefficient step ${maxStep.toFixed(3)} per frame`);
 }
+
+console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
+process.exit(failures ? 1 : 0);

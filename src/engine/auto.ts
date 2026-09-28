@@ -43,9 +43,9 @@ import { boxMean, guidedCoefficients, minFilter, quantiles } from './filters.ts'
 import { buildClahe, buildCurve, sampleClahe, sampleCurve } from './luts.ts';
 import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetect } from './light.ts';
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
-import { analyzeColorMatrix } from './matrix.ts';
-import { analyzeMeanPull, meanPull } from './twostep.ts';
-import { JERLOV } from './physical.ts';
+import { analyzeColorMatrix, applyMixGL } from './matrix.ts';
+import { analyzeMeanPull, meanPullGL } from './twostep.ts';
+import { JERLOV, physicalGL } from './physical.ts';
 
 /**
  * Long edge of the analysis frame. Every map computed from it is low-frequency
@@ -64,19 +64,35 @@ export const CHROMA_TARGET = 0.085;
  */
 export const TUNING = {
   redGain: 1.6, // Ancuti α for red at full underwater confidence
-  blueGain: 1.15, // same for blue in green water
-  wbGain: 0.98, // white-balance strength
+  blueGain: 1.15, // same for blue, where the water itself absorbs blue
+  wbGain: 1, // white-balance strength
   dehazeBase: 0.1, // dehaze on a non-underwater frame
   dehazeGain: 0.9, // extra dehaze at full underwater confidence (sum ≤ 1)
-  depthGain: 0.7, // distance colour compensation per unit residual red deficit
+  depthGain: 0.875, // distance colour compensation per unit residual red deficit
   claheBase: 0,
-  claheFlat: 0.22, // CLAHE on flat frames (dehaze already restores contrast)
+  claheFlat: 0.045, // CLAHE on flat frames (dehaze already restores contrast)
   kLo: 0.24, // auto exposure lifts frames whose log-average is below this
   vibBase: 0,
-  vibGain: 0.34,
-  deCastGain: 0.88,
-  vividAuto: 0.25, // automatic 豐富色彩 in full-auto mode
+  vibGain: 0,
+  deCastGain: 0.92,
+  vividAuto: 0.4, // automatic 豐富色彩 in full-auto mode
 };
+
+/**
+ * The water body (what the water IS: blue or green, whether it absorbs blue)
+ * is the dominant smooth colour among all but the darkest 30 % by the prior.
+ * Keeping only the "hazier 30 %" instead ranks bright sand above dark open
+ * water: a sandy 2.5–8 m blue scene then read as green water and got blue
+ * compensation, which turned the water violet.
+ */
+export const WATER_BODY_FLOOR = 0.3;
+/**
+ * The veil dehaze removes keeps the hazier-30 % rule. Using the open-water
+ * estimate there as well is physically tidier, but on the ground-truth
+ * scenes it made dehaze subtract a dark blue veil and lose colour: chromatic
+ * error on the 8 m reef 0.088 → 0.142, surfaces greyer (C/C_true 0.86 → 0.53).
+ */
+export const VEIL_FLOOR = 0.7;
 export const T0 = 0.3; // transmission floor: keeps far water from turning to noise
 /**
  * Share of the dehazed *colour* kept; the rest of dehaze acts on luminance.
@@ -168,21 +184,6 @@ export interface Pick {
   post: Vec3 | null;
 }
 
-
-/**
- * Colour cast of an RGB buffer, on the same scale the bench uses:
- * positive is blue, negative is warm. This is the quantity the four imported
- * methods have to stop being allowed to dominate.
- */
-function castOf(rgb: Float32Array, n: number): number {
-  let r = 0, g = 0, b = 0;
-  for (let i = 0; i < n; i++) { r += rgb[i * 3]; g += rgb[i * 3 + 1]; b += rgb[i * 3 + 2]; }
-  return b / n - (r / n + g / n) / 2;
-}
-
-/** Upper bound on how far an imported method may move the colour cast. */
-export const MAX_CAST_DRIFT = 1.5;
-
 export interface StepOptions {
   params: Params;
   locked: ReadonlySet<AutoKey>;
@@ -207,6 +208,7 @@ export class AutoEngine {
   private pool = new Map<string, Float32Array>();
   private bins = new Uint16Array(0);
   private frameNo = 0;
+  private g8: Uint8ClampedArray | null = null;
   private beamCache: BeamDetect | null = null;
   /** Per-frame scratch buffers, reused across frames to keep GC out of playback. */
   private buf(name: string, len: number): Float32Array {
@@ -272,16 +274,30 @@ export class AutoEngine {
       return v;
     };
 
+    /* 0. water colour, imported 全自動 profile ----------------------- */
+    // The water body's colour on the raw frame: classification and the blue
+    // compensation gate follow it, not the frame mean (a sandy bottom makes
+    // shallow blue water read "green" on average).
+    const raw = rgba;
+    const rawWater = this.waterVotes(raw, w, h, WATER_BODY_FLOOR);
+    // A profile does the colour correction with its own method, on the
+    // source, in place of the engine's compensation and white balance (its
+    // preset locks those off). Everything below — dehaze, exposure, CLAHE —
+    // then works on the method's output, as the GRADE pass does.
+    const prof = this.profiles(raw, w, h, p, rawWater.colour, S);
+    if (prof.rgba) rgba = prof.rgba;
+
     /* 1. linearise + scene statistics ------------------------------- */
+    // statistics that say what kind of scene this is come from the raw frame
     const lin = this.buf('lin', n * 3);
     let s8r = 0, s8g = 0, s8b = 0, sl = 0, sl2 = 0;
     let lr = 0, lg = 0, lb = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
-      const r8 = rgba[i * 4], g8 = rgba[i * 4 + 1], b8 = rgba[i * 4 + 2];
+      const r8 = raw[i * 4], g8 = raw[i * 4 + 1], b8 = raw[i * 4 + 2];
       s8r += r8; s8g += g8; s8b += b8;
       const l8 = LUMA_R * r8 + LUMA_G * g8 + LUMA_B * b8;
       sl += l8; sl2 += l8 * l8;
-      const r = LIN8[r8], g = LIN8[g8], b = LIN8[b8];
+      const r = LIN8[rgba[i * 4]], g = LIN8[rgba[i * 4 + 1]], b = LIN8[rgba[i * 4 + 2]];
       lin[q] = r; lin[q + 1] = g; lin[q + 2] = b;
       lr += r; lg += g; lb += b;
     }
@@ -303,11 +319,14 @@ export class AutoEngine {
     // 豐富色彩 strength: every adaptive amount below scales with it
     const vivid = clamp(E('vivid', TUNING.vividAuto * gate), 0, 1);
     const gateWb = smoothstep(0.15, 0.45, uw);
-    const water: FrameStats['water'] = uw < 0.3 ? 'neutral' : mG > mB * 1.08 ? 'green' : 'blue';
+    const wc = rawWater.colour;
+    const water: FrameStats['water'] = uw < 0.3 ? 'neutral' : wc[1] > wc[2] * 1.08 ? 'green' : 'blue';
 
     /* 2. Ancuti compensation ----------------------------------------- */
     const defR = clamp((mG - mR) / Math.max(1e-4, mG), 0, 1);
-    const defB = clamp((mG - mB) / Math.max(1e-4, mG), 0, 1);
+    // blue is compensated where the WATER absorbs it (green water), not
+    // where the frame happens to hold more green than blue (sand, weed)
+    const defB = clamp((wc[1] - wc[2]) / Math.max(1e-4, wc[1]), 0, 1);
     const dR = S('dR', Math.max(0, mG - mR));
     const dB = S('dB', Math.max(0, mG - mB));
     const aR = E('redComp', defR > 0.04 ? TUNING.redGain * gate : 0);
@@ -360,47 +379,10 @@ export class AutoEngine {
     // et al.: min(1 - R, G, B)) calls hazy. The texture term matters: sunlit
     // sand is often *brighter* than open water, so brightness-only estimates
     // (dark channel, plain RCP) pick the seabed and then crush the water.
-    const rs = Math.max(1, Math.round(Math.max(w, h) / 110));
-    const dmin = this.buf('dmin', n);
-    const Ls = this.buf('Ls', n);
-    const Ls2 = this.buf('Ls2', n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) {
-      dmin[i] = Math.min(1 - rgba[j] / 255, rgba[j + 1] / 255, rgba[j + 2] / 255);
-      const l = luma(rgba[j], rgba[j + 1], rgba[j + 2]) / 255;
-      Ls[i] = l;
-      Ls2[i] = l * l;
-    }
-    const prior = minFilter(dmin, w, h, rs);
-    const mLs = boxMean(Ls, w, h, 3);
-    const mLs2 = boxMean(Ls2, w, h, 3);
-    // Candidates: smooth (local σ < 1.5 %) and in the hazier 30 % by the
-    // prior. The water body is the *dominant* such colour by area; a white
-    // slate or tank is smooth and hazy-looking too, but small.
-    const [p70] = quantiles(prior, [0.7], 512);
-    const votes = new Uint32Array(512);
-    let nc = 0;
-    for (let i = 0; i < n; i++) {
-      const sd = Math.sqrt(Math.max(0, mLs2[i] - mLs[i] * mLs[i]));
-      dmin[i] = prior[i] - 4 * sd; // fallback score
-      if (sd < 0.015 && prior[i] >= p70) {
-        const j = i * 4;
-        votes[((rgba[j] >> 5) << 6) | ((rgba[j + 1] >> 5) << 3) | (rgba[j + 2] >> 5)]++;
-        nc++;
-      }
-    }
-    let best = -1;
-    if (nc >= 0.01 * n) {
-      let bv = 0;
-      for (let b = 0; b < 512; b++) if (votes[b] > bv) { bv = votes[b]; best = b; }
-    }
-    const [cutoff] = best < 0 ? quantiles(dmin, [0.995], 512) : [0];
+    const wv = this.waterVotes(rgba, w, h, VEIL_FLOOR);
     let ar = 0, ag = 0, ab = 0, ac = 0, rr = 0, rg = 0, rb = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
-      const j = i * 4;
-      const take = best >= 0
-        ? (((rgba[j] >> 5) << 6) | ((rgba[j + 1] >> 5) << 3) | (rgba[j + 2] >> 5)) === best
-        : dmin[i] >= cutoff - 1 / 512;
-      if (take) {
+      if (wv.take[i]) {
         ar += bal[q]; ag += bal[q + 1]; ab += bal[q + 2]; ac++;
         rr += comp[q]; rg += comp[q + 1]; rb += comp[q + 2];
       }
@@ -620,8 +602,11 @@ export class AutoEngine {
       S('gG', clamp(gAvg / Math.max(1e-4, gm[1]), 0.85, 1.2)),
       S('gB', clamp(gAvg / Math.max(1e-4, gm[2]), 0.85, 1.2)),
     ];
-    // de-cast pulls toward grey; ease it off when rich colour is wanted
-    const deCast = this.pick ? 0 : E('deCast', S('deCastSafe', TUNING.deCastGain * gate * (1 - 0.5 * vivid) * this.deCastGuard(e, L, tMap, gain)));
+    // De-cast pulls surfaces toward grey. It is NOT eased for 豐富色彩: the
+    // residual cast it leaves is blue-cyan, opposite to warm surfaces, so
+    // easing it cost chroma (8 m reef, 豐富色彩 0.7: surface C 0.062 with the
+    // easing, 0.078 without; truth 0.077).
+    const deCast = this.pick ? 0 : E('deCast', S('deCastSafe', TUNING.deCastGain * gate * this.deCastGuard(e, L, tMap, gain)));
     // Measure how colourful the surfaces actually are (mean OKLab chroma,
     // near surfaces, every 4th pixel) and derive the gain that brings them
     // toward a vivid target. Measured, so a frame that is already colourful
@@ -683,112 +668,11 @@ export class AutoEngine {
     const threshold = E('threshold', clamp(0.012 + (2.2 * sigma) / 255, 0.015, 0.08));
     const sharpen = E('sharpen', 0.35 * (1 - 0.7 * smoothstep(3, 10, sigma)));
 
-    // Borrowed-method profiles. Skipped entirely unless a preset turned one
-    // on, so the default pipeline costs nothing extra.
-    let mixMat: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-    let mixOff: Vec3 = [0, 0, 0];
-    let mixAmt = 0;
-    let pullAmt = 0;
-    let pull: Float32Array = new Float32Array(12);
-    let physA: Vec3 = [0, 0, 0];
-    let physBack = 0;
-    let physMix = 0;
-    // Imported profiles are bounded by the colour they are allowed to move.
-    //
-    // Measured on UIEB with ground-truth references, the four methods at full
-    // strength land 27-40 units of cast away from the engine's own auto
-    // result, and are 2.5-3x worse against truth. Re-enabling the engine's
-    // own redComp alongside them changed nothing (36.9 -> 37.1), so this is
-    // not double-counting: the methods simply pull somewhere the engine's
-    // measured pipeline does not. So rather than trust them with the colour
-    // balance, each one is scaled back until the cast it induces fits inside
-    // MAX_CAST_DRIFT. They keep their tonal and structural work and lose
-    // their ability to hijack the white balance.
-    if (p.matrixMix > 0.0001 || p.meanPull > 0.0001 || p.physicalMix > 0.0001) {
-      const n = Math.max(1, w * h);
-      // 0..255 throughout: the matrix offset is scaled by 255 at apply time,
-      // so measuring in normalised units saturates every pixel to white and
-      // the cast reads a flat zero.
-      const src = new Float32Array(n * 3);
-      for (let i = 0, j = 0; i < n; i++, j += 3) {
-        src[j] = rgba[j]; src[j + 1] = rgba[j + 1]; src[j + 2] = rgba[j + 2];
-      }
-      // Measure in the domain the method actually runs in. The method is
-      // applied to the engine's GRADED output, which has already had the water
-      // cast removed. Measuring against the raw frame under-reports the shift
-      // by roughly an order of magnitude, because on a still-blue frame the
-      // matrix's red lift and blue subtraction largely cancel in the cast
-      // metric — and it is the de-blued frame that goes warm. Grey-world
-      // normalising the buffer puts the measurement in that domain.
-      for (let c = 0; c < 3; c++) {
-        let sum = 0;
-        for (let i = 0; i < n; i++) sum += src[i * 3 + c];
-        const m = sum / n;
-        if (m > 1e-4) for (let i = 0; i < n; i++) src[i * 3 + c] = Math.min(255, src[i * 3 + c] * (127.5 / m));
-      }
-      const before = castOf(src, n);
-      const trial = Float32Array.from(src);
-      if (p.matrixMix > 0.0001) {
-        const cm = analyzeColorMatrix(rgba as Uint8ClampedArray, w, h, {
-          analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full',
-          hueLimit: p.matrixHue,
-        });
-        mixMat = cm.m;
-        mixOff = cm.off;
-        for (let i = 0; i < n; i++) {
-          const r = src[i * 3], g = src[i * 3 + 1], b = src[i * 3 + 2];
-          const m = cm.m;
-          trial[i * 3] = clamp(m[0] * r + m[1] * g + m[2] * b + cm.off[0] * 255, 0, 255);
-          trial[i * 3 + 1] = clamp(m[3] * r + m[4] * g + m[5] * b + cm.off[1] * 255, 0, 255);
-          trial[i * 3 + 2] = clamp(m[6] * r + m[7] * g + m[8] * b + cm.off[2] * 255, 0, 255);
-        }
-      }
-      if (p.meanPull > 0.0001) {
-        const mp = analyzeMeanPull(rgba as Uint8ClampedArray, w, h);
-        for (let c = 0; c < 3; c++) {
-          pull[c * 4] = mp.stats[c].mean / 255;
-          pull[c * 4 + 1] = mp.stats[c].min / 255;
-          pull[c * 4 + 2] = mp.stats[c].max / 255;
-          pull[c * 4 + 3] = mp.dark[c];
-        }
-        for (let i = 0; i < n; i++) {
-          for (let c = 0; c < 3; c++) {
-            const st = { mean: pull[c * 4] * 255, min: pull[c * 4 + 1] * 255, max: pull[c * 4 + 2] * 255 };
-            trial[i * 3 + c] = meanPull(trial[i * 3 + c], st, pull[c * 4 + 3], 1);
-          }
-        }
-      }
-      if (p.physicalMix > 0.0001) {
-        let mr = 0, mg = 0, mn2 = 0;
-        for (let i = 0; i < n; i++) { mr += src[i * 3]; mg += src[i * 3 + 1]; mn2++; }
-        const starvation = mn2 ? clamp(1 - mr / Math.max(1, mg), 0, 1) : 0;
-        const wt = water === 'green' ? JERLOV.green : water === 'blue' ? JERLOV.blue : JERLOV.coastal;
-        const haz = clamp(hazeAct, 0, 1);
-        const depth = 12 * haz * clamp(p.physicalDepth, 0, 1) * starvation;
-        physA = [Math.max(0, wt.ar - wt.ag) * depth, 0, 0];
-        physBack = 0.08 * haz;
-        physMix = p.physicalMix * smoothstep(0.12, 0.55, starvation);
-        if (physMix > 0.0001) {
-          for (let i = 0; i < n; i++) {
-            const gain = clamp(Math.exp(physA[0]), 1, 3);
-            const bsub = Math.min(physBack * wt.beta * (1 - Math.exp(-wt.ar * depth)), trial[i * 3] * 0.5);
-            trial[i * 3] = Math.max(0, trial[i * 3] - bsub) * gain;
-          }
-        }
-      }
-      // Scale the whole profile back until its cast shift fits the budget.
-      const shift = Math.abs(castOf(trial, n) - before);
-      const k = shift > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / shift : 1;
-      mixAmt = p.matrixMix * k;
-      pullAmt = p.meanPull * k;
-      physMix *= k;
-    }
-
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
     return {
-      mixMat, mixOff, mixAmt, pull, pullAmt,
-      physA, physBack, physAmt: physMix,
+      mixMat: prof.mixMat, mixOff: prof.mixOff, mixAmt: prof.mixAmt, pull: prof.pull, pullAmt: prof.pullAmt,
+      physA: prof.physA, physBack: prof.physBack, physAmt: prof.physAmt,
       aR, aB, dR, dB,
       A, Aout, post, k, dehazeOn, coef, coefW: w, coefH: h,
       wb, expMul,
@@ -820,6 +704,148 @@ export class AutoEngine {
    * Scene-cut detector: total-variation distance between colour histograms of
    * consecutive frames. Camera pans score ~0.05–0.15; a cut scores > 0.3.
    */
+
+
+
+  /**
+   * The dominant smooth colour among pixels the Red Channel Prior (Galdran et
+   * al.: min(1 − R, G, B)) ranks at or above the `floor` quantile. Returns the
+   * chosen pixels and their mean linear colour. See WATER_BODY_FLOOR and
+   * VEIL_FLOOR for the two uses.
+   */
+  private waterVotes(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, floor: number): { take: Uint8Array; colour: Vec3 } {
+    const n = w * h;
+    const rs = Math.max(1, Math.round(Math.max(w, h) / 110));
+    const dmin = this.buf('dmin', n);
+    const Ls = this.buf('Ls', n);
+    const Ls2 = this.buf('Ls2', n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      dmin[i] = Math.min(1 - rgba[j] / 255, rgba[j + 1] / 255, rgba[j + 2] / 255);
+      const l = luma(rgba[j], rgba[j + 1], rgba[j + 2]) / 255;
+      Ls[i] = l;
+      Ls2[i] = l * l;
+    }
+    const prior = minFilter(dmin, w, h, rs);
+    const mLs = boxMean(Ls, w, h, 3);
+    const mLs2 = boxMean(Ls2, w, h, 3);
+    // Candidates: smooth (local σ < 1.5 %) and in the hazier 30 % by the
+    // prior. The water body is the *dominant* such colour by area; a white
+    // slate or tank is smooth and hazy-looking too, but small.
+    const [pFloor] = quantiles(prior, [floor], 512);
+    const votes = new Uint32Array(512);
+    let nc = 0;
+    for (let i = 0; i < n; i++) {
+      const sd = Math.sqrt(Math.max(0, mLs2[i] - mLs[i] * mLs[i]));
+      dmin[i] = prior[i] - 4 * sd; // fallback score
+      if (sd < 0.015 && prior[i] >= pFloor) {
+        const j = i * 4;
+        votes[((rgba[j] >> 5) << 6) | ((rgba[j + 1] >> 5) << 3) | (rgba[j + 2] >> 5)]++;
+        nc++;
+      }
+    }
+    let best = -1;
+    if (nc >= 0.01 * n) {
+      let bv = 0;
+      for (let b = 0; b < 512; b++) if (votes[b] > bv) { bv = votes[b]; best = b; }
+    }
+    const [cutoff] = best < 0 ? quantiles(dmin, [0.995], 512) : [0];
+    const take = new Uint8Array(n);
+    let r = 0, g = 0, b = 0, c = 0;
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const t = best >= 0
+        ? (((rgba[j] >> 5) << 6) | ((rgba[j + 1] >> 5) << 3) | (rgba[j + 2] >> 5)) === best
+        : dmin[i] >= cutoff - 1 / 512;
+      if (!t) continue;
+      take[i] = 1;
+      r += LIN8[rgba[j]]; g += LIN8[rgba[j + 1]]; b += LIN8[rgba[j + 2]]; c++;
+    }
+    c = Math.max(1, c);
+    return { take, colour: [r / c, g / c, b / c] };
+  }
+
+  /**
+   * The imported methods (docs/sources.md), measured on the raw frame they
+   * are applied to (as their authors define them) and applied to a copy of
+   * it, which the rest of the analysis then uses. Every per-frame statistic
+   * goes through the tracker `S`, so a video does not breathe with the
+   * histogram. Returns the uniforms for the GRADE pass and the corrected copy
+   * (null when no profile is on — the default path costs nothing).
+   */
+  private profiles(
+    rgba: Uint8Array | Uint8ClampedArray,
+    w: number,
+    h: number,
+    p: Params,
+    waterColour: Vec3,
+    S: (key: string, target: number) => number,
+  ) {
+    const n = w * h;
+    const out = {
+      mixMat: [1, 0, 0, 0, 1, 0, 0, 0, 1] as Mat3,
+      mixOff: [0, 0, 0] as Vec3,
+      mixAmt: 0,
+      pull: new Float32Array(12),
+      pullAmt: 0,
+      physA: [0, 0, 0] as Vec3,
+      physBack: 0,
+      physAmt: 0,
+      rgba: null as Uint8ClampedArray | null,
+    };
+    if (p.matrixMix <= 0.0001 && p.meanPull <= 0.0001 && p.physicalMix <= 0.0001) return out;
+    const src = rgba as Uint8ClampedArray;
+    if (p.matrixMix > 0.0001) {
+      const cm = analyzeColorMatrix(src, w, h, { analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full', hueLimit: p.matrixHue });
+      out.mixMat = cm.m.map((v, i) => S(`mm${i}`, v)) as Mat3;
+      out.mixOff = cm.off.map((v, i) => S(`mo${i}`, v)) as Vec3;
+      out.mixAmt = p.matrixMix;
+    }
+    if (p.meanPull > 0.0001) {
+      const mp = analyzeMeanPull(src, w, h);
+      for (let c = 0; c < 3; c++) {
+        out.pull[c * 4] = S(`pm${c}`, mp.stats[c].mean / 255);
+        out.pull[c * 4 + 1] = S(`pn${c}`, mp.stats[c].min / 255);
+        out.pull[c * 4 + 2] = S(`px${c}`, mp.stats[c].max / 255);
+        out.pull[c * 4 + 3] = S(`pd${c}`, mp.dark[c]);
+      }
+      out.pullAmt = p.meanPull;
+    }
+    if (p.physicalMix > 0.0001) {
+      // how much red the frame has lost, and how hazy (flat) it is
+      let mr = 0, mg = 0, l = 0, l2 = 0;
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        mr += LIN8[src[j]];
+        mg += LIN8[src[j + 1]];
+        const y = luma(src[j], src[j + 1], src[j + 2]) / 255;
+        l += y;
+        l2 += y * y;
+      }
+      const starvation = clamp(1 - mr / Math.max(1e-4, mg), 0, 1);
+      const sd = Math.sqrt(Math.max(0, l2 / n - (l / n) ** 2));
+      const haze = clamp((0.3 - sd) / 0.25, 0, 1);
+      const wt = waterColour[1] > waterColour[2] * 1.08 ? JERLOV.green : JERLOV.blue;
+      // one distance for the frame: red loss (and haze) scaled by 虛擬深度
+      const depth = 12 * clamp(p.physicalDepth, 0, 1) * starvation * (0.5 + 0.5 * haze);
+      out.physA = [S('phA', Math.max(0, wt.ar - wt.ag) * depth), 0, 0];
+      out.physBack = S('phB', 0.08 * (0.5 + 0.5 * haze) * wt.beta); // β folded in: CPU and GPU agree
+      out.physAmt = S('phM', p.physicalMix * smoothstep(0.12, 0.55, starvation));
+    }
+    // the corrected copy, exactly as the GRADE pass computes it
+    if (!this.g8 || this.g8.length !== n * 4) this.g8 = new Uint8ClampedArray(n * 4);
+    const dst = this.g8;
+    const px = new Float32Array(3);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      px[0] = src[j] / 255;
+      px[1] = src[j + 1] / 255;
+      px[2] = src[j + 2] / 255;
+      applyProfile(px, out);
+      dst[j] = px[0] * 255 + 0.5;
+      dst[j + 1] = px[1] * 255 + 0.5;
+      dst[j + 2] = px[2] * 255 + 0.5;
+      dst[j + 3] = 255;
+    }
+    out.rgba = dst;
+    return out;
+  }
 
   /**
    * How much of the de-cast gain is safe (0..1). The gain is grey-world on
@@ -913,6 +939,19 @@ export function gamutFit(lab: Vec3, k: number): Vec3 {
   return [clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1)];
 }
 
+/** Imported profile state, as the GRADE pass takes it. */
+type ProfileState = { [K in 'mixMat' | 'mixOff' | 'mixAmt' | 'pull' | 'pullAmt' | 'physA' | 'physBack' | 'physAmt']: FrameState[K] };
+
+/**
+ * The imported 全自動 profile on one sRGB-encoded 0..1 colour, in place.
+ * Mirrors the head of GRADE_FS (mixMatrix → meanPull → physical).
+ */
+export function applyProfile(px: Float32Array, s: ProfileState): void {
+  if (s.mixAmt > 0.0001) applyMixGL(px, 0, s.mixMat, s.mixOff, s.mixAmt);
+  if (s.pullAmt > 0.0001) for (let c = 0; c < 3; c++) px[c] = meanPullGL(px[c], s.pull, c * 4, s.pullAmt);
+  if (s.physAmt > 0.0001) for (let c = 0; c < 3; c++) px[c] += (physicalGL(px[c], s.physA[c], s.physBack) - px[c]) * s.physAmt;
+}
+
 /**
  * CPU reference of the final colour stage at analysis resolution — used by the
  * tests and by the photo thumbnails. Omits spatial detail (sharpen/clarity).
@@ -920,13 +959,22 @@ export function gamutFit(lab: Vec3, k: number): Vec3 {
 export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, s: FrameState): Float32Array {
   const n = w * h;
   const out = new Float32Array(n * 3);
+  const px3 = new Float32Array(3);
+  const profile = s.mixAmt > 0.0001 || s.pullAmt > 0.0001 || s.physAmt > 0.0001;
   const [kr, kg, kb] = s.k;
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const i = y * w + x,
         j = i * 4,
         q = i * 3;
-      let r = LIN8[rgba[j]], g = LIN8[rgba[j + 1]], b = LIN8[rgba[j + 2]];
+      let r: number, g: number, b: number;
+      if (profile) {
+        px3[0] = rgba[j] / 255; px3[1] = rgba[j + 1] / 255; px3[2] = rgba[j + 2] / 255;
+        applyProfile(px3, s);
+        r = srgbToLinear(px3[0]); g = srgbToLinear(px3[1]); b = srgbToLinear(px3[2]);
+      } else {
+        r = LIN8[rgba[j]]; g = LIN8[rgba[j + 1]]; b = LIN8[rgba[j + 2]];
+      }
       r = Math.min(1, r + s.aR * s.dR * (1 - r) * g);
       b = Math.min(1, b + s.aB * s.dB * (1 - b) * g);
       const m = s.wb;

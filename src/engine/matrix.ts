@@ -173,6 +173,9 @@ export function matrixFromHistograms(
 
   const s = hueShiftRed(1, 1, 1, hueShift);
   const blueTerm = Math.max(-MAX_BLUE_TERM, s[2] * gain[0] * BLUE_MAGIC);
+  // Upstream stores a 4×5 colour matrix (row stride 5: R G B A offset); its
+  // 3×3 part is diagonal apart from the red row. Row 3 is blue × blue gain —
+  // read with a stride of 3 it would come out as green × blue gain.
   const m: Mat3 = [
     s[0] * gain[0],
     s[1] * gain[0],
@@ -181,8 +184,8 @@ export function matrixFromHistograms(
     gain[1],
     0,
     0,
-    gain[2],
     0,
+    gain[2],
   ];
   return { m, off: off as Vec3, hueShift, range, threshold };
 }
@@ -290,4 +293,19 @@ export function applyColorMatrix(m: ColorMatrix, r: number, g: number, b: number
     m.m[6] * r + m.m[7] * g + m.m[8] * b + m.off[2] * 255,
   ];
   return [Math.min(255, Math.max(0, out[0])), Math.min(255, Math.max(0, out[1])), Math.min(255, Math.max(0, out[2]))];
+}
+
+/**
+ * The matrix as the FINAL shader applies it (`mixMatrix` in shaders.ts): on
+ * sRGB-encoded 0..1 colour, blended by `amount`, clamped. `e` is changed in
+ * place at index `q`.
+ */
+export function applyMixGL(e: Float32Array, q: number, m: Mat3, off: Vec3, amount: number): void {
+  const r = e[q], g = e[q + 1], b = e[q + 2];
+  const cr = m[0] * r + m[1] * g + m[2] * b + off[0];
+  const cg = m[3] * r + m[4] * g + m[5] * b + off[1];
+  const cb = m[6] * r + m[7] * g + m[8] * b + off[2];
+  e[q] = Math.min(1, Math.max(0, r + (cr - r) * amount));
+  e[q + 1] = Math.min(1, Math.max(0, g + (cg - g) * amount));
+  e[q + 2] = Math.min(1, Math.max(0, b + (cb - b) * amount));
 }

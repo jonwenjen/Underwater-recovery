@@ -177,17 +177,6 @@ export interface Group {
 
 export const GROUPS: Group[] = [
   {
-    title: '外部演算法（全自動 profiles）',
-    sliders: [
-      { key: 'matrixMix', label: '直方圖間隙矩陣', min: 0, max: 1, step: 0.01, hint: 'bornfree / nikolajbech：以最寬直方圖空隙定黑點白點，再套 3×3 sRGB 色彩矩陣' },
-      { key: 'matrixHue', label: '色相位移上限', min: 0, max: 121, step: 1, hint: '綠轉紅的上限（度）。原法為 121；調低可避免重度偏紅的畫面被推成洋紅' },
-      { key: 'matrixGrid', label: '分析取樣', min: 0, max: 1, step: 1, hint: '0 ＝分析整張原圖（nikolajbech）；1 ＝固定 256×256 取樣（bornfree，門檻不隨解析度變動，影片較穩）' },
-      { key: 'meanPull', label: '兩段式色調拉抬', min: 0, max: 1, step: 0.01, hint: 'Fu 等 ISPACS 2017 Eq.2：通道均值拉回 128；通道被壓到全黑時改平移、不拉伸，避免雜訊爆開' },
-      { key: 'physicalMix', label: '深度導向物理還原', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz 成像模型：先扣後向散射再除以衰減，還原被水吸收的紅色' },
-      { key: 'physicalDepth', label: '虛擬深度', min: 0, max: 1, step: 0.01, hint: '以暗通道推估每個像素的距離：0 全畫同距離、1 完全依距離（遠景補得多）' },
-    ],
-  },
-  {
     title: '水體校正',
     sliders: [
       { key: 'redComp', label: '紅色補償', min: 0, max: 2, step: 0.01, hint: '用綠色頻道重建被水吸收的紅色（Ancuti 補償）' },
@@ -251,6 +240,17 @@ export const GROUPS: Group[] = [
     ],
   },
   {
+    title: '外部演算法（全自動 profiles）',
+    sliders: [
+      { key: 'matrixMix', label: '直方圖間隙矩陣', min: 0, max: 1, step: 0.01, hint: 'bornfree / nikolajbech：在去霧後的畫面上以最寬直方圖空隙定黑白點，再套 3×3 sRGB 色彩矩陣' },
+      { key: 'matrixHue', label: '色相位移上限', min: 0, max: 121, step: 1, hint: '綠轉紅的上限（度）。原法為 121；調低可避免重度偏紅的畫面被推成洋紅' },
+      { key: 'matrixGrid', label: '分析取樣', min: 0, max: 1, step: 1, hint: '0 ＝以分析畫面本身的像素數定門檻（nikolajbech）；1 ＝固定 256×256 取樣（bornfree，門檻固定）' },
+      { key: 'meanPull', label: '兩段式色調拉抬', min: 0, max: 1, step: 0.01, hint: 'Fu 等 ISPACS 2017 Eq.2：通道均值拉回 128；通道被壓到全黑時改平移、不拉伸，避免雜訊爆開' },
+      { key: 'physicalMix', label: '深度導向物理還原', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz 成像模型：先扣後向散射再除以衰減，還原被水吸收的紅色' },
+      { key: 'physicalDepth', label: '虛擬深度', min: 0, max: 1, step: 0.01, hint: '整張畫面共用的距離尺度（由水霧量 × 紅色流失量推估）：0 不補、1 以最大距離補紅' },
+    ],
+  },
+  {
     title: '自動追蹤',
     sliders: [
       { key: 'response', label: '反應時間 秒', min: 0.1, max: 5, step: 0.05, hint: '影片中自動參數跟隨畫面變化的平滑時間；場景切換時立即重算' },
@@ -279,65 +279,12 @@ const RAW: Partial<Record<NumKey, number>> = {
   beams: 0, surfaceHL: 0, surfaceTone: 0, surfaceWarm: 0, lightNeutral: 0,
 };
 
-/**
- * The four "全自動-<source>" profiles, imported from outside projects.
- *
- * Each one turns its own method on and zeroes the other three, then leaves
- * the rest of the engine on its normal auto values. They are not tuned to
- * look a certain way — they reproduce what the cited method does, and the
- * "raw" flag tells the UI not to apply the engine's finishing pass on top,
- * because stacking a look on top of a fixed 3x3 correction changes it.
- *
- * Provenance and licensing are recorded in docs/sources.md. In short: all four
- * upstream projects are copyleft or unlicensed, and this repository is MIT, so
- * none of their code was copied — each method is reimplemented from its
- * published description.
- */
+/** Only one imported method at a time: switching profiles cannot stack two. */
 const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0 } as const;
+/** The engine's own colour correction, off while a profile does that job. */
+const ENGINE_COLOUR_OFF = { redComp: 0, blueComp: 0, depthColor: 0, wbStrength: 0, deCast: 0 } as const;
 
 export const PRESETS: Record<string, Preset> = {
-  '全自動-bornfree': {
-    label: '全自動-bornfree',
-    hint: '直方圖間隙色彩矩陣，固定 256×256 取樣（解析度無關、影片穩定）',
-    set: {
-      ...BORROWED_PROFILES,
-      // A 全自動 profile differs from 全自動 *only* by the imported method.
-      // Locking anything else just reproduces some other look and hides what
-      // the method actually does. The one thing that must change is the
-      // engine's own red restoration: the matrix does that job, and running
-      // both double-counts it.
-      matrixMix: 0.85, matrixGrid: 1, matrixHue: 60,
-    },
-  },
-  '全自動-nikolajbech': {
-    label: '全自動-nikolajbech',
-    hint: '同一套直方圖間隙矩陣，但依原版在「整張原圖」上統計（門檻隨解析度變動）',
-    set: {
-      ...BORROWED_PROFILES,
-      matrixMix: 0.85, matrixGrid: 0, matrixHue: 60,
-    },
-  },
-  '全自動-T77701': {
-    label: '全自動-T77701',
-    hint: 'Fu 等 ISPACS 2017 兩段式：通道均值拉回 128，被壓毀的通道改平移不拉伸',
-    set: {
-      ...BORROWED_PROFILES,
-      // Eq. 2 pulls every channel mean to 128; at full strength a frame whose
-      // means sit well below that is stretched hard and ends up warm.
-      meanPull: 0.7,
-    },
-  },
-  '全自動-warplab': {
-    label: '全自動-warplab',
-    hint: 'Akkaynak–Treibitz 物理模型：扣後向散射、再除以距離衰減，還原深水紅色',
-    set: {
-      ...BORROWED_PROFILES,
-      // Depth scale 0.45, not 1: the differential red gain hits its 3×
-      // ceiling well before the slider's maximum, and on a shallow frame a
-      // full-strength correction lands visibly warm. The slider is there.
-      physicalMix: 1, physicalDepth: 0.45,
-    },
-  },
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
   raw: { label: '原始', hint: '所有校正歸零、顯示原圖，從這裡手動調整（曲線／HSL 也重設）', set: RAW, raw: true },
   // Values from scripts/optimize.ts: each preset searched on the ground-truth
@@ -347,14 +294,41 @@ export const PRESETS: Record<string, Preset> = {
     hint: '陽光射入的淺水：提亮暗部、光束與水面不過曝、加強光紋清晰度、保留清透藍綠水色；紅色、去霧、光束與水面高光仍由自動依畫面量測',
     // locking dehaze or red compensation made colour worse (water drifts
     // violet); the surface filter did no better locked than on auto
-    set: { highlights: -0.1, whites: 1, shadows: 0.45, clarity: 0.25, depthColor: 0, waterTint: 0.95, vibrance: -0.2 },
+    set: { highlights: 0, whites: 1, shadows: 0.65, clarity: 0.25, waterTint: 0.5, vibrance: -0.2 },
   },
-  blue: { label: '深藍海水', hint: '15 m 以上的深水：紅色幾乎全失，少推飽和避免假色', set: { depthColor: 0.1, vibrance: -0.3 } },
-  green: { label: '綠水／湖', hint: '湖泊、藻類多的綠水：補藍、去綠', set: { blueComp: 0.95, tint: 0.6 } },
+  blue: { label: '深藍海水', hint: '15 m 以上的深水：紅色幾乎全失，飽和度略降避免假色', set: { vibrance: -0.08 } },
+  green: { label: '綠水／湖', hint: '湖泊、藻類多的綠水：以色調去綠、藍色補償減半', set: { blueComp: 0.45, tint: 0.31 } },
   murky: {
     label: '混濁近攝',
     hint: '能見度差、懸浮粒子多',
-    set: { dehaze: 0.85, clahe: 0.3, denoise: 0.55, sharpen: 0.35, clarity: 0.3, restore: 0.4 },
+    set: { dehaze: 0.8, clahe: 0.3, denoise: 0.55, sharpen: 0.35, clarity: 0.3, restore: 0.4 },
   },
-  strobe: { label: '閃燈', hint: '有閃燈／補光，近處紅色大多還在', set: { redComp: 0.8, depthColor: 0, dehaze: 0.4 } },
+  strobe: { label: '閃燈', hint: '有閃燈／補光，近處紅色大多還在', set: { redComp: 0.8, dehaze: 0.4, depthColor: 0, deCast: 0.5 } },
+  // The four imported 全自動 profiles (docs/sources.md). Each does the
+  // colour correction with its own method INSTEAD of the engine's: the
+  // engine's colour stages are locked off (red / blue compensation, white
+  // balance, distance compensation, de-cast), everything else — dehaze,
+  // exposure, CLAHE, detail, light — stays on auto. The method is measured on
+  // the frame it is applied to (AutoEngine.profiles). Strengths were searched
+  // by scripts/optimize.ts on the ground-truth scene suite.
+  '全自動-bornfree': {
+    label: '全自動-bornfree',
+    hint: '以 bornfree 的直方圖間隙色彩矩陣取代引擎的色彩校正；固定 256×256 取樣',
+    set: { ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, matrixMix: 0.9, matrixGrid: 1, matrixHue: 60 },
+  },
+  '全自動-nikolajbech': {
+    label: '全自動-nikolajbech',
+    hint: '同一套直方圖間隙矩陣，門檻隨分析畫面的像素數變動（nikolajbech 原版做法）',
+    set: { ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, matrixMix: 1, matrixGrid: 0, matrixHue: 60 },
+  },
+  '全自動-T77701': {
+    label: '全自動-T77701',
+    hint: 'Fu 等 ISPACS 2017 兩段式取代引擎的色彩校正：通道均值拉回 128，被壓毀的通道改平移不拉伸',
+    set: { ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, meanPull: 1 },
+  },
+  '全自動-warplab': {
+    label: '全自動-warplab',
+    hint: 'Akkaynak–Treibitz 物理模型取代引擎的紅色補償：扣後向散射、再依距離補回被吸收的紅色',
+    set: { ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, physicalMix: 1, physicalDepth: 0.45 },
+  },
 };

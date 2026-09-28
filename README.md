@@ -15,9 +15,10 @@ stage stays under professional manual control.
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # engine unit tests (Node, no browser)
+npm test           # typecheck + unit tests (Node, no browser)
 npm run verify     # build + end-to-end verification in headless Chromium
-node --experimental-strip-types scripts/optimize.ts [--report]   # re-tune auto against the scene suite
+                   # (CHROME_PATH=/path/to/chrome to use an installed browser)
+node --experimental-strip-types scripts/optimize.ts [--report] [--real]   # re-tune auto against the scene suite
 npm run build      # typecheck + production bundle
 ```
 
@@ -49,7 +50,7 @@ npm run build      # typecheck + production bundle
 
 ### ✨ 豐富色彩 (rich colour)
 
-Accurate recovery can look flat. Full auto now applies a mild dose (0.25,
+Accurate recovery can look flat. Full auto now applies a mild dose (0.4,
 found by the optimizer); one tap on **✨ 豐富色彩** locks a strong one (0.7,
 strength in the 色彩 group), a second tap hands it back to auto. Every
 amount is *measured per frame*:
@@ -60,8 +61,9 @@ amount is *measured per frame*:
   roll-off, and a **gamut fit** that gives back only the added chroma instead
   of clipping.
 - **Warm emphasis** on reds / oranges — the colours water removes first.
-- **More light** — the auto-exposure target and contrast rise; de-cast eases
-  off and open water keeps a deeper blue.
+- **More light** — the auto-exposure target and contrast rise, and open
+  water keeps a deeper blue. (De-cast is deliberately *not* eased: the cast
+  it would leave is blue-cyan, opposite to warm surfaces, and cost chroma.)
 
 ![豐富色彩 on — split before/after](docs/screenshots/studio-vivid.png)
 
@@ -101,35 +103,73 @@ Jaffe–McGlamery model: blue water at 4 / 8 / 12 m, green water 6 m, murky
 water with grain, a strobe close-up at 10 m, sunlit shallows (2.5 m) with
 beams and a clipped surface, and a clean non-underwater photo that must stay
 untouched. The score is the mean OKLab ΔE to the true colours on surfaces
-(hue, chroma and lightness at once) plus local-contrast match, white-slate
-neutrality, clipping, open-water hue (no violet) and harm to the clean photo.
+(hue, chroma and lightness at once), chromaticity error (the colour itself,
+whatever the exposure), local-contrast match, white-slate neutrality,
+clipping, open-water hue (no violet) and harm to the clean photo.
 Coordinate descent over every constant that maps a measurement to an auto
 value (`TUNING` in `auto.ts`, within ranges that stay sane on real footage),
 then over each preset's values on the scene it is made for. A preset lock is
 dropped where auto does as well.
 
-| Scene | OKLab ΔE before → after | | Preset | its scene: score auto → preset |
+| Scene | OKLab ΔE: v2 → first tuning → now | | Preset | its scene: score auto → preset |
 |---|---|---|---|---|
-| blue 4 m | 0.131 → **0.084** | | 淺水／陽光 | sunny 2.5 m: 0.857 → **0.471** |
-| blue 8 m | 0.160 → **0.078** | | 深藍海水 | blue 18 m: 0.703 → **0.676** |
-| blue 12 m | 0.153 → **0.071** | | 綠水／湖 | green 6 m: 0.652 → **0.625** |
-| green 6 m | 0.224 → **0.148** | | 混濁近攝 | murky 5 m + grain: 0.891 → **0.829** |
-| murky 5 m + grain | 0.265 → **0.202** | | 閃燈 | strobe 10 m: 0.910 → **0.682** |
-| strobe 10 m | 0.238 → **0.216** | | | |
-| sunny 2.5 m | 0.283 → **0.203** (water no longer violet) | | | |
-| clean photo (mean change) | 0.058 → **0.052** | | | |
+| blue 4 m | 0.131 → 0.084 → **0.081** | | 淺水／陽光 | sunny 2.5 m: 1.177 → **0.697** |
+| blue 8 m | 0.160 → 0.078 → **0.070** | | 綠水／湖 | green 6 m: 0.971 → **0.883** |
+| blue 12 m | 0.153 → 0.071 → **0.066** | | 混濁近攝 | murky 5 m + grain: 1.235 → **1.167** |
+| green 6 m | 0.224 → 0.148 → **0.141** | | 閃燈 | strobe 10 m: 1.280 → **1.163** |
+| murky 5 m + grain | 0.265 → 0.202 → **0.199** | | 深藍海水 | blue 18 m: 0.962 → 0.961 (≈ auto) |
+| strobe 10 m | 0.238 → 0.216 → **0.212** | | | |
+| sunny 2.5 m | 0.283 → 0.203 → **0.198** | | | |
+| clean photo (mean change) | 0.058 → 0.052 → **0.048** | | | |
 
-What changed in full auto: stronger red compensation and dehaze, brighter
-exposure target, less CLAHE (dehaze already restores local contrast; output
-was 1.3–1.4× the true local contrast), stronger de-cast (with the violet
-guard) and a **mild 豐富色彩 always on** (0.25 — the flat, dull look the
-earlier default had). The presets were re-found too: 深藍海水 is now for
-very deep water (18 m) and pushes saturation *down* (colour there is mostly
-inferred; boosting it makes false colour); 閃燈 keeps red compensation light;
-淺水／陽光 lifts shadows and keeps turquoise water. Two guards came from GPU
-checks the CPU mirror cannot see: 淺水／陽光 keeps the white point at 1
-(a lower one clipped the beams once clarity was applied), and the auto
-restore / sharpen mapping was checked on real grain.
+(The preset scores use the current objective, which also weighs
+chromaticity error ×2, so they are not comparable with earlier versions.)
+
+**Water colour now comes from the water body.** Blue-vs-green water and the
+blue compensation used to follow the frame mean, so a sandy 2.5–8 m blue
+scene read as *green* water and got blue compensation — the source of the
+violet water. Both now follow the water body: the dominant smooth colour
+among all but the darkest 30 % of pixels by the Red Channel Prior (checked
+pixel by pixel on the scenes: it is the open water). The veil that dehaze
+removes keeps its earlier estimator on purpose: using the open-water colour
+there too made dehaze subtract a dark blue veil and grey the picture
+(chromatic error on the 8 m GPU reef 0.088 → 0.142), so each use has the
+estimate that measures best.
+
+**Real photographs, as a check (not a target).** `--real` scores 23 EUVP pairs
+(`node scripts/fetch-euvp.mjs`, fetched to /tmp, never committed). Full auto
+lands at ΔE 0.136, further from the EUVP references than the untouched
+frames (0.089) — those references are clear underwater photographs that keep
+most of the water colour (reference red can be 20/255), not colour-corrected
+truth, so they cannot be a target for a colour-restoration engine. What the
+check does show is over-processing to keep an eye on: 1.5× the reference's
+local contrast.
+
+What full auto does now: strong red compensation (1.6), dehaze 0.1 + 0.9 ×
+underwater confidence, little CLAHE (dehaze already restores local contrast),
+de-cast 0.92 with the violet guard, and **豐富色彩 0.4 always on** (surface
+chroma in blue water 84–95 % of the truth). Presets:
+淺水／陽光 lifts shadows, keeps the white point and turquoise water; 綠水
+tints out the green with half the blue compensation; 閃燈 keeps red
+compensation light with less dehaze and de-cast; 混濁近攝 keeps strong
+dehaze with restoration. 深藍海水 now measures the same as full auto at
+18 m: auto handles deep water as well as any setting within the preset's
+bounds. Two guards came from GPU checks the CPU mirror cannot see:
+淺水／陽光 keeps the white point at 1 (a lower one clipped the beams once
+clarity was applied), and the auto restore / sharpen mapping was checked on
+real grain.
+
+### Imported 全自動 profiles
+
+全自動-bornfree · 全自動-nikolajbech (histogram-gap colour matrix) ·
+全自動-T77701 (Fu et al. two-step, Eq. 2) · 全自動-warplab (Akkaynak–Treibitz
+formation model) are four other auto-correction methods, reimplemented from
+their published descriptions (provenance and licences in `docs/sources.md`).
+A profile **replaces** the engine's colour correction with its method — run
+on the source, where the method is defined and measured, and smoothed over
+time — while dehaze, exposure, detail and light stay automatic. On the
+ground-truth scenes each moves the colour toward the truth, and none beats
+the engine's own correction (ΔE 0.150–0.205 vs 0.129).
 
 ### Presets, curves, HSL, rotation, speed, restoration
 
@@ -183,32 +223,33 @@ restore / sharpen mapping was checked on real grain.
 SwiftShader, WebCodecs VP9) against scenes with **known ground truth**: a reef
 rendered in true colour, then degraded with the Jaffe–McGlamery image-formation
 model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
-(59 / 59 passing):
+(73 / 73 passing):
 
 | Check | Result |
 |---|---|
-| Colour error vs ground truth (chromaticity L1, surfaces) | **0.532 → 0.088 (83 % better)** |
-| Blue cast, 75 %+ of the way to truth | 42.0 → −23.8 (truth −14.1) |
-| Red / contrast | 37.6 → 129.8 / 17.9 → 54.7 |
-| Eyedropper on a white slate | chroma error 0.030 → **0.005** |
-| Detail vs truth local contrast | 1.90× — crisp, not crunchy (1.2–2.0× window) |
+| Colour error vs ground truth (chromaticity L1, surfaces) | **0.532 → 0.082 (85 % better)** |
+| Blue cast, 75 %+ of the way to truth | 42.0 → −27.5 (truth −14.1) |
+| Red / contrast | 37.6 → 134.4 / 17.9 → 55.0 |
+| Eyedropper on a white slate | chroma error 0.036 → **0.004** |
+| Detail vs truth local contrast | 1.86× — crisp, not crunchy (1.2–2.0× window) |
 | Clean (non-underwater) photo | not flagged (0.19); colour change 0.021 |
-| Full-res export vs preview | max channel-mean difference 0.3 / 255 |
-| Video: descent 5 → 14 m | illuminant red falls in 115 / 115 steps (max step 0.001), no false cuts |
+| Full-res export vs preview | max channel-mean difference 0.2 / 255 |
+| Video: descent 5 → 14 m | illuminant red falls in 120 / 120 steps (max step 0.001), no false cuts |
 | Video: blue → green cut at 3.0 s | cut detected at 3.1 s; green water & blue compensation engage |
-| Video export | 150 / 150 frames, VP9 640×360; blue cast 43.2 → −20.6 (truth −13.7), green 58.4 → 8.6 (truth 4.9) |
-| 豐富色彩 (button, GPU) | surface chroma 0.057 → **0.076** (truth 0.077), coral redder, 0.7 % blown; press / press again = lock / back to auto |
+| Video export | 150 / 150 frames, VP9 640×360; blue cast 43.2 → −24.2 (truth −13.7), green 58.4 → 6.6 (truth 4.9) |
+| 豐富色彩 (off → button, GPU) | surface chroma 0.036 → **0.057** (truth 0.077), coral redder, 0.7 % blown; press / press again = lock / back to auto |
 | 「原始」 preset | output = source (mean diff 0.3 / 255) |
-| Rotate 90° / flip | 800×500 → 500×800, content matches (luma diff 2.7 / 0.4); photo exports 500×800 |
-| Curves | RGB mid-point lift 127 → 154; R curve moves red only (G, B ±0.0) |
-| HSL 藍 −100 | water chroma 0.030 → 0.001; coral and slate unchanged |
-| 畫質修復 | grain 19.3 → 8.6, colour noise 12.9 → 6.2, slate edge kept |
+| Rotate 90° / flip | 800×500 → 500×800, content matches (luma diff 2.8 / 0.3); photo exports 500×800 |
+| Curves | RGB mid-point lift 129 → 157; R curve moves red only (G, B ±0.0) |
+| HSL 藍 −100 | water chroma 0.016 → 0.003; coral and slate unchanged |
+| 畫質修復 | grain 18.4 → 8.2, colour noise 12.7 → 6.1, slate edge kept |
 | Auto 畫質修復 | σ 0.7 → restore 0; σ 10.2 → restore 0.85, sharpening 0.35 → 0.11 |
-| 淺水／陽光 on a sunlit scene | blown 0.2 % → 0.0 %; colour error 0.429 → 0.127 |
+| 淺水／陽光 on a sunlit scene | blown 0.0 % → 0.0 %; colour error 0.429 → 0.118 |
 | Sun beams: auto | presence 1.0, source (0.68, −0.02) for a true (0.70, −0.40) |
-| ☀ 光束 +0.8 / −0.8 | beam − gap luminance 66.6 → 95.9 / 27.8; at a wrong source only 66.8 |
-| 水面高光壓制 | clipped top band 35.7 % → 0.0 %, lower frame unchanged (Δ 0.0) |
+| ☀ 光束 +0.8 / −0.8 | beam − gap luminance 63.8 → 92.6 / 25.3; at a wrong source only 64.0 |
+| 水面高光壓制 | clipped top band 37.1 % → 0.0 %, lower frame unchanged (Δ 0.0) |
 | Control points (mouse drag) | ☀ lands at (0.250, 0.050), B at y 0.450, both lock; 自動定位 unlocks all |
+| Imported profiles | each applies only its own method, replaces the engine colour stages, beats the source (colour error 0.544 → 0.23–0.33; 全自動 0.085), red 37 → 83–176; switching does not stack |
 | Export speed | 2×: 2.5 s, 75 frames, rotated 360×640 · 0.5×: 9.9 s, all 150 frames |
 | Phone layout (390 px) | no horizontal scroll |
 
@@ -219,7 +260,11 @@ darker, greys stay grey, gamut fit keeps hue), 「原始」 as an exact identity
 curves, HSL, the light module (beam and surface detection, source position,
 grain σ within 15 %, surface mask and recovery, 光線去洋紅 keeping coral
 pink, sun beams near-white, open water not violet on a sandy bottom), and the
-analysis time budget.
+analysis time budget. `test/methods.test.ts` (50 checks) covers the imported methods
+(published coefficient tables, the matrix's blue row, the GLSL twins, one
+method per profile, profiles replacing the engine's colour stages, warplab
+engaging on a red-starved frame, every profile beating the source, and the
+matrix gliding while the camera pans).
 
 ## Architecture
 
@@ -243,7 +288,9 @@ source ─────────────▶ GRADE ─mips─▶ BLUR H ─
 | `src/engine/look.ts` | Curves (monotone cubic → LUT) and the 8-band OKLCh HSL mixer |
 | `src/engine/light.ts` | Beam / surface detection, grain σ, JS twins of the light shader maths |
 | `src/ui/lightPoints.ts` | Draggable ☀ / A / B control points over the viewer |
-| `scripts/optimize.ts` | Ground-truth scene suite + coordinate descent that tuned auto and the presets |
+| `scripts/optimize.ts` | Ground-truth scene suite + coordinate descent that tuned auto, the presets and the profiles |
+| `scripts/fetch-euvp.mjs` | Fetches the EUVP real-photo pairs to /tmp for `optimize.ts --real` |
+| `src/engine/matrix.ts`, `twostep.ts`, `physical.ts` | The imported 全自動 methods (see `docs/sources.md`) |
 | `src/engine/export.ts` | Full-res photo export, video export with speed + rotation (mediabunny, lazy-loaded) |
 | `src/ui/curves.ts`, `src/ui/hsl.ts` | Curve editor and HSL panel |
 | `src/app.ts`, `src/app.css` | Studio UI |

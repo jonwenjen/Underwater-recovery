@@ -158,3 +158,26 @@ export function meanPull(v: number, s: ChannelStats, dark: number, amount = 1): 
   const full = toneAdjust(v, s, dark, LAMBDA);
   return v + (full - v) * amount;
 }
+
+/**
+ * Eq. 2 as the FINAL shader applies it (`meanPull` in shaders.ts), on 0..1
+ * values. `s` = (mean, min, max, darkFraction) in 0..1 units.
+ *
+ * One deliberate deviation for video: the published method switches between
+ * shifting and stretching at a dark fraction of exactly 0.7. A frame whose
+ * channel hovers there would flip between the two every few frames, so the
+ * two are blended over 0.6–0.8 instead. Away from that band the result is
+ * the published one.
+ */
+export function meanPullGL(v: number, s: ArrayLike<number>, o: number, amount: number): number {
+  const T = TARGET_MEAN / 255;
+  const mean = s[o], mn = s[o + 1], mx = s[o + 2], dark = s[o + 3];
+  const shifted = v - LAMBDA * (mean - T);
+  const anchor = mean <= T ? mn : mx;
+  const span = anchor - mean;
+  const scale = Math.abs(span) < 1e-5 ? 1 : (anchor - T) / span;
+  const stretched = (v - mean) * scale + T;
+  const t = dark <= 0.6 ? 0 : dark >= 0.8 ? 1 : ((dark - 0.6) / 0.2) ** 2 * (3 - 2 * ((dark - 0.6) / 0.2));
+  const full = clamp(stretched + (shifted - stretched) * t, 0, 1); // uint8 store, as published
+  return v + (full - v) * amount;
+}
