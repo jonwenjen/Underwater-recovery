@@ -1,0 +1,107 @@
+name: Apps (Android + macOS)
+
+# Builds the Android app (Capacitor) and the macOS app (Electron) from the same
+# web build as the website (APP_BUILD=1: relative paths), and publishes them on
+# the rolling "app-latest" release. See apps/README.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'apps/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'capacitor.config.json'
+      - '.github/workflows/apps.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apps
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - run: npm ci
+      - name: Web build + Capacitor sync
+        run: npm run android:sync
+      - name: Build APK
+        working-directory: apps/android
+        env:
+          APP_VERSION_CODE: ${{ github.run_number }}
+          APP_VERSION_NAME: 2.0.${{ github.run_number }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+      - run: mv apps/android/app/build/outputs/apk/release/app-release.apk UnderwaterRecovery-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: UnderwaterRecovery-android.apk
+
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/mac/package-lock.json
+      - run: npm ci
+      - run: npm run build:app
+      - run: cp -R dist apps/mac/web
+      - name: Build DMG (Apple silicon + Intel)
+        working-directory: apps/mac
+        run: |
+          npm ci
+          npm pkg set version=2.0.${{ github.run_number }}
+          npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: apps/mac/release/*.dmg
+
+  release:
+    needs: [android, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish app-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la out
+          cat > notes.md <<'EOF'
+          Underwater Recovery Studio 2.0.${{ github.run_number }} — built from ${{ github.sha }}.
+
+          - **Android**: `UnderwaterRecovery-android.apk` — open it on the phone and allow installing from this source.
+          - **macOS**: `UnderwaterRecovery-mac-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel). Not notarised: the first time, right-click the app → Open (or System Settings → Privacy & Security → Open Anyway).
+
+          Installation and details: apps/README.md.
+          EOF
+          gh release delete app-latest --yes --cleanup-tag || true
+          gh release create app-latest out/* --title "Apps: Android + macOS (latest)" --notes-file notes.md --target ${{ github.sha }}

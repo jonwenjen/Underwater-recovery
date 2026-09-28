@@ -1,0 +1,10 @@
+{
+  "appId": "io.github.jonwenjen.underwaterrecovery",
+  "appName": "Underwater Recovery",
+  "webDir": "dist",
+  "android": {
+    "path": "apps/android",
+    "backgroundColor": "#06121f"
+  },
+  "backgroundColor": "#06121f"
+}

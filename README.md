@@ -22,6 +22,15 @@ node --experimental-strip-types scripts/optimize.ts [--report] [--real]   # re-t
 npm run build      # typecheck + production bundle
 ```
 
+## Android and macOS apps
+
+The same Studio as installable apps — **Android** (`.apk`, Capacitor) and
+**macOS** (`.dmg`, Electron; Apple silicon and Intel) — built by GitHub
+Actions and published on
+[Releases → `app-latest`](https://github.com/jonwenjen/Underwater-recovery/releases/tag/app-latest).
+Install notes (unknown-source install on Android, first launch of a
+non-notarised Mac app) and how they are built: [`apps/README.md`](apps/README.md).
+
 ## What it does
 
 | Problem | Stage | How |

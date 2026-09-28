@@ -850,28 +850,37 @@ const grade = () => ({
   aiModel: funie ?? undefined,
 });
 const baseName = (n: string) => n.replace(/\.[^.]+$/, '');
-function download(blob: Blob, name: string) {
+/** Inside the Android app (Capacitor): saving goes through native.ts. */
+const isNativeApp = () => (window as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.() === true;
+/** Save a result; returns where it went (app) or '' (browser download). */
+async function download(blob: Blob, name: string): Promise<string> {
+  if (isNativeApp()) return (await import('./native.ts')).saveNative(blob, name);
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  return '';
 }
 
 async function savePhoto(it: ImageItem) {
   const mod = await loadExport();
   const type = $<HTMLSelectElement>('photoFormat').value as 'image/jpeg' | 'image/png' | 'image/webp';
   const blob = await mod.exportPhoto(it.bitmap, grade(), type, 0.95);
-  download(blob, `${baseName(it.name)}-recovered.${type.split('/')[1].replace('jpeg', 'jpg')}`);
-  return blob;
+  const where = await download(blob, `${baseName(it.name)}-recovered.${type.split('/')[1].replace('jpeg', 'jpg')}`);
+  return { blob, where };
 }
 
 $('savePhoto').addEventListener('click', async () => {
   const it = items[current];
   if (it?.kind !== 'image') return;
   note.textContent = `輸出 ${it.w}×${it.h}…`;
-  const blob = await savePhoto(it);
-  note.textContent = `已輸出 ${it.w}×${it.h}（${(blob.size / 1e6).toFixed(1)} MB）`;
+  try {
+    const { blob, where } = await savePhoto(it);
+    note.textContent = `已輸出 ${it.w}×${it.h}（${(blob.size / 1e6).toFixed(1)} MB）${where ? ` · ${where}` : ''}`;
+  } catch (err) {
+    note.textContent = `輸出失敗：${(err as Error).message}`;
+  }
 });
 $('saveAll').addEventListener('click', async () => {
   const imgs = items.filter((x): x is ImageItem => x.kind === 'image');
@@ -925,8 +934,8 @@ $('vexport').addEventListener('click', async () => {
     });
     if (res.canceled) note.textContent = '已取消';
     else {
-      if (res.blob) download(res.blob, `${baseName(it.name)}-recovered.${format}`);
-      note.textContent = `完成：${res.frames} 幀 · ${res.width}×${res.height} · ${res.codec.toUpperCase()} · ${clock((performance.now() - t0) / 1000)}`;
+      const where = res.blob ? await download(res.blob, `${baseName(it.name)}-recovered.${format}`) : '';
+      note.textContent = `完成：${res.frames} 幀 · ${res.width}×${res.height} · ${res.codec.toUpperCase()} · ${clock((performance.now() - t0) / 1000)}${where ? ` · ${where}` : ''}`;
     }
   } catch (err) {
     note.textContent = `匯出失敗：${(err as Error).message}`;

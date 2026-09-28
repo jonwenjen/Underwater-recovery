@@ -1,0 +1,49 @@
+{
+  "name": "underwater-recovery-mac",
+  "productName": "Underwater Recovery Studio",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Underwater Recovery Studio for macOS: GPU real-time recovery of underwater photos and video",
+  "author": "jonwenjen",
+  "license": "MIT",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac --publish never"
+  },
+  "devDependencies": {
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "io.github.jonwenjen.underwaterrecovery",
+    "productName": "Underwater Recovery Studio",
+    "copyright": "MIT \u00b7 jonwenjen",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "web/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.photography",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "hardenedRuntime": false
+    },
+    "dmg": {
+      "artifactName": "UnderwaterRecovery-mac-${arch}.${ext}"
+    }
+  }
+}

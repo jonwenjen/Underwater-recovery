@@ -29,8 +29,10 @@ const ortRuntime = (): Plugin => ({
 
 export default defineConfig({
   // Served from https://jonwenjen.github.io/Underwater-recovery/ — without this
-  // prefix every built asset resolves to the domain root and 404s.
-  base: '/Underwater-recovery/',
+  // prefix every built asset resolves to the domain root and 404s. The Android
+  // and Mac apps (APP_BUILD=1, see apps/README.md) serve the build from their
+  // own root, so they use relative paths.
+  base: process.env.APP_BUILD ? './' : '/Underwater-recovery/',
   define: { __ORT_VERSION__: JSON.stringify(ORT_VERSION) },
   plugins: [ortRuntime()],
 });
