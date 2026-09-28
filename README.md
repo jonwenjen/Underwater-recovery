@@ -131,7 +131,9 @@ keeps it within 1.4 of 255 levels of the float32 model).
 - **Nothing loads until the button is pressed.** Then the ONNX Runtime Web
   build this device can use (WebGPU on a real adapter with `shader-f16`,
   otherwise single-threaded WASM, 3.7 MB gzipped) and the model are fetched
-  once; the main bundle is unchanged.
+  once (served as plain files under `ort/<version>/` and imported by URL, so a
+  request dropped by a flaky mobile connection is retried instead of failing
+  the page's import for good); the main bundle grows by 2 KB.
 - **The network runs small, the picture stays full resolution.** It sees a
   copy with a long edge of 256 px (WASM) or 512 px (WebGPU); what it did is
   fitted as an 8-tile grid of 3 × 4 colour transforms (weighted least squares,

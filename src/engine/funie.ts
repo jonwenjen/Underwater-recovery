@@ -31,7 +31,40 @@ async function webgpuUsable(): Promise<boolean> {
   }
 }
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Import the runtime by URL, retrying with a cache-busting query: a mobile
+ * connection can drop one request, and Chromium keeps a failed import()
+ * failed for the life of the page.
+ */
+async function importRuntime(url: string): Promise<Ort> {
+  let last: unknown;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return (await import(/* @vite-ignore */ i ? `${url}?retry=${i}-${Date.now()}` : url)) as Ort;
+    } catch (err) {
+      last = err;
+      await wait(600 * 2 ** i);
+    }
+  }
+  throw last;
+}
+
 async function download(url: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
+  let last: unknown;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await downloadOnce(url, onProgress);
+    } catch (err) {
+      last = err;
+      await wait(600 * 2 ** i);
+    }
+  }
+  throw last;
+}
+
+async function downloadOnce(url: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
   const res = await fetch(url);
   if (!res.ok || !res.body) throw new Error(`模型下載失敗（${res.status}）`);
   const total = Number(res.headers.get('content-length')) || 0;
@@ -64,23 +97,27 @@ export class Funie {
     this.backend = backend;
   }
 
-  /** Load runtime + model. `modelUrl` is public/models/funie-gan.fp16.onnx under the app base. */
-  static async create(modelUrl: string, onProgress?: (f: number) => void): Promise<Funie> {
+  /**
+   * Load runtime + model. `modelUrl` is public/models/funie-gan.fp16.onnx and
+   * `ortDir` the ort/<version>/ folder (vite.config.ts), both under the app base.
+   */
+  static async create(modelUrl: string, ortDir: string, onProgress?: (f: number) => void): Promise<Funie> {
     const model = download(modelUrl, onProgress);
+    model.catch(() => {}); // awaited below; don't report it unhandled while the runtime loads
     const setup = (ort: Ort) => {
       ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
       return ort;
     };
     if (await webgpuUsable()) {
       try {
-        const ort = setup((await import('onnxruntime-web/webgpu')) as unknown as Ort);
+        const ort = setup(await importRuntime(`${ortDir}ort.webgpu.bundle.min.mjs`));
         const session = await ort.InferenceSession.create(await model, { executionProviders: ['webgpu'] });
         return new Funie(ort, session, 'webgpu');
       } catch (err) {
         console.warn('FUnIE-GAN: WebGPU unavailable, using WASM', err);
       }
     }
-    const ort = setup((await import('onnxruntime-web/wasm')) as unknown as Ort);
+    const ort = setup(await importRuntime(`${ortDir}ort.wasm.bundle.min.mjs`));
     const session = await ort.InferenceSession.create(await model, { executionProviders: ['wasm'] });
     return new Funie(ort, session, 'wasm');
   }

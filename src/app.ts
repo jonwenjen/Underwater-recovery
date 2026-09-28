@@ -21,7 +21,7 @@ import { curveEditor } from './ui/curves.ts';
 import { hslPanel } from './ui/hsl.ts';
 import { lightPoints, type PointId } from './ui/lightPoints.ts';
 
-import type { Funie } from './engine/funie.ts';
+import { Funie } from './engine/funie.ts';
 
 type ExportMod = typeof import('./engine/export.ts');
 let exportMod: Promise<ExportMod> | null = null;
@@ -450,7 +450,9 @@ for (const b of flowButtons)
  * the model; the network then runs on a small copy of each still (every
  * AI_REFRESH_S of video, and on cuts) and the GRADE pass applies its colour
  * and tone at full resolution. Pressing again returns to 全自動. */
+declare const __ORT_VERSION__: string; // vite.config.ts
 const MODEL_URL = `${import.meta.env.BASE_URL}models/funie-gan.fp16.onnx`;
+const ORT_DIR = `${new URL(import.meta.env.BASE_URL, location.href).href}ort/${__ORT_VERSION__}/`;
 let funie: Funie | null = null;
 let funieLoad: Promise<Funie> | null = null;
 let aiGuide: AiGuide | null = null;
@@ -464,26 +466,25 @@ const aiKey = () => {
   return `${current}|${orient.rot}${orient.flip ? 'f' : ''}|${t}`;
 };
 function loadFunie(): Promise<Funie> {
-  funieLoad ??= import('./engine/funie.ts')
-    .then((m) =>
-      m.Funie.create(MODEL_URL, (f) => {
-        aiMsg = `下載模型 ${Math.round(f * 100)}%…`;
-        syncAi();
-      }),
-    )
-    .then(
-      (f) => {
-        funie = f;
-        aiMsg = '';
-        return f;
-      },
-      (err) => {
-        funieLoad = null;
-        aiMsg = `載入失敗：${(err as Error).message}`;
-        syncAi();
-        throw err;
-      },
-    );
+  if (funieLoad) return funieLoad;
+  aiMsg = '載入中…';
+  syncAi();
+  funieLoad = Funie.create(MODEL_URL, ORT_DIR, (f) => {
+    aiMsg = `下載模型 ${Math.round(f * 100)}%…`;
+    syncAi();
+  }).then(
+    (f) => {
+      funie = f;
+      aiMsg = '';
+      return f;
+    },
+    (err) => {
+      funieLoad = null;
+      aiMsg = `載入失敗（已自動重試 3 次）：${(err as Error).message} · 請確認網路後再按一次`;
+      syncAi();
+      throw err;
+    },
+  );
   return funieLoad;
 }
 /** Run the network on the frame now in the source texture. */
