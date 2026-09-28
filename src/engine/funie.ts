@@ -32,42 +32,36 @@ async function webgpuUsable(): Promise<boolean> {
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/**
- * Import the runtime by URL, retrying with a cache-busting query: a mobile
- * connection can drop one request, and Chromium keeps a failed import()
- * failed for the life of the page.
- */
-async function importRuntime(url: string): Promise<Ort> {
+/** Runtime files per backend, in ort/<version>/ (vite.config.ts). */
+const RUNTIME: Record<Backend, { js: string; wasm: string }> = {
+  wasm: { js: 'ort.wasm.bundle.min.mjs', wasm: 'ort-wasm-simd-threaded.wasm' },
+  webgpu: { js: 'ort.webgpu.bundle.min.mjs', wasm: 'ort-wasm-simd-threaded.asyncify.wasm' },
+};
+
+/** Bytes received / expected (expected 0 while unknown, e.g. a compressed response). */
+export type Progress = (got: number, total: number) => void;
+
+/** fetch() with three tries and byte progress. */
+async function download(url: string, onBytes?: Progress): Promise<Uint8Array> {
   let last: unknown;
   for (let i = 0; i < 3; i++) {
     try {
-      return (await import(/* @vite-ignore */ i ? `${url}?retry=${i}-${Date.now()}` : url)) as Ort;
+      return await downloadOnce(url, onBytes);
     } catch (err) {
       last = err;
       await wait(600 * 2 ** i);
     }
   }
-  throw last;
+  throw new Error(`下載失敗 ${url.split('/').pop()}：${msg(last)}`);
 }
 
-async function download(url: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
-  let last: unknown;
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await downloadOnce(url, onProgress);
-    } catch (err) {
-      last = err;
-      await wait(600 * 2 ** i);
-    }
-  }
-  throw last;
-}
-
-async function downloadOnce(url: string, onProgress?: (f: number) => void): Promise<Uint8Array> {
-  const res = await fetch(url);
-  if (!res.ok || !res.body) throw new Error(`模型下載失敗（${res.status}）`);
-  const total = Number(res.headers.get('content-length')) || 0;
+async function downloadOnce(url: string, onBytes?: Progress): Promise<Uint8Array> {
+  const res = await fetch(url, { cache: 'no-cache' });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  // content-length is the compressed size when the server gzips
+  const total = res.headers.get('content-encoding') ? 0 : Number(res.headers.get('content-length')) || 0;
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let got = 0;
@@ -76,7 +70,7 @@ async function downloadOnce(url: string, onProgress?: (f: number) => void): Prom
     if (done) break;
     parts.push(value);
     got += value.length;
-    if (total) onProgress?.(Math.min(1, got / total));
+    onBytes?.(got, Math.max(total, got));
   }
   const out = new Uint8Array(got);
   let o = 0;
@@ -85,6 +79,35 @@ async function downloadOnce(url: string, onProgress?: (f: number) => void): Prom
     o += p.length;
   }
   return out;
+}
+
+/**
+ * The runtime module. Fetched with fetch() — the same path as the model — and
+ * imported from a Blob URL: on some phones a module import() of the file URL
+ * fails every time ("Failed to fetch dynamically imported module") while
+ * fetch() of the 14 MB model succeeds. The bundle supports a blob: base, and
+ * the .wasm is handed over as bytes (wasmBinary), so it never resolves a
+ * path. A direct import of the URL is the fallback.
+ */
+async function importRuntime(url: string): Promise<Ort> {
+  const errs: string[] = [];
+  try {
+    const src = await download(url);
+    const blob = URL.createObjectURL(new Blob([src as BlobPart], { type: 'text/javascript' }));
+    try {
+      return (await import(/* @vite-ignore */ blob)) as Ort;
+    } finally {
+      URL.revokeObjectURL(blob);
+    }
+  } catch (err) {
+    errs.push(`blob: ${msg(err)}`);
+  }
+  try {
+    return (await import(/* @vite-ignore */ `${url}?t=${Date.now()}`)) as Ort;
+  } catch (err) {
+    errs.push(`url: ${msg(err)}`);
+  }
+  throw new Error(`無法載入 AI 執行環境（${errs.join('；')}）· ${navigator.userAgent}`);
 }
 
 export class Funie {
@@ -100,26 +123,37 @@ export class Funie {
   /**
    * Load runtime + model. `modelUrl` is public/models/funie-gan.fp16.onnx and
    * `ortDir` the ort/<version>/ folder (vite.config.ts), both under the app base.
+   * `onProgress` gets the bytes of every download together.
    */
-  static async create(modelUrl: string, ortDir: string, onProgress?: (f: number) => void): Promise<Funie> {
-    const model = download(modelUrl, onProgress);
+  static async create(modelUrl: string, ortDir: string, onProgress?: Progress): Promise<Funie> {
+    const seen = new Map<string, [number, number]>();
+    const track = (key: string): Progress => (got, total) => {
+      seen.set(key, [got, total]);
+      let g = 0, t = 0;
+      for (const [a, b] of seen.values()) {
+        g += a;
+        t += b;
+      }
+      onProgress?.(g, t);
+    };
+    const model = download(modelUrl, track('model'));
     model.catch(() => {}); // awaited below; don't report it unhandled while the runtime loads
-    const setup = (ort: Ort) => {
-      ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-      return ort;
+    const start = async (b: Backend) => {
+      const [ort, wasm] = await Promise.all([importRuntime(ortDir + RUNTIME[b].js), download(ortDir + RUNTIME[b].wasm, track(b))]);
+      // threads would need COOP/COEP (not on GitHub Pages) and a file URL for the worker
+      ort.env.wasm.numThreads = 1;
+      ort.env.wasm.wasmBinary = wasm;
+      const session = await ort.InferenceSession.create(await model, { executionProviders: [b] });
+      return new Funie(ort, session, b);
     };
     if (await webgpuUsable()) {
       try {
-        const ort = setup(await importRuntime(`${ortDir}ort.webgpu.bundle.min.mjs`));
-        const session = await ort.InferenceSession.create(await model, { executionProviders: ['webgpu'] });
-        return new Funie(ort, session, 'webgpu');
+        return await start('webgpu');
       } catch (err) {
         console.warn('FUnIE-GAN: WebGPU unavailable, using WASM', err);
       }
     }
-    const ort = setup(await importRuntime(`${ortDir}ort.wasm.bundle.min.mjs`));
-    const session = await ort.InferenceSession.create(await model, { executionProviders: ['wasm'] });
-    return new Funie(ort, session, 'wasm');
+    return start('wasm');
   }
 
   /** Network input size for a w × h frame. */

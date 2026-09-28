@@ -469,8 +469,8 @@ function loadFunie(): Promise<Funie> {
   if (funieLoad) return funieLoad;
   aiMsg = '載入中…';
   syncAi();
-  funieLoad = Funie.create(MODEL_URL, ORT_DIR, (f) => {
-    aiMsg = `下載模型 ${Math.round(f * 100)}%…`;
+  funieLoad = Funie.create(MODEL_URL, ORT_DIR, (got, total) => {
+    aiMsg = `下載模型與執行環境 ${(got / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB…`;
     syncAi();
   }).then(
     (f) => {
@@ -480,7 +480,7 @@ function loadFunie(): Promise<Funie> {
     },
     (err) => {
       funieLoad = null;
-      aiMsg = `載入失敗（已自動重試 3 次）：${(err as Error).message} · 請確認網路後再按一次`;
+      aiMsg = `載入失敗：${(err as Error).message} · 請確認網路後再按一次`;
       syncAi();
       throw err;
     },
