@@ -331,6 +331,20 @@ export class Renderer {
         f.u.u_clarityLod,
         Math.max(0, Math.min(Math.log2(Math.max(this.pw, this.ph) / 48), Math.log2(Math.max(this.pw, this.ph)))),
       );
+      // borrowed-method profiles; all inert when their amount is 0
+      if (s.mixAmt > 0.0001) {
+        gl.uniformMatrix3fv(f.u.u_mixMat, false, toGLMat3(s.mixMat));
+        gl.uniform3fv(f.u.u_mixOff, s.mixOff);
+      }
+      gl.uniform1f(f.u.u_mixAmt, s.mixAmt);
+      if (s.pullAmt > 0.0001) gl.uniform4fv(f.u.u_pull, s.pull);
+      gl.uniform1f(f.u.u_pullAmt, s.pullAmt);
+      if (s.physAmt > 0.0001) {
+        gl.uniform3fv(f.u.u_physA, s.physA);
+        gl.uniform1f(f.u.u_physBack, s.physBack);
+      }
+      gl.uniform1f(f.u.u_physAmt, s.physAmt);
+      gl.uniform1f(f.u.u_physMaxGain, 3);
       gl.uniform3fv(f.u.u_gain, s.gain);
       gl.uniform1f(f.u.u_deCast, s.deCast);
       gl.uniform1f(f.u.u_sat, s.saturation);

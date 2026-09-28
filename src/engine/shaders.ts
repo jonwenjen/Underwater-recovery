@@ -148,6 +148,17 @@ uniform float u_hiThr, u_hiAmt;   // 光線去洋紅: sunlight above u_hiThr los
 uniform sampler2D u_look;         // user curves: 256×1, rgb = master(channel(x))
 uniform float u_lookOn, u_hslOn;
 uniform float u_hslC[8], u_hslH[8], u_hslS[8], u_hslL[8];
+// --- borrowed-method profiles (docs/sources.md) ---------------------
+// These run on the sRGB-encoded graded value, BEFORE the finishing chain,
+// because the methods they implement are defined in gamma space: running a
+// 3x3 colour matrix in linear light very nearly cancels itself out.
+uniform mat3 u_mixMat;         // 直方圖間隙矩陣 (bornfree / nikolajbech)
+uniform vec3 u_mixOff;
+uniform float u_mixAmt;
+uniform vec4 u_pull[3];        // 全自動-T77701: (mean, min, max, darkFraction)
+uniform float u_pullAmt;
+uniform vec3 u_physA;          // 全自動-warplab: per-channel attenuation
+uniform float u_physBack, u_physAmt, u_physMaxGain;
 uniform int u_mode;          // 0 result, 1 split, 2 original
 uniform float u_split;
 uniform int u_clip;          // highlight / shadow clipping overlay
@@ -241,6 +252,53 @@ vec3 applyHsl(vec3 e) {
   return toSrgb(fitLab(vec3(L2, C2 * cos(h2), C2 * sin(h2))));
 }
 
+// 直方圖間隙色彩矩陣 — src/engine/matrix.ts, applied per pixel in sRGB.
+// The upstream method computes gains with a 256 numerator and a 255 offset,
+// so the endpoints do not land exactly on 0/255; that deviation is kept.
+vec3 mixMatrix(vec3 e) {
+  vec3 c = u_mixMat * e + u_mixOff;
+  return clamp(mix(e, c, u_mixAmt), 0.0, 1.0);
+}
+
+// 全自動-T77701 — Fu et al. ISPACS 2017 Eq. 2, per channel.
+// Above 0.7 crushed pixels the channel is SHIFTED, which moves its mean and
+// leaves its spread alone; otherwise it is stretched about the mean and
+// re-anchored to 128. Doing the stretch on a destroyed channel is what
+// detonates shadow noise, so the branch is the whole point.
+float meanPull(float v, vec4 s) {
+  const float TARGET = 128.0 / 255.0;
+  float full;
+  if (s.w > 0.7) {
+    full = v - 0.4 * (s.x - TARGET);
+  } else {
+    float anchor = s.x <= TARGET ? s.y : s.z;   // min below 128, max above
+    float span = anchor - s.x;
+    float scale = abs(span) < 1e-5 ? 1.0 : (anchor - TARGET) / span;
+    full = (v - s.x) * scale + TARGET;
+  }
+  return mix(v, full, u_pullAmt);
+}
+
+// 全自動-warplab — Akkaynak-Treibitz formation model, solved in closed form:
+//   A = exp(-a_c z),  B = beta (1 - A),  J = (I - B) / A
+// The gain is clamped: exp(a_r * z) is unbounded, and a distant red channel
+// that is pure sensor noise must not be amplified 100x into magenta.
+// The gain is differential, anchored on green (u_physA.y == 0): green is left
+// alone and only the channels the water absorbed are lifted. Using the
+// absolute exp(a_c·z) gain instead makes red and green both hit the ceiling
+// and the red-to-green ratio — the entire point of the correction — is lost.
+vec3 physical(vec3 e) {
+  vec3 A = exp(-u_physA);
+  vec3 B = u_physBack * (1.0 - A);
+  // exp(0) = 1 for green by construction, so green passes through untouched.
+  vec3 g = clamp(exp(u_physA), vec3(0.0), vec3(u_physMaxGain));
+  // Never remove more than half of a channel: on a red-starved frame the
+  // backscatter term is larger than the red that survived, and an unguarded
+  // subtraction sends the channel to zero and the frame green.
+  vec3 b = min(B, e * 0.5);
+  return max(vec3(0.0), (e - b) * g);
+}
+
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
   p += dot(p, p + 45.32 + u_seed);
@@ -256,6 +314,10 @@ void main() {
     vec4 g = texture(u_graded, uv);
     vec3 e = g.rgb;
     float L = g.a;
+    // borrowed-method profiles, in gamma space, ahead of the finishing chain
+    if (u_mixAmt > 0.0001) e = mixMatrix(e);
+    if (u_pullAmt > 0.0001) e = vec3(meanPull(e.r, u_pull[0]), meanPull(e.g, u_pull[1]), meanPull(e.b, u_pull[2]));
+    if (u_physAmt > 0.0001) e = mix(e, physical(e), u_physAmt);
     // detail: amplify above threshold (sharpen), flatten below (denoise)
     float Lb = texture(u_blur, uv).r;
     float d = L - Lb;

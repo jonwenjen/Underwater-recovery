@@ -7,15 +7,18 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types test/engine.test.ts",
+    "test": "npm run typecheck && npm run test:engine && npm run test:methods && npm run test:legacy",
     "test:legacy": "node --experimental-strip-types test/pipeline.test.ts",
     "typecheck": "tsc -b && tsc -p tsconfig.test.json",
     "verify": "npm run build && node scripts/verify.mjs",
-    "bench:legacy": "node --experimental-strip-types bench/bench.ts"
+    "bench:legacy": "node --experimental-strip-types bench/bench.ts",
+    "test:methods": "node --experimental-strip-types test/methods.test.ts",
+    "test:engine": "node --experimental-strip-types test/engine.test.ts",
+    "profiles:real": "node scripts/real-photo-profiles.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
-    "playwright": "^1.56.1",
+    "playwright": "^1.63.0",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   },

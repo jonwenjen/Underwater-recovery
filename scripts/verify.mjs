@@ -652,6 +652,91 @@ try {
     `sharpen ${f3(grain.clean.sharpen)} (clean) vs ${f3(grain.noisy.sharpen)} (grainy)`);
 
   /* ============================================================ video */
+  console.log('\n— imported profiles: 全自動-bornfree / nikolajbech / T77701 / warplab');
+  {
+    // All the measuring happens in the page; the assertions happen out here.
+    const prof = await page.evaluate(async () => {
+      const U = window.__uw;
+      const S = window.__scene;
+      const mean = (o) => { let r=0,g=0,b=0,n=0; for (let i=0;i<o.px.length;i+=4){r+=o.px[i];g+=o.px[i+1];b+=o.px[i+2];n++;} return [r/n,g/n,b/n]; };
+      const W = 900, H = 600;
+      const t = S.truth(W, H);
+      await U.addFiles([await S.toFile(S.degrade(t, 'blue', 9), W, H, 'profiles.png')]);
+      U.setView({ mode: 0 });
+      U.preset('auto');
+      const base = mean(U.outputPixels());
+
+      const seen = {};
+      const params = {};
+      for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
+        U.preset(name);
+        U.render();
+        seen[name] = mean(U.outputPixels());
+        params[name] = JSON.parse(JSON.stringify(U.state().params));
+      }
+      // do they reset rather than accumulate?
+      U.preset('全自動-nikolajbech'); U.render();
+      const once = mean(U.outputPixels());
+      U.preset('全自動-bornfree'); U.render();
+      U.preset('全自動-T77701'); U.render();
+      U.preset('全自動-warplab'); U.render();
+      U.preset('全自動-nikolajbech'); U.render();
+      const twice = mean(U.outputPixels());
+      // keep a picture of each profile so the numbers can be eyeballed
+      for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
+        U.preset(name); U.render();
+        const cv = document.querySelector('canvas');
+        const o = JSON.parse(JSON.stringify(U.outputPixels()));
+        const tmp = document.createElement('canvas'); tmp.width = o.w; tmp.height = o.h;
+        const id = tmp.getContext('2d').createImageData(o.w, o.h);
+        id.data.set(new Uint8ClampedArray(o.px));
+        tmp.getContext('2d').putImageData(id, 0, 0);
+        window.__profileShots = window.__profileShots || {};
+        window.__profileShots[name] = tmp.toDataURL('image/png');
+        void cv;
+      }
+      const shots = window.__profileShots || {};
+      // hand the app back in a neutral state, or the video checks that follow
+      // inherit whichever profile was screenshotted last
+      U.preset('auto');
+      U.render();
+      return { base, seen, params, once, twice, shots };
+    });
+    for (const [k, url] of Object.entries(prof.shots ?? {}))
+      writeFileSync(join(OUT, `profile-${k}.png`), Buffer.from(String(url).split(',')[1], 'base64'));
+
+    const d = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+    console.log(`  auto  r=${f1(prof.base[0])} g=${f1(prof.base[1])} b=${f1(prof.base[2])}`);
+    for (const name of ['全自動-bornfree', '全自動-nikolajbech', '全自動-T77701', '全自動-warplab']) {
+      const m = prof.seen[name];
+      check(`${name} is wired and changes the image`, d(m, prof.base) > 0.8,
+        `r=${f1(m[0])} g=${f1(m[1])} b=${f1(m[2])} (Δ${f1(d(m, prof.base))})`);
+    }
+    // The matrix profiles exist to lift a red-starved frame; if they do not,
+    // they are wired to nothing.
+    for (const name of ['全自動-bornfree', '全自動-nikolajbech']) {
+      check(`${name} recovers red over the source`, prof.seen[name][0] > prof.base[0],
+        `${f1(prof.base[0])} → ${f1(prof.seen[name][0])}`);
+    }
+    // The two differ only in the sparse-bin threshold, which is the whole
+    // reason both presets exist; identical output would make it decorative.
+    check('bornfree and nikolajbech differ (different analysis grid)',
+      d(prof.seen['全自動-bornfree'], prof.seen['全自動-nikolajbech']) > 0.05,
+      `Δ${f3(d(prof.seen['全自動-bornfree'], prof.seen['全自動-nikolajbech']))}`);
+    // T77701 pulls channel means toward 128, so at least one channel must move.
+    check('全自動-T77701 moves the channel means',
+      d(prof.seen['全自動-T77701'], prof.base) > 0.5, `Δ${f1(d(prof.seen['全自動-T77701'], prof.base))}`);
+    // Switching profiles must reset, not accumulate.
+    const drift = d(prof.once, prof.twice);
+    check('profiles do not stack when switched', drift < 0.6, `drift ${f3(drift)}`);
+    // Only one profile may be armed at a time.
+    check('each preset arms exactly one profile', Object.values(prof.params).every((p) => {
+      const on = [p.matrixMix > 0, p.meanPull > 0, p.physicalMix > 0].filter(Boolean).length;
+      return on === 1;
+    }), JSON.stringify(Object.fromEntries(Object.entries(prof.params).map(([k, v]) =>
+      [k, `m${v.matrixMix}/p${v.meanPull}/ph${v.physicalMix}/g${v.matrixGrid}`]))));
+  }
+
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');
   const clip = await page.evaluate(async () => {
     const S = window.__scene;

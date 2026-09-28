@@ -43,6 +43,9 @@ import { boxMean, guidedCoefficients, minFilter, quantiles } from './filters.ts'
 import { buildClahe, buildCurve, sampleClahe, sampleCurve } from './luts.ts';
 import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetect } from './light.ts';
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
+import { analyzeColorMatrix } from './matrix.ts';
+import { analyzeMeanPull } from './twostep.ts';
+import { JERLOV } from './physical.ts';
 
 /**
  * Long edge of the analysis frame. Every map computed from it is low-frequency
@@ -125,6 +128,17 @@ export interface FrameState {
   surface: { ax: number; ay: number; bx: number; by: number; hl: number; tone: number; warm: number };
   /** 光線去洋紅: highlights above `thr` (output luma) lose magenta by `amount`. */
   neutral: { thr: number; amount: number };
+  /** 全自動-bornfree / 全自動-nikolajbech: the 3x3 sRGB matrix and offset. */
+  mixMat: Mat3;
+  mixOff: Vec3;
+  mixAmt: number;
+  /** 全自動-T77701: per channel (mean, min, max, darkFraction), 0..1 units. */
+  pull: Float32Array;
+  pullAmt: number;
+  /** 全自動-warplab: per-channel attenuation (1/m) and the backscatter scale. */
+  physA: Vec3;
+  physBack: number;
+  physAmt: number;
   /** Values actually applied for every auto key (for the UI). */
   effective: Record<AutoKey, number>;
   stats: FrameStats;
@@ -654,9 +668,75 @@ export class AutoEngine {
     const threshold = E('threshold', clamp(0.012 + (2.2 * sigma) / 255, 0.015, 0.08));
     const sharpen = E('sharpen', 0.35 * (1 - 0.7 * smoothstep(3, 10, sigma)));
 
+    // Borrowed-method profiles. Skipped entirely unless a preset turned one
+    // on, so the default pipeline costs nothing extra.
+    let mixMat: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    let mixOff: Vec3 = [0, 0, 0];
+    let pull: Float32Array = new Float32Array(12);
+    let physA: Vec3 = [0, 0, 0];
+    let physBack = 0;
+    let physMix = 0;
+    if (p.matrixMix > 0.0001) {
+      // bornfree analyses a fixed 256x256; nikolajbech uses the frame it is
+      // correcting. `rgba` here is the engine's analysis thumbnail, so the
+      // "full" mode analyses that thumbnail rather than the full-resolution
+      // frame — see docs/sources.md; the two differ only in the sparse
+      // threshold, which is why the profiles do not produce identical output.
+      const cm = analyzeColorMatrix(rgba as Uint8ClampedArray, w, h, {
+        analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full',
+        hueLimit: p.matrixHue,
+      });
+      mixMat = cm.m;
+      mixOff = cm.off;
+    }
+    if (p.meanPull > 0.0001) {
+      const mp = analyzeMeanPull(rgba as Uint8ClampedArray, w, h);
+      for (let c = 0; c < 3; c++) {
+        pull[c * 4] = mp.stats[c].mean / 255;
+        pull[c * 4 + 1] = mp.stats[c].min / 255;
+        pull[c * 4 + 2] = mp.stats[c].max / 255;
+        pull[c * 4 + 3] = mp.dark[c];
+      }
+    }
+    if (p.physicalMix > 0.0001) {
+      // The physical model is for water that has actually eaten the red. On a
+      // shallow frame that still has plenty of red it removes the blue and
+      // leaves a golden cast, so the strength follows the measurement: a frame
+      // whose mean red is close to its mean green is not corrected at all.
+      let mr = 0;
+      let mg = 0;
+      let mn = 0;
+      for (let i = 0; i < rgba.length; i += 4) {
+        if (rgba[i + 3] === 0) continue;
+        mr += rgba[i];
+        mg += rgba[i + 1];
+        mn++;
+      }
+      const starvation = mn ? clamp(1 - mr / Math.max(1, mg), 0, 1) : 0;
+      const amt = p.physicalMix * smoothstep(0.12, 0.55, starvation);
+      if (amt > 0.0001) {
+        const wt = water === 'green' ? JERLOV.green : water === 'blue' ? JERLOV.blue : JERLOV.coastal;
+        const haz = clamp(hazeAct, 0, 1);
+        // Metres of water, scaled by measured haze, the user's depth slider,
+        // and how much red the frame has actually lost.
+        const depth = 12 * haz * clamp(p.physicalDepth, 0, 1) * starvation;
+        // Differential, anchored on green: see physicalRestoreRGB. Blue is
+        // deliberately left at 1.0 — reducing it as well is what turns the
+        // frame into a golden fog, because the blue that survives in an
+        // underwater photo is scattered light, not an attenuated signal. The
+        // job here is to put back what the water ate, not to strip what it
+        // did not.
+        physA = [Math.max(0, wt.ar - wt.ag) * depth, 0, 0];
+        physBack = 0.08 * haz;
+        physMix = amt;
+      }
+    }
+
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
     return {
+      mixMat, mixOff, mixAmt: p.matrixMix, pull, pullAmt: p.meanPull,
+      physA, physBack, physAmt: physMix,
       aR, aB, dR, dB,
       A, Aout, post, k, dehazeOn, coef, coefW: w, coefH: h,
       wb, expMul,

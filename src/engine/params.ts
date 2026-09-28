@@ -60,6 +60,21 @@ export interface Params {
   surfBy: number;
   // tracking
   response: number;
+  // --- borrowed-method profiles (docs/sources.md) ---------------------
+  // All four default to 0, i.e. inert. Each preset turns on exactly one and
+  // zeroes the rest, so switching profiles cannot stack two corrections.
+  /** 全自動-bornfree / 全自動-nikolajbech: strength of the 3x3 sRGB matrix. */
+  matrixMix: number;
+  /** 0 = analyse the full frame (nikolajbech), 1 = a fixed 256x256 (bornfree). */
+  matrixGrid: number;
+  /** 全自動-T77701: strength of the Fu et al. Eq. 1/2 per-channel mean pull. */
+  meanPull: number;
+  /** 上限 for the hue-shift search, degrees (published limit is 121). */
+  matrixHue: number;
+  /** 全自動-warplab: strength of the depth-guided physical restoration. */
+  physicalMix: number;
+  /** How much of the physical gain is driven by the dark-channel pseudo-depth. */
+  physicalDepth: number;
 }
 
 export type NumKey = Exclude<keyof Params, 'auto'>;
@@ -139,6 +154,12 @@ export const DEFAULT_PARAMS: Params = {
   surfBx: 0.5,
   surfBy: 0.3,
   response: 1.2,
+  matrixMix: 0,
+  matrixGrid: 0,
+  matrixHue: 121,
+  meanPull: 0,
+  physicalMix: 0,
+  physicalDepth: 0.6,
 };
 
 export interface SliderDef {
@@ -155,6 +176,17 @@ export interface Group {
 }
 
 export const GROUPS: Group[] = [
+  {
+    title: '外部演算法（全自動 profiles）',
+    sliders: [
+      { key: 'matrixMix', label: '直方圖間隙矩陣', min: 0, max: 1, step: 0.01, hint: 'bornfree / nikolajbech：以最寬直方圖空隙定黑點白點，再套 3×3 sRGB 色彩矩陣' },
+      { key: 'matrixHue', label: '色相位移上限', min: 0, max: 121, step: 1, hint: '綠轉紅的上限（度）。原法為 121；調低可避免重度偏紅的畫面被推成洋紅' },
+      { key: 'matrixGrid', label: '分析取樣', min: 0, max: 1, step: 1, hint: '0 ＝分析整張原圖（nikolajbech）；1 ＝固定 256×256 取樣（bornfree，門檻不隨解析度變動，影片較穩）' },
+      { key: 'meanPull', label: '兩段式色調拉抬', min: 0, max: 1, step: 0.01, hint: 'Fu 等 ISPACS 2017 Eq.2：通道均值拉回 128；通道被壓到全黑時改平移、不拉伸，避免雜訊爆開' },
+      { key: 'physicalMix', label: '深度導向物理還原', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz 成像模型：先扣後向散射再除以衰減，還原被水吸收的紅色' },
+      { key: 'physicalDepth', label: '虛擬深度', min: 0, max: 1, step: 0.01, hint: '以暗通道推估每個像素的距離：0 全畫同距離、1 完全依距離（遠景補得多）' },
+    ],
+  },
   {
     title: '水體校正',
     sliders: [
@@ -247,7 +279,65 @@ const RAW: Partial<Record<NumKey, number>> = {
   beams: 0, surfaceHL: 0, surfaceTone: 0, surfaceWarm: 0, lightNeutral: 0,
 };
 
+/**
+ * The four "全自動-<source>" profiles, imported from outside projects.
+ *
+ * Each one turns its own method on and zeroes the other three, then leaves
+ * the rest of the engine on its normal auto values. They are not tuned to
+ * look a certain way — they reproduce what the cited method does, and the
+ * "raw" flag tells the UI not to apply the engine's finishing pass on top,
+ * because stacking a look on top of a fixed 3x3 correction changes it.
+ *
+ * Provenance and licensing are recorded in docs/sources.md. In short: all four
+ * upstream projects are copyleft or unlicensed, and this repository is MIT, so
+ * none of their code was copied — each method is reimplemented from its
+ * published description.
+ */
+const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0 } as const;
+
 export const PRESETS: Record<string, Preset> = {
+  '全自動-bornfree': {
+    label: '全自動-bornfree',
+    hint: '直方圖間隙色彩矩陣，固定 256×256 取樣（解析度無關、影片穩定）',
+    set: {
+      ...BORROWED_PROFILES,
+      // A 全自動 profile differs from 全自動 *only* by the imported method.
+      // Locking anything else just reproduces some other look and hides what
+      // the method actually does. The one thing that must change is the
+      // engine's own red restoration: the matrix does that job, and running
+      // both double-counts it.
+      matrixMix: 0.85, matrixGrid: 1, matrixHue: 60, redComp: 0,
+    },
+  },
+  '全自動-nikolajbech': {
+    label: '全自動-nikolajbech',
+    hint: '同一套直方圖間隙矩陣，但依原版在「整張原圖」上統計（門檻隨解析度變動）',
+    set: {
+      ...BORROWED_PROFILES,
+      matrixMix: 0.85, matrixGrid: 0, matrixHue: 60, redComp: 0,
+    },
+  },
+  '全自動-T77701': {
+    label: '全自動-T77701',
+    hint: 'Fu 等 ISPACS 2017 兩段式：通道均值拉回 128，被壓毀的通道改平移不拉伸',
+    set: {
+      ...BORROWED_PROFILES,
+      // Eq. 2 pulls every channel mean to 128; at full strength a frame whose
+      // means sit well below that is stretched hard and ends up warm.
+      meanPull: 0.7, redComp: 0,
+    },
+  },
+  '全自動-warplab': {
+    label: '全自動-warplab',
+    hint: 'Akkaynak–Treibitz 物理模型：扣後向散射、再除以距離衰減，還原深水紅色',
+    set: {
+      ...BORROWED_PROFILES,
+      // Depth scale 0.45, not 1: the differential red gain hits its 3×
+      // ceiling well before the slider's maximum, and on a shallow frame a
+      // full-strength correction lands visibly warm. The slider is there.
+      physicalMix: 1, physicalDepth: 0.45, redComp: 0,
+    },
+  },
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
   raw: { label: '原始', hint: '所有校正歸零、顯示原圖，從這裡手動調整（曲線／HSL 也重設）', set: RAW, raw: true },
   // Values from scripts/optimize.ts: each preset searched on the ground-truth
