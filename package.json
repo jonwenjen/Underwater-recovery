@@ -14,7 +14,9 @@
     "bench:legacy": "node --experimental-strip-types bench/bench.ts",
     "test:methods": "node --experimental-strip-types test/methods.test.ts",
     "test:engine": "node --experimental-strip-types test/engine.test.ts",
-    "profiles:real": "node scripts/real-photo-profiles.mjs"
+    "profiles:real": "node scripts/real-photo-profiles.mjs",
+    "profiles:bench": "node scripts/bench-profiles.mjs",
+    "fetch:zip": "node scripts/fetch-drive-zip.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",

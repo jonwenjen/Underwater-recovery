@@ -129,28 +129,49 @@ description; algorithms are not copyrightable, only their expression is.
 
 ---
 
-## Measured behaviour, and the limits of each profile
+## Measured behaviour on UIEB, and the cast budget
 
-On a real shallow-water photograph (divers, bait ball, strobed; source mean
-`r=106 g=108 b=87`, blue-cast −19.8), rendering the whole engine plus the
-imported method:
+Scored on 10 UIEB images with ground-truth references
+(`npm run profiles:bench`), reporting colour-cast error against truth and
+cast drift away from the engine's own 全自動 result.
 
-| Profile | mean r,g,b | blue-cast | verdict |
-|---|---|---|---|
-| 全自動-bornfree | 114, 119, 112 | −4.5 | balanced |
-| 全自動-nikolajbech | 117, 119, 112 | −5.9 | balanced |
-| 全自動-T77701 | 185, 140, 113 | −49.5 | visibly warm |
-| 全自動-warplab | 162, 104, 85 | −47.9 | visibly warm |
+**At full strength, all four were far worse than the engine's own auto result:**
 
-The two matrix profiles behave. The other two land warm on **this** photo, and
-the reason is the photo rather than the implementations: both are red-restoring
-methods aimed at water that has genuinely absorbed red, and a shallow strobed
-frame is not that. The engine's own auto pipeline restores red gently and a
-frame like this is already close, so a method that adds a deliberate red lift
-tips it over. On a deeper, unlit frame they are the ones doing the needed work.
+| Profile | cast error vs truth | drift from 全自動 |
+|---|---|---|
+| 全自動 (engine) | 14.1 | — |
+| 全自動-bornfree | 36.9 | 31.3 |
+| 全自動-nikolajbech | 36.9 | 31.5 |
+| 全自動-T77701 | 39.3 | 27.2 |
+| 全自動-warplab | 45.3 | 37.9 |
 
-Both ship with their strength below maximum for the same reason
-(`meanPull` 0.7, `physicalDepth` 0.45) and both are exposed as sliders.
+Re-enabling the engine's own `redComp` alongside them changed nothing
+(36.9 → 37.1), so this was **not** double-counting: the methods simply pull in
+a direction the engine's measured pipeline does not. Undisciplined, all four
+turn every image warm — which is exactly what was reported.
+
+**The fix is a budget, not a fudge factor.** Each frame the engine measures
+the colour cast the method would introduce and scales the profile back until
+that shift fits inside `MAX_CAST_DRIFT` (1.5). The measurement is taken on a
+grey-world-normalised copy of the analysis buffer, because the method is
+applied to the already-de-blued graded output — measuring against the raw
+frame under-reports the shift by roughly an order of magnitude, since on a
+still-blue frame the red lift and blue subtraction cancel in the cast metric.
+
+| Profile | cast error vs truth | drift from 全自動 |
+|---|---|---|
+| 全自動 (engine) | 14.1 | — |
+| 全自動-bornfree | 16.3 | 4.4 |
+| 全自動-nikolajbech | 16.4 | 4.6 |
+| 全自動-T77701 | 16.0 | 2.1 |
+| 全自動-warplab | 14.1 | 0.0 |
+
+They keep their tonal and structural work and lose the ability to hijack the
+white balance. `全自動-warplab` collapses to a no-op on these frames, and that
+is honest rather than a bug: the physical model is gated on measured red
+starvation, and on UIEB — where the engine's auto pipeline has already put the
+red back — there is nothing left for it to restore. On a deeper, unlit frame it
+does act.
 
 ### Guards added, and why each exists
 
@@ -172,9 +193,8 @@ These are deviations from the published methods, all deliberate:
 - **Backscatter capped at half a channel.** Subtracting the full backscatter
   term from a red-starved channel removes more than is there and sends it to
   zero.
-- **`physicalMix` scales with measured red starvation.** On a frame that still
-  has red, the physical model should do nothing, and as a "全自動" profile it
-  now does.
+- **`physicalMix` scales with measured red starvation**, and the whole profile
+  is then bounded by the cast budget above.
 
 ## Deliberate omissions
 

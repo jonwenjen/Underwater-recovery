@@ -306,7 +306,7 @@ export const PRESETS: Record<string, Preset> = {
       // the method actually does. The one thing that must change is the
       // engine's own red restoration: the matrix does that job, and running
       // both double-counts it.
-      matrixMix: 0.85, matrixGrid: 1, matrixHue: 60, redComp: 0,
+      matrixMix: 0.85, matrixGrid: 1, matrixHue: 60,
     },
   },
   '全自動-nikolajbech': {
@@ -314,7 +314,7 @@ export const PRESETS: Record<string, Preset> = {
     hint: '同一套直方圖間隙矩陣，但依原版在「整張原圖」上統計（門檻隨解析度變動）',
     set: {
       ...BORROWED_PROFILES,
-      matrixMix: 0.85, matrixGrid: 0, matrixHue: 60, redComp: 0,
+      matrixMix: 0.85, matrixGrid: 0, matrixHue: 60,
     },
   },
   '全自動-T77701': {
@@ -324,7 +324,7 @@ export const PRESETS: Record<string, Preset> = {
       ...BORROWED_PROFILES,
       // Eq. 2 pulls every channel mean to 128; at full strength a frame whose
       // means sit well below that is stretched hard and ends up warm.
-      meanPull: 0.7, redComp: 0,
+      meanPull: 0.7,
     },
   },
   '全自動-warplab': {
@@ -335,7 +335,7 @@ export const PRESETS: Record<string, Preset> = {
       // Depth scale 0.45, not 1: the differential red gain hits its 3×
       // ceiling well before the slider's maximum, and on a shallow frame a
       // full-strength correction lands visibly warm. The slider is there.
-      physicalMix: 1, physicalDepth: 0.45, redComp: 0,
+      physicalMix: 1, physicalDepth: 0.45,
     },
   },
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },

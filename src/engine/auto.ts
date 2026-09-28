@@ -44,7 +44,7 @@ import { buildClahe, buildCurve, sampleClahe, sampleCurve } from './luts.ts';
 import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetect } from './light.ts';
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 import { analyzeColorMatrix } from './matrix.ts';
-import { analyzeMeanPull } from './twostep.ts';
+import { analyzeMeanPull, meanPull } from './twostep.ts';
 import { JERLOV } from './physical.ts';
 
 /**
@@ -167,6 +167,21 @@ export interface Pick {
   uv: [number, number];
   post: Vec3 | null;
 }
+
+
+/**
+ * Colour cast of an RGB buffer, on the same scale the bench uses:
+ * positive is blue, negative is warm. This is the quantity the four imported
+ * methods have to stop being allowed to dominate.
+ */
+function castOf(rgb: Float32Array, n: number): number {
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < n; i++) { r += rgb[i * 3]; g += rgb[i * 3 + 1]; b += rgb[i * 3 + 2]; }
+  return b / n - (r / n + g / n) / 2;
+}
+
+/** Upper bound on how far an imported method may move the colour cast. */
+export const MAX_CAST_DRIFT = 1.5;
 
 export interface StepOptions {
   params: Params;
@@ -672,70 +687,107 @@ export class AutoEngine {
     // on, so the default pipeline costs nothing extra.
     let mixMat: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
     let mixOff: Vec3 = [0, 0, 0];
+    let mixAmt = 0;
+    let pullAmt = 0;
     let pull: Float32Array = new Float32Array(12);
     let physA: Vec3 = [0, 0, 0];
     let physBack = 0;
     let physMix = 0;
-    if (p.matrixMix > 0.0001) {
-      // bornfree analyses a fixed 256x256; nikolajbech uses the frame it is
-      // correcting. `rgba` here is the engine's analysis thumbnail, so the
-      // "full" mode analyses that thumbnail rather than the full-resolution
-      // frame — see docs/sources.md; the two differ only in the sparse
-      // threshold, which is why the profiles do not produce identical output.
-      const cm = analyzeColorMatrix(rgba as Uint8ClampedArray, w, h, {
-        analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full',
-        hueLimit: p.matrixHue,
-      });
-      mixMat = cm.m;
-      mixOff = cm.off;
-    }
-    if (p.meanPull > 0.0001) {
-      const mp = analyzeMeanPull(rgba as Uint8ClampedArray, w, h);
+    // Imported profiles are bounded by the colour they are allowed to move.
+    //
+    // Measured on UIEB with ground-truth references, the four methods at full
+    // strength land 27-40 units of cast away from the engine's own auto
+    // result, and are 2.5-3x worse against truth. Re-enabling the engine's
+    // own redComp alongside them changed nothing (36.9 -> 37.1), so this is
+    // not double-counting: the methods simply pull somewhere the engine's
+    // measured pipeline does not. So rather than trust them with the colour
+    // balance, each one is scaled back until the cast it induces fits inside
+    // MAX_CAST_DRIFT. They keep their tonal and structural work and lose
+    // their ability to hijack the white balance.
+    if (p.matrixMix > 0.0001 || p.meanPull > 0.0001 || p.physicalMix > 0.0001) {
+      const n = Math.max(1, w * h);
+      // 0..255 throughout: the matrix offset is scaled by 255 at apply time,
+      // so measuring in normalised units saturates every pixel to white and
+      // the cast reads a flat zero.
+      const src = new Float32Array(n * 3);
+      for (let i = 0, j = 0; i < n; i++, j += 3) {
+        src[j] = rgba[j]; src[j + 1] = rgba[j + 1]; src[j + 2] = rgba[j + 2];
+      }
+      // Measure in the domain the method actually runs in. The method is
+      // applied to the engine's GRADED output, which has already had the water
+      // cast removed. Measuring against the raw frame under-reports the shift
+      // by roughly an order of magnitude, because on a still-blue frame the
+      // matrix's red lift and blue subtraction largely cancel in the cast
+      // metric — and it is the de-blued frame that goes warm. Grey-world
+      // normalising the buffer puts the measurement in that domain.
       for (let c = 0; c < 3; c++) {
-        pull[c * 4] = mp.stats[c].mean / 255;
-        pull[c * 4 + 1] = mp.stats[c].min / 255;
-        pull[c * 4 + 2] = mp.stats[c].max / 255;
-        pull[c * 4 + 3] = mp.dark[c];
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += src[i * 3 + c];
+        const m = sum / n;
+        if (m > 1e-4) for (let i = 0; i < n; i++) src[i * 3 + c] = Math.min(255, src[i * 3 + c] * (127.5 / m));
       }
-    }
-    if (p.physicalMix > 0.0001) {
-      // The physical model is for water that has actually eaten the red. On a
-      // shallow frame that still has plenty of red it removes the blue and
-      // leaves a golden cast, so the strength follows the measurement: a frame
-      // whose mean red is close to its mean green is not corrected at all.
-      let mr = 0;
-      let mg = 0;
-      let mn = 0;
-      for (let i = 0; i < rgba.length; i += 4) {
-        if (rgba[i + 3] === 0) continue;
-        mr += rgba[i];
-        mg += rgba[i + 1];
-        mn++;
+      const before = castOf(src, n);
+      const trial = Float32Array.from(src);
+      if (p.matrixMix > 0.0001) {
+        const cm = analyzeColorMatrix(rgba as Uint8ClampedArray, w, h, {
+          analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full',
+          hueLimit: p.matrixHue,
+        });
+        mixMat = cm.m;
+        mixOff = cm.off;
+        for (let i = 0; i < n; i++) {
+          const r = src[i * 3], g = src[i * 3 + 1], b = src[i * 3 + 2];
+          const m = cm.m;
+          trial[i * 3] = clamp(m[0] * r + m[1] * g + m[2] * b + cm.off[0] * 255, 0, 255);
+          trial[i * 3 + 1] = clamp(m[3] * r + m[4] * g + m[5] * b + cm.off[1] * 255, 0, 255);
+          trial[i * 3 + 2] = clamp(m[6] * r + m[7] * g + m[8] * b + cm.off[2] * 255, 0, 255);
+        }
       }
-      const starvation = mn ? clamp(1 - mr / Math.max(1, mg), 0, 1) : 0;
-      const amt = p.physicalMix * smoothstep(0.12, 0.55, starvation);
-      if (amt > 0.0001) {
+      if (p.meanPull > 0.0001) {
+        const mp = analyzeMeanPull(rgba as Uint8ClampedArray, w, h);
+        for (let c = 0; c < 3; c++) {
+          pull[c * 4] = mp.stats[c].mean / 255;
+          pull[c * 4 + 1] = mp.stats[c].min / 255;
+          pull[c * 4 + 2] = mp.stats[c].max / 255;
+          pull[c * 4 + 3] = mp.dark[c];
+        }
+        for (let i = 0; i < n; i++) {
+          for (let c = 0; c < 3; c++) {
+            const st = { mean: pull[c * 4] * 255, min: pull[c * 4 + 1] * 255, max: pull[c * 4 + 2] * 255 };
+            trial[i * 3 + c] = meanPull(trial[i * 3 + c], st, pull[c * 4 + 3], 1);
+          }
+        }
+      }
+      if (p.physicalMix > 0.0001) {
+        let mr = 0, mg = 0, mn2 = 0;
+        for (let i = 0; i < n; i++) { mr += src[i * 3]; mg += src[i * 3 + 1]; mn2++; }
+        const starvation = mn2 ? clamp(1 - mr / Math.max(1, mg), 0, 1) : 0;
         const wt = water === 'green' ? JERLOV.green : water === 'blue' ? JERLOV.blue : JERLOV.coastal;
         const haz = clamp(hazeAct, 0, 1);
-        // Metres of water, scaled by measured haze, the user's depth slider,
-        // and how much red the frame has actually lost.
         const depth = 12 * haz * clamp(p.physicalDepth, 0, 1) * starvation;
-        // Differential, anchored on green: see physicalRestoreRGB. Blue is
-        // deliberately left at 1.0 — reducing it as well is what turns the
-        // frame into a golden fog, because the blue that survives in an
-        // underwater photo is scattered light, not an attenuated signal. The
-        // job here is to put back what the water ate, not to strip what it
-        // did not.
         physA = [Math.max(0, wt.ar - wt.ag) * depth, 0, 0];
         physBack = 0.08 * haz;
-        physMix = amt;
+        physMix = p.physicalMix * smoothstep(0.12, 0.55, starvation);
+        if (physMix > 0.0001) {
+          for (let i = 0; i < n; i++) {
+            const gain = clamp(Math.exp(physA[0]), 1, 3);
+            const bsub = Math.min(physBack * wt.beta * (1 - Math.exp(-wt.ar * depth)), trial[i * 3] * 0.5);
+            trial[i * 3] = Math.max(0, trial[i * 3] - bsub) * gain;
+          }
+        }
       }
+      // Scale the whole profile back until its cast shift fits the budget.
+      const shift = Math.abs(castOf(trial, n) - before);
+      const k = shift > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / shift : 1;
+      mixAmt = p.matrixMix * k;
+      pullAmt = p.meanPull * k;
+      physMix *= k;
     }
 
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
     return {
-      mixMat, mixOff, mixAmt: p.matrixMix, pull, pullAmt: p.meanPull,
+      mixMat, mixOff, mixAmt, pull, pullAmt,
       physA, physBack, physAmt: physMix,
       aR, aB, dR, dB,
       A, Aout, post, k, dehazeOn, coef, coefW: w, coefH: h,

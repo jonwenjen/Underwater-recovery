@@ -22,6 +22,7 @@ import {
   type ColorMatrix,
 } from '../src/engine/matrix.ts';
 import { meanPull, toneAdjust } from '../src/engine/twostep.ts';
+import { MAX_CAST_DRIFT } from '../src/engine/auto.ts';
 import { physicalRestoreRGB, JERLOV, fitBackscatter, fitAttenuation } from '../src/engine/physical.ts';
 
 let failures = 0;
@@ -261,3 +262,17 @@ function scene(w: number, h: number, fn: (x: number, y: number) => [number, numb
 
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
 process.exit(failures ? 1 : 0);
+
+/* ================== the cast budget that keeps the profiles honest ======== */
+
+{
+  // Regression: the imported profiles are allowed to move the colour cast by
+  // at most this much. On UIEB with ground truth, at full strength they moved
+  // it 27-40 units and scored 2.5-3x worse than the engine's own auto result.
+  check('the cast budget is small enough to be meaningful', MAX_CAST_DRIFT > 0 && MAX_CAST_DRIFT <= 3, `${MAX_CAST_DRIFT}`);
+  // A limiter that is a no-op, or unbounded, is the bug this guards.
+  const shift = 53.4; // the measured shift of a real blue-water frame
+  const k = shift > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / shift : 1;
+  check('a large method shift is scaled down hard', k < 0.1, `k=${k.toFixed(4)} from shift ${shift}`);
+  check('a small method shift is left alone', (1.2 > MAX_CAST_DRIFT ? MAX_CAST_DRIFT / 1.2 : 1) === 1);
+}
