@@ -11,6 +11,7 @@
 import { ANALYSIS_EDGE, AutoEngine, DEHAZE_CHROMA, T0, type FrameState, type StepOptions } from './auto.ts';
 import { toGLMat3 } from './color.ts';
 import { MAX_GAIN } from './physical.ts';
+import { LWB_GRID } from './pipeline.ts';
 import { destroy, program, target, texture, type GL, type Program, type Target, type Tex } from './gl.ts';
 import { CLAHE_BINS, CURVE_N } from './luts.ts';
 import { buildCurveLut, HSL_CENTERS, identityLook, isIdentityCurves, isIdentityHsl, LOOK_N, type Look } from './look.ts';
@@ -48,6 +49,9 @@ export class Renderer {
   private blurA: Target | null = null;
   private blurB: Target | null = null;
   private coef: Tex | null = null;
+  /** 自動化流程 maps: analysis-res aux (depth coef, fusion weights), local WB grid. */
+  private aux: Tex | null = null;
+  private lwb: Tex | null = null;
   private lut: Tex | null = null;
   private curve: Tex;
   private pre: Target | null = null;
@@ -234,6 +238,22 @@ export class Renderer {
     }
     gl.bindTexture(gl.TEXTURE_2D, this.curve.tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, CURVE_N, 1, 0, gl.RED, gl.FLOAT, s.curve);
+    if (!this.aux || this.aux.w !== s.coefW || this.aux.h !== s.coefH) {
+      destroy(gl, this.aux);
+      this.aux = texture(gl, s.coefW, s.coefH, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.aux.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, s.coefW, s.coefH, 0, gl.RGBA, gl.FLOAT, s.aux);
+    if (!this.lwb) this.lwb = texture(gl, LWB_GRID, LWB_GRID, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    const g4 = new Float32Array(LWB_GRID * LWB_GRID * 4);
+    for (let k = 0; k < LWB_GRID * LWB_GRID; k++) {
+      g4[k * 4] = s.lwb.gains[k * 3];
+      g4[k * 4 + 1] = s.lwb.gains[k * 3 + 1];
+      g4[k * 4 + 2] = s.lwb.gains[k * 3 + 2];
+      g4[k * 4 + 3] = 1;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.lwb.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, LWB_GRID, LWB_GRID, 0, gl.RGBA, gl.FLOAT, g4);
   }
 
   /** Full-resolution grade + blur passes. Call when the state or source changed. */
@@ -288,6 +308,17 @@ export class Renderer {
       gl.uniform1f(g.u.u_tiles, s.claheTiles);
       gl.uniform1f(g.u.u_claheMix, s.clahe ? s.claheMix : 0);
       gl.uniform1f(g.u.u_claheK, s.claheK);
+      // 自動化流程
+      this.bind(6, this.aux!, 'u_aux', g);
+      this.bind(7, this.lwb!, 'u_lwb', g);
+      gl.uniform1f(g.u.u_lwbAmt, s.lwb.amount);
+      gl.uniform1f(g.u.u_stAmt, s.seathru.amount);
+      gl.uniform3fv(g.u.u_stB, s.seathru.B);
+      gl.uniform3fv(g.u.u_stb, s.seathru.b);
+      gl.uniform3fv(g.u.u_stBeta, s.seathru.beta);
+      gl.uniform2f(g.u.u_labShift, s.lab.shift[0], s.lab.shift[1]);
+      gl.uniform1f(g.u.u_labAmt, s.lab.amount);
+      gl.uniform1f(g.u.u_fuse, s.clahe ? s.fusion : 0);
     });
     gl.bindTexture(gl.TEXTURE_2D, this.graded!.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
@@ -411,7 +442,7 @@ export class Renderer {
 
   dispose() {
     const gl = this.gl;
-    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.lut, this.curve, this.pre, this.lookTex, this.rays, this.noise])
+    for (const t of [this.src, this.small, this.scope, this.graded, this.blurA, this.blurB, this.coef, this.aux, this.lwb, this.lut, this.curve, this.pre, this.lookTex, this.rays, this.noise])
       destroy(gl, t);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
   }

@@ -46,6 +46,20 @@ import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 import { analyzeColorMatrix, applyMixGL } from './matrix.ts';
 import { analyzeMeanPull, meanPullGL } from './twostep.ts';
 import { JERLOV, physicalGL } from './physical.ts';
+import {
+  applyLabShift,
+  depthOf,
+  fitSeaThru,
+  fuseL,
+  fusionWeights,
+  localWhiteBalance,
+  LWB_GRID,
+  measureLabCast,
+  quality,
+  sampleGrid,
+  SEATHRU_MAX_GAIN,
+  type Quality,
+} from './pipeline.ts';
 
 /**
  * Long edge of the analysis frame. Every map computed from it is low-frequency
@@ -76,7 +90,22 @@ export const TUNING = {
   vibGain: 0,
   deCastGain: 0.92,
   vividAuto: 0.4, // automatic 豐富色彩 in full-auto mode
+  // 自動判斷流程 (autoPipeline, the natural mode): how strongly each module
+  // comes on per need. Tuned by scripts/optimize.ts --pipeline --real on half
+  // of the real photographs: only Sea-thru (with 品質把關) helped there, so
+  // fusion, Lab and local WB stay manual one-tap tools (gains 0).
+  fuseGain: 0, // 多分支融合 on flat frames
+  labGain: 0, // Lab 分軸校正 once a residual green / blue cast is measured
+  stGain: 0.2, // Sea-thru where the frame has depth (haze spread)
+  lwbGain: 0, // 補光區域白平衡 where the illuminant varies across the frame
 };
+
+/**
+ * 品質把關 limits (see pipeline.quality): beyond them enhancement backs off.
+ * Tuned with the gains above; clipping is held tightest (real frames clipped
+ * 5–38 % of their pixels in full auto against 0–24 % in the references).
+ */
+export const QA_LIMITS = { clip: 0.002, noiseAmp: 2.5, lcRatio: 3 };
 
 /**
  * The water body (what the water IS: blue or green, whether it absorbs blue)
@@ -155,6 +184,13 @@ export interface FrameState {
   physA: Vec3;
   physBack: number;
   physAmt: number;
+  /** 自動化流程: per analysis pixel (depth guided coefficients a, b; fusion w2, w3). */
+  aux: Float32Array;
+  fusion: number;
+  lab: { shift: [number, number]; amount: number };
+  seathru: { B: Vec3; b: Vec3; beta: Vec3; amount: number };
+  /** 補光區域白平衡: LWB_GRID² RGB gains and the amount. */
+  lwb: { gains: Float32Array; amount: number };
   /** Values actually applied for every auto key (for the UI). */
   effective: Record<AutoKey, number>;
   stats: FrameStats;
@@ -168,6 +204,12 @@ export interface FrameStats {
   waterLight: Vec3;
   sceneCut: boolean;
   analysisMs: number;
+  /** 品質把關: quality of the result (null when not measured) and the back-off applied. */
+  quality: Quality | null;
+  qaScale: number;
+  /** 自動化流程 analysis: residual Lab cast, illuminant spread, depth spread. */
+  cast: [number, number];
+  lightSpread: number;
   /** Mean OKLab chroma of surfaces before the colour stage. */
   chroma: number;
   /** 0..1 detection confidence for sun beams / a bright surface band. */
@@ -225,6 +267,8 @@ export class AutoEngine {
     this.smoothed.clear();
     this.sig = null;
     this.lastLut = null;
+    this.qaScale = 1;
+    this.lastQuality = null;
   }
 
   /** Eyedropper: sample the compensated (pre-WB) frame at uv and use it as the illuminant. */
@@ -252,7 +296,74 @@ export class AutoEngine {
     return this.pick.illum;
   }
 
+  /** 品質把關: back-off applied to every enhancement target (1 = none). */
+  private qaScale = 1;
+  private qaFrame = 0;
+  private lastQuality: Quality | null = null;
+
+  /**
+   * Analyse a frame. With 品質把關 (or 自動判斷流程) on, the result is rendered
+   * by the CPU mirror, measured (UIQM, UCIQE, clipping, noise amplification,
+   * local-contrast overshoot) and, where a limit is exceeded, every
+   * enhancement target is scaled back: for a still, the strongest scale that
+   * stays within the limits is found by bisection; video eases toward the
+   * limits every 4th frame.
+   */
   step(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, o: StepOptions): FrameState {
+    const p = o.params;
+    if (!(p.qaGuard >= 0.5 || p.autoPipeline >= 0.5)) {
+      this.qaScale = 1;
+      this.lastQuality = null;
+      return this.run(rgba, w, h, o);
+    }
+    const still = !!o.snap || o.dt <= 0;
+    if (still) this.qaScale = 1;
+    let st = this.run(rgba, w, h, o);
+    if (!still && this.qaFrame++ % 4 !== 0) {
+      st.stats.quality = this.lastQuality;
+      return st;
+    }
+    let q = quality(mirrorRender(rgba, w, h, st), rgba, w, h);
+    const within = (m: Quality) => m.clip <= QA_LIMITS.clip && m.noiseAmp <= QA_LIMITS.noiseAmp && m.lcRatio <= QA_LIMITS.lcRatio;
+    if (still) {
+      // the strongest enhancement that stays within every limit (bisection:
+      // the measures grow with the strength)
+      if (!within(q)) {
+        let lo = 0.4, hi = 1;
+        let best: { st: FrameState; q: Quality } | null = null;
+        for (let it = 0; it < 4; it++) {
+          const mid = it === 3 && !best ? lo : 0.5 * (lo + hi);
+          this.qaScale = mid;
+          const s2 = this.run(rgba, w, h, { ...o, snap: true });
+          const q2 = quality(mirrorRender(rgba, w, h, s2), rgba, w, h);
+          if (within(q2) || mid === lo) {
+            lo = mid;
+            best = { st: s2, q: q2 };
+          } else hi = mid;
+        }
+        if (best) {
+          this.qaScale = lo;
+          st = best.st;
+          q = best.q;
+        }
+      }
+    } else {
+      // video: ease toward the limits every 4th frame
+      const fit = Math.min(
+        1.15,
+        Math.pow(QA_LIMITS.clip / Math.max(1e-6, q.clip), 0.5),
+        Math.pow(QA_LIMITS.noiseAmp / Math.max(1e-6, q.noiseAmp), 0.7),
+        Math.pow(QA_LIMITS.lcRatio / Math.max(1e-6, q.lcRatio), 0.7),
+      );
+      this.qaScale = clamp(this.qaScale * Math.pow(fit, 0.5), 0.4, 1);
+    }
+    st.stats.quality = q;
+    st.stats.qaScale = this.qaScale;
+    this.lastQuality = q;
+    return st;
+  }
+
+  private run(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, o: StepOptions): FrameState {
     const t0 = performance.now();
     const p = o.params;
     const n = w * h;
@@ -273,6 +384,10 @@ export class AutoEngine {
       eff[k] = v;
       return v;
     };
+    // 自動判斷流程 switches the modules on by need; 品質把關 scales every
+    // enhancement target by the back-off it measured (1 = none)
+    const ap = p.autoPipeline >= 0.5;
+    const qa = this.qaScale;
 
     /* 0. water colour, imported 全自動 profile ----------------------- */
     // The water body's colour on the raw frame: classification and the blue
@@ -317,7 +432,7 @@ export class AutoEngine {
     // (score < 0.2) gets almost nothing, a clear underwater frame gets it all.
     const gate = smoothstep(0.2, 0.55, uw);
     // 豐富色彩 strength: every adaptive amount below scales with it
-    const vivid = clamp(E('vivid', TUNING.vividAuto * gate), 0, 1);
+    const vivid = clamp(E('vivid', TUNING.vividAuto * gate * this.qaScale), 0, 1);
     const gateWb = smoothstep(0.15, 0.45, uw);
     const wc = rawWater.colour;
     const water: FrameStats['water'] = uw < 0.3 ? 'neutral' : wc[1] > wc[2] * 1.08 ? 'green' : 'blue';
@@ -372,6 +487,26 @@ export class AutoEngine {
       bal[q] = Math.max(0, wb[0] * r + wb[1] * g + wb[2] * b);
       bal[q + 1] = Math.max(0, wb[3] * r + wb[4] * g + wb[5] * b);
       bal[q + 2] = Math.max(0, wb[6] * r + wb[7] * g + wb[8] * b);
+    }
+
+    /* 3b. 補光區域白平衡 ---------------------------------------------- */
+    // A strobe / torch lights near subjects white while the rest stays in
+    // water light: measured as how much the illuminant varies across a grid.
+    const lw = localWhiteBalance(bal, w, h);
+    const lightSpread = S('lwbSpread', lw.spread);
+    const lwbAmt = E('localWB', ap ? TUNING.lwbGain * smoothstep(0.015, 0.05, lightSpread) * gate : 0);
+    const lwbGains = new Float32Array(LWB_GRID * LWB_GRID * 3);
+    for (let k2 = 0; k2 < lwbGains.length; k2++) lwbGains[k2] = S(`lwb${k2}`, lw.gains[k2]);
+    if (lwbAmt > 0.001) {
+      const g3: Vec3 = [1, 1, 1];
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          sampleGrid(lwbGains, (x + 0.5) / w, (y + 0.5) / h, g3);
+          const q = (y * w + x) * 3;
+          bal[q] *= 1 + (g3[0] - 1) * lwbAmt;
+          bal[q + 1] *= 1 + (g3[1] - 1) * lwbAmt;
+          bal[q + 2] *= 1 + (g3[2] - 1) * lwbAmt;
+        }
     }
 
     /* 4. haze-lines dehaze ------------------------------------------ */
@@ -442,7 +577,10 @@ export class AutoEngine {
     // Only dehaze when there is a *spread* between near and far: a flat frame
     // (all dark ≈ A) has no depth cue and would collapse toward A.
     const hazeAct = S('hazeAct', smoothstep(0.06, 0.3, d90 - d10));
-    const omega = E('dehaze', TUNING.dehazeBase + TUNING.dehazeGain * gate) * hazeAct;
+    // Sea-thru does dehaze's job with a physical model: where it is on,
+    // it takes over from dehaze instead of stacking on it
+    const stAmt = E('seathru', ap ? TUNING.stGain * hazeAct * gate : 0);
+    const omega = E('dehaze', (TUNING.dehazeBase + TUNING.dehazeGain * gate) * qa * (1 - clamp(stAmt, 0, 1))) * hazeAct;
     const dehazeOn = omega > 0.005;
     const I = this.buf('I', n);
     const tRaw = this.buf('tRaw', n);
@@ -463,11 +601,37 @@ export class AutoEngine {
     // most red on the way, so red is lifted in proportion to (1 - t).
     const k: Vec3 = [1.6 * depth, 0, -0.35 * depth];
 
+    /* 4b. Sea-thru 深度感知 ------------------------------------------- */
+    // Its own pseudo-depth: the haze-lines transmission at full strength (the
+    // dehaze one scales with the dehaze slider), refined by the same guided
+    // filter; then backscatter and attenuation fitted per channel.
+    const aux = this.buf('aux', n * 4);
+    let stB: Vec3 = [0, 0, 0], stb: Vec3 = [1, 1, 1], stBeta: Vec3 = [0, 0, 0];
+    if (stAmt > 0.001) {
+      const tD = this.buf('tD', n);
+      for (let i = 0; i < n; i++) tD[i] = clamp(1 - 0.95 * darkN[i], 0, 1);
+      const { a: da, b: db } = guidedCoefficients(I, tD, w, h, gr, 1e-3);
+      for (let i = 0; i < n; i++) {
+        aux[i * 4] = da[i];
+        aux[i * 4 + 1] = db[i];
+        tD[i] = clamp(da[i] * I[i] + db[i], 0, 1);
+      }
+      const fit = fitSeaThru(bal, tD, n); // on the balanced frame, before dehaze
+      stB = fit.B.map((v, c) => S(`stB${c}`, v)) as Vec3;
+      stb = fit.b.map((v, c) => S(`stb${c}`, v)) as Vec3;
+      stBeta = fit.beta.map((v, c) => S(`stE${c}`, v)) as Vec3;
+    } else
+      for (let i = 0; i < n; i++) {
+        aux[i * 4] = 0;
+        aux[i * 4 + 1] = 1;
+      }
+
     /* 5. exposure --------------------------------------------------- */
     const Wb = bal; // dehazed in place
     const tMap = this.buf('tMap', n);
     let logSum = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
+      const o0 = Wb[q], o1 = Wb[q + 1], o2 = Wb[q + 2];
       if (dehazeOn) {
         const t = clamp(coef[i * 4] * I[i] + coef[i * 4 + 1], 0, 1);
         tMap[i] = t;
@@ -492,6 +656,17 @@ export class AutoEngine {
         Wb[q + 1] = mix(w1 * yr, j1, DEHAZE_CHROMA);
         Wb[q + 2] = mix(w2 * yr, j2, DEHAZE_CHROMA);
       } else tMap[i] = 1;
+      if (stAmt > 0.001) {
+        // Sea-thru on the balanced value; open water (no surface) keeps it
+        const td = clamp(aux[i * 4] * I[i] + aux[i * 4 + 1], 0, 1);
+        const md = 1 - smoothstep(T0, T0 + 0.25, td);
+        const s0 = seaThruGL(o0, td, stB[0], stb[0], stBeta[0], md);
+        const s1 = seaThruGL(o1, td, stB[1], stb[1], stBeta[1], md);
+        const s2 = seaThruGL(o2, td, stB[2], stb[2], stBeta[2], md);
+        Wb[q] += (s0 - Wb[q]) * stAmt;
+        Wb[q + 1] += (s1 - Wb[q + 1]) * stAmt;
+        Wb[q + 2] += (s2 - Wb[q + 2]) * stAmt;
+      }
       if ((i & 3) === 0) logSum += Math.log(luma(Wb[q], Wb[q + 1], Wb[q + 2]) + 1e-4);
     }
     // Eyedropper: after the stages above, make the picked patch exactly
@@ -525,7 +700,8 @@ export class AutoEngine {
     const kk = Math.max(1e-4, key);
     const kLo = TUNING.kLo + 0.08 * vivid; // rich colour also means a more luminous frame
     const evTarget = kk < kLo ? Math.log2(kLo / kk) * 0.7 : kk > 0.32 ? Math.log2(0.32 / kk) * 0.7 : 0;
-    const ev = E('exposure', clamp(evTarget, -1, 1.5));
+    // 品質把關 also holds back the exposure LIFT (clipping on bright frames)
+    const ev = E('exposure', clamp(evTarget > 0 ? evTarget * qa : evTarget, -1, 1.5));
     const expMul = Math.pow(2, ev);
     // Highlight roll-off only when something can push values past 1: an
     // exposure lift, dehaze, WB or compensation. With all of them off
@@ -536,13 +712,22 @@ export class AutoEngine {
     /* 6. encode + CLAHE --------------------------------------------- */
     const e = this.buf('e', n * 3);
     const L = this.buf('L', n);
-    let sL = 0, sL2 = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
       const r = encodeFast(shl(Wb[q] * expMul));
       const g = encodeFast(shl(Wb[q + 1] * expMul));
       const b = encodeFast(shl(Wb[q + 2] * expMul));
       e[q] = r; e[q + 1] = g; e[q + 2] = b;
-      const l = luma(r, g, b);
+    }
+    /* 6a. Lab 分軸校正 ------------------------------------------------ */
+    // the residual green / blue cast of pale surfaces, removed along OKLab
+    // a and b, toward red / yellow only
+    const castAB = measureLabCast(e, tMap, n);
+    const labShift: [number, number] = [S('labA', castAB[0]), S('labB', castAB[1])];
+    const labAmt = E('labCast', ap ? TUNING.labGain * smoothstep(0.004, 0.02, Math.hypot(labShift[0], labShift[1])) * gate : 0);
+    if (labAmt > 0.001) for (let i = 0, q = 0; i < n; i++, q += 3) applyLabShift(e, q, labShift, labAmt, tMap[i]);
+    let sL = 0, sL2 = 0;
+    for (let i = 0, q = 0; i < n; i++, q += 3) {
+      const l = luma(e[q], e[q + 1], e[q + 2]);
       L[i] = l; sL += l; sL2 += l * l;
     }
     const mL = sL / n;
@@ -550,13 +735,20 @@ export class AutoEngine {
     const flat2 = clamp((0.24 - stdL) / 0.16, 0, 1);
     // Dehaze already restores most of the lost contrast; CLAHE only tops up
     // what is still flat, less so the more dehaze did.
-    const claheS = E('clahe', clamp((TUNING.claheBase + TUNING.claheFlat * flat2) * (1 - 0.4 * omega), 0, 0.35));
+    const claheS = E('clahe', clamp((TUNING.claheBase + TUNING.claheFlat * flat2) * (1 - 0.4 * omega), 0, 0.35) * qa);
+    /* 6b. 多分支融合 --------------------------------------------------- */
+    const fuseAmt = E('fusion', ap ? TUNING.fuseGain * flat2 * gate * qa : 0);
     const tiles = clamp(Math.round(p.claheTiles), 2, 16);
     let clahe: Float32Array | null = null;
-    const claheMix = claheS > 0.001 ? Math.min(1, 2 * claheS) : 0;
+    // with fusion on, CLAHE is its histogram-equalised branch
+    const claheMix = (claheS > 0.001 ? Math.min(1, 2 * claheS) : 0) * (1 - clamp(fuseAmt, 0, 1));
     let claheK = 1;
-    if (claheMix > 0) {
-      clahe = buildClahe(L, w, h, tiles, 1.2 + 2 * claheS);
+    for (let i = 0; i < n; i++) {
+      aux[i * 4 + 2] = 0;
+      aux[i * 4 + 3] = 0;
+    }
+    if (claheMix > 0 || fuseAmt > 0.001) {
+      clahe = buildClahe(L, w, h, tiles, 1.2 + 2 * Math.max(claheS, fuseAmt > 0.001 ? 0.3 : 0));
       if (!snap && this.lastLut && this.lastTiles === tiles && this.lastLut.length === clahe.length) {
         const rl = 1 - Math.exp(-o.dt / Math.min(0.3, tau));
         const prev = this.lastLut;
@@ -573,18 +765,38 @@ export class AutoEngine {
           sm += mapped[i];
         }
       claheK = S('claheK', sm > 1e-6 ? clamp(sL / sm, 0.8, 1.25) : 1);
-      for (let i = 0, q = 0; i < n; i++, q += 3) {
-        const L2 = mix(L[i], mapped[i] * claheK, claheMix);
-        const s = (L2 + 1e-4) / (L[i] + 1e-4);
-        e[q] *= s; e[q + 1] *= s; e[q + 2] *= s;
-        L[i] = L2;
+      if (fuseAmt > 0.001) {
+        const he = this.buf('he', n);
+        for (let i = 0; i < n; i++) he[i] = mapped[i] * claheK;
+        const w2 = this.buf('fw2', n), w3 = this.buf('fw3', n);
+        fusionWeights(L, he, w, h, w2, w3);
+        for (let i = 0, q = 0; i < n; i++, q += 3) {
+          aux[i * 4 + 2] = w2[i];
+          aux[i * 4 + 3] = w3[i];
+          const L1 = fuseL(L[i], he[i], w2[i], w3[i], fuseAmt);
+          const sc = (L1 + 1e-4) / (L[i] + 1e-4);
+          e[q] *= sc; e[q + 1] *= sc; e[q + 2] *= sc;
+          L[i] = L1;
+        }
       }
+      if (claheMix > 0)
+        for (let y = 0; y < h; y++)
+          for (let x = 0; x < w; x++) {
+            const i = y * w + x, q = i * 3;
+            const m2 = fuseAmt > 0.001 ? sampleClahe(clahe, tiles, L[i], (x + 0.5) / w, (y + 0.5) / h) : mapped[i];
+            const L2 = mix(L[i], m2 * claheK, claheMix);
+            const sc = (L2 + 1e-4) / (L[i] + 1e-4);
+            e[q] *= sc; e[q + 1] *= sc; e[q + 2] *= sc;
+            L[i] = L2;
+          }
     }
 
     /* 7. levels, shadows, de-cast ----------------------------------- */
     const [pLo, pMed, pHi] = quantiles(L, [0.003, 0.5, 0.997], 1024);
     const blacks = E('blacks', clamp(pLo * 0.85, 0, 0.1));
-    const whites = E('whites', clamp(pHi + 0.005, 0.88, 1));
+    // the auto white point clips ~0.3 % of pixels by design; 品質把關 eases it
+    // toward 1 as it backs off
+    const whites = E('whites', mix(1, clamp(pHi + 0.005, 0.88, 1), qa));
     const shadows = E('shadows', clamp((0.4 - pMed) * 1.2, 0, 0.35));
     let wr = 0, wg = 0, wbb = 0, ws = 0;
     for (let i = 0, q = 0; i < n; i++, q += 3) {
@@ -666,11 +878,15 @@ export class AutoEngine {
     const restore = E('restore', 0.85 * smoothstep(2.5, 9, sigma));
     const denoise = E('denoise', 0.15 + 0.5 * smoothstep(1.5, 7, sigma));
     const threshold = E('threshold', clamp(0.012 + (2.2 * sigma) / 255, 0.015, 0.08));
-    const sharpen = E('sharpen', 0.35 * (1 - 0.7 * smoothstep(3, 10, sigma)));
+    const sharpen = E('sharpen', 0.35 * (1 - 0.7 * smoothstep(3, 10, sigma)) * qa);
 
     for (const k2 of AUTO_KEYS) if (eff[k2] === undefined) eff[k2] = p[k2];
 
     return {
+      aux, fusion: fuseAmt,
+      lab: { shift: labShift, amount: labAmt },
+      seathru: { B: stB, b: stb, beta: stBeta, amount: stAmt },
+      lwb: { gains: lwbGains, amount: lwbAmt },
       mixMat: prof.mixMat, mixOff: prof.mixOff, mixAmt: prof.mixAmt, pull: prof.pull, pullAmt: prof.pullAmt,
       physA: prof.physA, physBack: prof.physBack, physAmt: prof.physAmt,
       aR, aB, dR, dB,
@@ -692,6 +908,10 @@ export class AutoEngine {
         waterLight: A,
         sceneCut: cut,
         analysisMs: performance.now() - t0,
+        quality: null,
+        qaScale: qa,
+        cast: labShift,
+        lightSpread,
         chroma,
         noise: o.noise ? sigma : 0,
         beamPresence: bd.presence,
@@ -939,6 +1159,16 @@ export function gamutFit(lab: Vec3, k: number): Vec3 {
   return [clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1)];
 }
 
+/**
+ * Sea-thru on one balanced linear channel at depth-transmission `t`, faded to
+ * the input where `md` says the pixel is open water. Mirrors GRADE_FS.
+ */
+export function seaThruGL(I: number, t: number, B: number, b: number, beta: number, md: number): number {
+  const z = depthOf(t);
+  const J = Math.max(0, I - B * (1 - Math.exp(-b * z))) * Math.min(SEATHRU_MAX_GAIN, Math.exp(beta * z));
+  return J + (I - J) * md;
+}
+
 /** Imported profile state, as the GRADE pass takes it. */
 type ProfileState = { [K in 'mixMat' | 'mixOff' | 'mixAmt' | 'pull' | 'pullAmt' | 'physA' | 'physBack' | 'physAmt']: FrameState[K] };
 
@@ -961,6 +1191,9 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
   const out = new Float32Array(n * 3);
   const px3 = new Float32Array(3);
   const profile = s.mixAmt > 0.0001 || s.pullAmt > 0.0001 || s.physAmt > 0.0001;
+  const lwbOn = s.lwb.amount > 0.001;
+  const st = s.seathru;
+  const g3: Vec3 = [1, 1, 1];
   const [kr, kg, kb] = s.k;
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
@@ -982,9 +1215,18 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
       const gw = Math.max(0, m[3] * r + m[4] * g + m[5] * b);
       const bw = Math.max(0, m[6] * r + m[7] * g + m[8] * b);
       r = rw; g = gw; b = bw;
+      if (lwbOn) {
+        sampleGrid(s.lwb.gains, (x + 0.5) / w, (y + 0.5) / h, g3);
+        r *= 1 + (g3[0] - 1) * s.lwb.amount;
+        g *= 1 + (g3[1] - 1) * s.lwb.amount;
+        b *= 1 + (g3[2] - 1) * s.lwb.amount;
+      }
+      const o0 = r, o1 = g, o2 = b;
+      const I = Math.sqrt(luma(r, g, b));
+      let tt = 1;
       if (s.dehazeOn) {
-        const I = Math.sqrt(luma(r, g, b));
         const t = clamp(s.coef[i * 4] * I + s.coef[i * 4 + 1], 0, 1);
+        tt = t;
         const m = 1 - smoothstep(T0, T0 + 0.25, t);
         const div = mix(Math.max(t, T0), 1, m),
           far = (1 - t) * (1 - m),
@@ -997,12 +1239,32 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
         g = mix(g * yr, j1, DEHAZE_CHROMA);
         b = mix(b * yr, j2, DEHAZE_CHROMA);
       }
+      if (st.amount > 0.001) {
+        const td = clamp(s.aux[i * 4] * I + s.aux[i * 4 + 1], 0, 1);
+        const md = 1 - smoothstep(T0, T0 + 0.25, td);
+        r += (seaThruGL(o0, td, st.B[0], st.b[0], st.beta[0], md) - r) * st.amount;
+        g += (seaThruGL(o1, td, st.B[1], st.b[1], st.beta[1], md) - g) * st.amount;
+        b += (seaThruGL(o2, td, st.B[2], st.b[2], st.beta[2], md) - b) * st.amount;
+      }
       const r2 = r * s.post[0] * s.expMul, g2 = g * s.post[1] * s.expMul, b2 = b * s.post[2] * s.expMul;
       const sl = (x: number) => x + (shoulder(x) - x) * s.shoulder;
       let er = encodeFast(sl(r2)), eg = encodeFast(sl(g2)), eb = encodeFast(sl(b2));
+      if (s.lab.amount > 0.001) {
+        px3[0] = er; px3[1] = eg; px3[2] = eb;
+        applyLabShift(px3, 0, s.lab.shift, s.lab.amount, tt);
+        er = px3[0]; eg = px3[1]; eb = px3[2];
+      }
+      const u = (x + 0.5) / w, v = (y + 0.5) / h;
+      if (s.clahe && s.fusion > 0.001) {
+        const L = luma(er, eg, eb);
+        const he = sampleClahe(s.clahe, s.claheTiles, L, u, v) * s.claheK;
+        const L1 = fuseL(L, he, s.aux[i * 4 + 2], s.aux[i * 4 + 3], s.fusion);
+        const sc = (L1 + 1e-4) / (L + 1e-4);
+        er *= sc; eg *= sc; eb *= sc;
+      }
       if (s.clahe && s.claheMix > 0) {
         const L = luma(er, eg, eb);
-        const L2 = mix(L, sampleClahe(s.clahe, s.claheTiles, L, (x + 0.5) / w, (y + 0.5) / h) * s.claheK, s.claheMix);
+        const L2 = mix(L, sampleClahe(s.clahe, s.claheTiles, L, u, v) * s.claheK, s.claheMix);
         const sc = (L2 + 1e-4) / (L + 1e-4);
         er *= sc; eg *= sc; eb *= sc;
       }

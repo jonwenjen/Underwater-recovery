@@ -167,6 +167,8 @@ function renderAnalysis(st: FrameState) {
   $('fNoise').textContent = s.noise > 0 ? `σ ${s.noise.toFixed(1)}` : '—';
   const light = [s.beamPresence > 0.3 ? '光束' : '', s.surfacePresence > 0.3 ? '水面' : ''].filter(Boolean).join('＋');
   $('fLight').textContent = light || '無';
+  $('fUiqm').textContent = s.quality ? s.quality.uiqm.toFixed(2) : '—';
+  $('fUciqe').textContent = s.quality ? s.quality.uciqe.toFixed(3) : '—';
   const px = proc.renderer.readScope(st);
   drawHistogram(px);
   curvesUi?.draw(px);
@@ -286,6 +288,7 @@ function buildControls() {
 
 function refreshControls(st: FrameState | null) {
   syncVivid();
+  syncFlow();
   lp?.update();
   for (const [k, r] of rows) {
     const auto = isFollowingAuto(k);
@@ -376,6 +379,66 @@ $('vivid').addEventListener('click', () => {
   refreshControls(lastState);
   requestRender();
 });
+
+/* 自動化流程: one tap each. 自動判斷流程 and 品質把關 are switches; the four
+ * modules lock a measured-good strength (press again hands back to auto,
+ * where 自動判斷流程 may still turn them on by need). */
+const FLOW_LOCK: Partial<Record<NumKey, number>> = { fusion: 1, labCast: 0.5, seathru: 0.5, localWB: 0.5 };
+const isSwitch = (k: NumKey) => k === 'autoPipeline' || k === 'qaGuard';
+const flowPressed = (k: NumKey) => (isSwitch(k) ? params[k] >= 0.5 : !isFollowingAuto(k) && params[k] > 0);
+const flowButtons = [...document.querySelectorAll<HTMLButtonElement>('#flow button')];
+function syncFlow() {
+  const st = lastState;
+  const eff = (k: AutoKey) => (st ? st.effective[k] : params[k]);
+  for (const b of flowButtons) {
+    const k = b.dataset.flow as NumKey;
+    const on = flowPressed(k);
+    b.setAttribute('aria-pressed', String(on));
+    b.classList.toggle('engaged', !isSwitch(k) && eff(k as AutoKey) > 0.01);
+    const note = b.querySelector<HTMLElement>('[data-note]')!;
+    if (!st) continue;
+    const q = st.stats.quality;
+    switch (k) {
+      case 'autoPipeline':
+        note.textContent = on
+          ? `Sea-thru ${eff('seathru').toFixed(2)} · 融合 ${eff('fusion').toFixed(2)} · Lab ${eff('labCast').toFixed(2)} · 補光 ${eff('localWB').toFixed(2)} · 強度 ×${st.stats.qaScale.toFixed(2)}`
+          : '自然、不過度、不假色';
+        break;
+      case 'fusion':
+        note.textContent = eff('fusion') > 0.01 ? `套用 ${eff('fusion').toFixed(2)}` : '平淡／混濁畫面';
+        break;
+      case 'labCast':
+        note.textContent = `殘留 綠 ${st.stats.cast[0].toFixed(3)} · 藍 ${st.stats.cast[1].toFixed(3)}` + (eff('labCast') > 0.01 ? ` · 套用 ${eff('labCast').toFixed(2)}` : '');
+        break;
+      case 'seathru':
+        note.textContent = eff('seathru') > 0.01 ? `套用 ${eff('seathru').toFixed(2)}（取代去霧）` : '遠近差大的場景';
+        break;
+      case 'localWB':
+        note.textContent = `光源差異 ${st.stats.lightSpread.toFixed(3)}` + (eff('localWB') > 0.01 ? ` · 套用 ${eff('localWB').toFixed(2)}` : '');
+        break;
+      case 'qaGuard':
+        note.textContent = q
+          ? `溢出 ${(q.clip * 100).toFixed(1)}% · 雜訊 ×${q.noiseAmp.toFixed(1)} · 強度 ×${st.stats.qaScale.toFixed(2)}`
+          : '避免過度處理';
+        break;
+    }
+  }
+}
+for (const b of flowButtons)
+  b.addEventListener('click', () => {
+    const k = b.dataset.flow as NumKey;
+    if (isSwitch(k)) params[k] = params[k] >= 0.5 ? 0 : 1;
+    else if (flowPressed(k)) {
+      if (params.auto) locked.delete(k as AutoKey);
+      else params[k] = 0;
+    } else {
+      params[k] = FLOW_LOCK[k]!;
+      if (params.auto) locked.add(k as AutoKey);
+    }
+    markPreset(null);
+    refreshControls(lastState);
+    requestRender();
+  });
 
 $<HTMLInputElement>('auto').addEventListener('change', (e) => {
   const on = (e.target as HTMLInputElement).checked;
@@ -875,6 +938,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
         stats: st.stats,
         effective: st.effective,
         profile: { mix: st.mixAmt, pull: st.pullAmt, phys: st.physAmt },
+        flow: { fusion: st.fusion, lab: st.lab.amount, seathru: st.seathru.amount, localWB: st.lwb.amount, qaScale: st.stats.qaScale, quality: st.stats.quality },
         ms: proc.lastFrameMs,
         size: [proc.renderer.pw, proc.renderer.ph],
       };

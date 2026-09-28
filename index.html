@@ -98,6 +98,8 @@
               <div><dt>色彩增益</dt><dd id="fGain">關</dd></div>
               <div><dt>雜訊</dt><dd id="fNoise">—</dd></div>
               <div><dt>光線</dt><dd id="fLight">—</dd></div>
+              <div><dt>UIQM</dt><dd id="fUiqm">—</dd></div>
+              <div><dt>UCIQE</dt><dd id="fUciqe">—</dd></div>
             </dl>
           </div>
 
@@ -110,6 +112,30 @@
             <button id="vivid" class="vivid" aria-pressed="false" title="依畫面實測彩度自動補足色彩、暖色、亮度與水色；強度可在「色彩」群組微調">
               ✨ 豐富色彩<small id="vividNote">自動把光線與色彩算得更飽滿</small>
             </button>
+          </div>
+
+          <div class="card autoflow">
+            <h3>自動化流程 <small>分析 → 校正 → 品質把關</small></h3>
+            <div class="flow" id="flow">
+              <button data-flow="autoPipeline" class="flowbtn wide" aria-pressed="false" title="自然還原：依畫面分析自動決定要開哪些模組，並開啟品質把關（真實照片上最接近參考影像）">
+                🧠 自動判斷流程<small data-note>自然、不過度、不假色</small>
+              </button>
+              <button data-flow="fusion" class="flowbtn" aria-pressed="false" title="WaterNet／Ancuti 思路：白平衡、Gamma、直方圖等化三個分支依局部對比與曝光良好度逐像素融合；適合平淡、混濁、綠水畫面">
+                🔀 多分支融合<small data-note>平淡／混濁畫面</small>
+              </button>
+              <button data-flow="labCast" class="flowbtn" aria-pressed="false" title="UIEC² 思路：在 OKLab a（綠↔紅）、b（藍↔黃）軸移除殘留水色，只往紅／黃方向；飽和色與水體受保護">
+                🎨 Lab 分軸校正<small data-note>殘留綠／藍偏</small>
+              </button>
+              <button data-flow="seathru" class="flowbtn" aria-pressed="false" title="Sea-thru：以最暗像素擬合各深度的後向散射、再依距離補回衰減，取代一般去霧；深度取自穿透率圖">
+                🌊 Sea-thru 深度感知<small data-note>遠近差大的場景</small>
+              </button>
+              <button data-flow="localWB" class="flowbtn" aria-pressed="false" title="閃燈／手電筒只照亮近處：依近中性表面分區估計光源，修正畫面中不一致的色溫">
+                💡 補光區域白平衡<small data-note>閃燈／手電筒</small>
+              </button>
+              <button data-flow="qaGuard" class="flowbtn" aria-pressed="false" title="計算 UIQM／UCIQE，並檢查高光溢出、雜訊放大、局部對比過度；超標時自動降低增強與曝光拉抬">
+                ✅ 品質把關<small data-note>避免過度處理</small>
+              </button>
+            </div>
           </div>
 
           <div id="groups"></div>
@@ -176,7 +202,7 @@
       </main>
 
       <footer>
-        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩 → 光束／水面高光（畫面控制點）→ 使用者曲線／HSL。可選：畫質修復（保邊去雜訊）、旋轉翻轉、變速輸出。
+        WebGL2 即時管線：Ancuti 紅色補償 → Bradford 白平衡 → 暗通道去霧（快速導向濾波）→ 自動測光 → CLAHE → 細節／清晰度 → 影調曲線 → 色彩 → 光束／水面高光（畫面控制點）→ 使用者曲線／HSL。自動化流程：多分支融合、Lab 分軸校正、Sea-thru 深度感知、補光區域白平衡、品質把關（UIQM／UCIQE）。可選：畫質修復（保邊去雜訊）、旋轉翻轉、變速輸出。
         影片自動追蹤：每幀分析、指數平滑、場景切換立即重算。MIT License · 影音 I/O：mediabunny
       </footer>
     </div>

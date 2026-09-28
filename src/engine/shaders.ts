@@ -1,3 +1,5 @@
+import { FUSE_GAMMA, SEATHRU_MAX_GAIN } from './pipeline.ts';
+
 /**
  * GLSL for the three full-resolution passes. The maths mirrors `auto.ts`
  * (`step` stages 2–6 and `mirrorRender`) — keep them in lock-step.
@@ -31,6 +33,28 @@ vec3 shoulder(vec3 x) {
   const float k = 0.8;
   return mix(x, k + (1.0 - k) * tanh((x - k) / (1.0 - k)), step(vec3(k), x));
 }
+vec3 oklab(vec3 c) {
+  vec3 lms = vec3(
+    dot(c, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
+    dot(c, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
+    dot(c, vec3(0.0883024619, 0.2817188376, 0.6299787005)));
+  lms = pow(max(lms, 0.0), vec3(1.0 / 3.0));
+  return vec3(
+    dot(lms, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
+    dot(lms, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+    dot(lms, vec3(0.0259040371, 0.7827717662, -0.8086757660)));
+}
+vec3 fromOklab(vec3 lab) {
+  vec3 lms = vec3(
+    lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z,
+    lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z,
+    lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z);
+  lms = lms * lms * lms;
+  return vec3(
+    dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
+    dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
+    dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010)));
+}
 `;
 
 /** Downsample the source for analysis (mip-filtered) — plain copy. */
@@ -57,6 +81,29 @@ uniform vec3 u_A, u_Aout, u_k, u_post;
 uniform float u_t0, u_dehaze, u_dehazeChroma;
 uniform float u_exp;
 uniform float u_tiles, u_claheMix, u_claheK;
+// --- 自動化流程 (pipeline.ts) -----------------------------------------
+uniform sampler2D u_aux;       // analysis res: depth guided coef (a, b), fusion weights (w2, w3)
+uniform sampler2D u_lwb;       // 補光區域白平衡: grid of local RGB gains
+uniform float u_lwbAmt;
+uniform float u_stAmt;         // Sea-thru 深度感知
+uniform vec3 u_stB, u_stb, u_stBeta;
+uniform vec2 u_labShift;       // Lab 分軸校正: OKLab (a, b) shift toward red / yellow
+uniform float u_labAmt;
+uniform float u_fuse;          // 多分支融合
+const float FUSE_GAMMA = ${FUSE_GAMMA.toFixed(3)};
+const float SEATHRU_MAX = ${SEATHRU_MAX_GAIN.toFixed(1)};
+
+// mirrors applyLabShift() / labWeight() in pipeline.ts
+vec3 labShift(vec3 e, float t) {
+  vec3 lab = oklab(toLin(clamp(e, 0.0, 1.0)));
+  float C = length(lab.yz);
+  float pale = 1.0 - smoothstep(0.06, 0.14, C);
+  float mid = smoothstep(0.03, 0.15, lab.x) * (1.0 - smoothstep(0.85, 1.0, lab.x));
+  float surf = 0.3 + 0.7 * smoothstep(0.3, 0.75, t);
+  float k = u_labAmt * pale * mid * surf;
+  if (k <= 0.0) return e;
+  return clamp(toSrgb(clamp(fromOklab(vec3(lab.x, lab.yz + u_labShift * k)), 0.0, 1.0)), 0.0, 1.0);
+}
 // --- imported 全自動 profiles (docs/sources.md) ----------------------
 // A profile is the colour front-end in place of the engine's compensation
 // and white balance: its method runs on the sRGB-encoded SOURCE, where it is
@@ -145,10 +192,15 @@ void main() {
   c.b = min(1.0, c.b + u_aB * u_dB * (1.0 - c.b) * c.g);
   // white balance (Bradford), then dehaze on the balanced frame
   c = max(u_wb * c, 0.0);
+  // 補光區域白平衡: local gains where artificial light varies the illuminant
+  if (u_lwbAmt > 0.001) c *= mix(vec3(1.0), texture(u_lwb, v_uv).rgb, u_lwbAmt);
+  vec3 c0 = c;
+  float I = sqrt(dot(c, LUMA));
+  float tt = 1.0;
   if (u_dehaze > 0.5) {
-    float I = sqrt(dot(c, LUMA));
     vec2 ab = texture(u_coef, v_uv).rg;
     float t = clamp(ab.x * I + ab.y, 0.0, 1.0);
+    tt = t;
     float m = 1.0 - smoothstep(u_t0, u_t0 + 0.25, t);   // 1 = open water
     float div = mix(max(t, u_t0), 1.0, m);
     float veil = clamp((1.0 - t) / (1.0 - u_t0), 0.0, 1.0);
@@ -157,10 +209,29 @@ void main() {
     float yr = (dot(j, LUMA) + 1e-4) / (dot(c, LUMA) + 1e-4);
     c = mix(c * yr, j, u_dehazeChroma);
   }
+  // Sea-thru 深度感知 — mirrors seaThruGL() in auto.ts
+  if (u_stAmt > 0.001) {
+    vec4 ax = texture(u_aux, v_uv);
+    float td = clamp(ax.r * I + ax.g, 0.0, 1.0);
+    float md = 1.0 - smoothstep(u_t0, u_t0 + 0.25, td);
+    float z = -log(clamp(td, 0.02, 1.0));
+    vec3 J = max(c0 - u_stB * (1.0 - exp(-u_stb * z)), 0.0) * min(vec3(SEATHRU_MAX), exp(u_stBeta * z));
+    c = mix(c, mix(J, c0, md), u_stAmt);
+  }
   c *= u_post;
   vec3 ce = c * u_exp;
   vec3 e = toSrgb(mix(ce, shoulder(ce), u_shoulder));
+  if (u_labAmt > 0.001) e = labShift(e, tt);
   float L = dot(e, LUMA);
+  // 多分支融合 — mirrors fuseL() in pipeline.ts
+  if (u_fuse > 0.001) {
+    vec2 fw = texture(u_aux, v_uv).ba;
+    float he = claheMap(L, v_uv) * u_claheK;
+    float f = (1.0 - fw.x - fw.y) * L + fw.x * pow(max(L, 0.0), FUSE_GAMMA) + fw.y * he;
+    float L1 = mix(L, f, u_fuse);
+    e *= (L1 + 1e-4) / (L + 1e-4);
+    L = L1;
+  }
   float L2 = L;
   if (u_claheMix > 0.0) {
     L2 = mix(L, claheMap(L, v_uv) * u_claheK, u_claheMix);
@@ -218,28 +289,6 @@ uniform float u_split;
 uniform int u_clip;          // highlight / shadow clipping overlay
 uniform float u_seed;
 
-vec3 oklab(vec3 c) {
-  vec3 lms = vec3(
-    dot(c, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
-    dot(c, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
-    dot(c, vec3(0.0883024619, 0.2817188376, 0.6299787005)));
-  lms = pow(max(lms, 0.0), vec3(1.0 / 3.0));
-  return vec3(
-    dot(lms, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
-    dot(lms, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
-    dot(lms, vec3(0.0259040371, 0.7827717662, -0.8086757660)));
-}
-vec3 fromOklab(vec3 lab) {
-  vec3 lms = vec3(
-    lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z,
-    lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z,
-    lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z);
-  lms = lms * lms * lms;
-  return vec3(
-    dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
-    dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
-    dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010)));
-}
 // mirrors boostChroma() in color.ts
 float boostChroma(float C, float h) {
   float warmW = smoothstep(-0.3, 0.2, h) * (1.0 - smoothstep(1.1, 1.5, h));

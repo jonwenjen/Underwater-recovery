@@ -1,6 +1,6 @@
 /**
  * Re-tunes the auto engine against ground-truth scenes:
- *   node --experimental-strip-types scripts/optimize.ts [--report] [--real[=dir]]
+ *   node --experimental-strip-types scripts/optimize.ts [--report] [--real[=dir]] [--presets | --pipeline]
  * --report  score the current constants, presets and profiles; no search
  * --real    also report 23 real underwater photographs against reference images
  *           (EUVP test pairs; fetch once with `node scripts/fetch-euvp.mjs`).
@@ -31,12 +31,15 @@
  *    scene it is made for; a preset is kept only where it beats full auto.
  * 3. The imported 全自動 profiles: their strength searched on the suite
  *    (engine colour stages off, the method in their place).
+ * 4. 自動化流程 (--pipeline): every module locked on, per scene against full
+ *    auto; then 自動判斷流程's rule gains and the 品質把關 limits searched on
+ *    half of the real photographs (--real), reported on the other half.
  * The result is printed; chosen values are written into auto.ts / params.ts
  * by hand (README "How auto was tuned").
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AutoEngine, mirrorRender, TUNING, type FrameState } from '../src/engine/auto.ts';
+import { AutoEngine, mirrorRender, QA_LIMITS, TUNING, type FrameState } from '../src/engine/auto.ts';
 import { srgbToLinear, toOklab } from '../src/engine/color.ts';
 import { boxMean } from '../src/engine/filters.ts';
 import { applySurface, surfaceMask } from '../src/engine/light.ts';
@@ -62,6 +65,8 @@ const S = (globalThis as unknown as {
 const REPORT = process.argv.includes('--report');
 /** --presets: keep TUNING as it is, search presets and profiles only */
 const PRESETS_ONLY = process.argv.includes('--presets');
+/** --pipeline: only measure / tune the 自動化流程 modules */
+const PIPELINE_ONLY = process.argv.includes('--pipeline');
 const realArg = process.argv.find((a) => a.startsWith('--real'));
 const REAL_DIR = realArg ? (realArg.split('=')[1] ?? '/tmp/euvp') : null;
 
@@ -269,7 +274,7 @@ function sourceDE(sc: Scene): number {
 
 /* ----------------------------------------------------- 1. TUNING search */
 type TKey = keyof typeof TUNING;
-const RANGES: Record<TKey, [number, number]> = {
+const RANGES: Partial<Record<TKey, [number, number]>> = {
   // ranges keep every constant inside what looks sane on real footage
   // (e.g. red gain beyond 1.6 amplifies red-channel noise in deep water)
   redGain: [0.6, 1.6],
@@ -287,13 +292,13 @@ const RANGES: Record<TKey, [number, number]> = {
   vividAuto: [0, 0.8],
 };
 const before = { ...TUNING };
-table('before (current TUNING)');
+if (!PIPELINE_ONLY) table('before (current TUNING)');
 
 let best = suite();
-for (let pass = 0; pass < (REPORT || PRESETS_ONLY ? 0 : 3); pass++) {
+for (let pass = 0; pass < (REPORT || PRESETS_ONLY || PIPELINE_ONLY ? 0 : 3); pass++) {
   let improved = false;
   for (const k of Object.keys(RANGES) as TKey[]) {
-    const [lo, hi] = RANGES[k];
+    const [lo, hi] = RANGES[k]!;
     const step = (hi - lo) * (pass === 0 ? 0.15 : pass === 1 ? 0.07 : 0.03);
     for (const dir of [1, -1]) {
       for (;;) {
@@ -315,7 +320,7 @@ for (let pass = 0; pass < (REPORT || PRESETS_ONLY ? 0 : 3); pass++) {
   console.log(`pass ${pass + 1}: suite ${f3(best)}`);
   if (!improved && pass > 0) break;
 }
-if (!REPORT && !PRESETS_ONLY) {
+if (!REPORT && !PRESETS_ONLY && !PIPELINE_ONLY) {
   console.log('\nTUNING before → after');
   for (const k of Object.keys(RANGES) as TKey[]) console.log(`  ${k.padEnd(11)} ${String(before[k]).padEnd(6)} → ${TUNING[k]}`);
   table('after (optimised TUNING)');
@@ -358,8 +363,8 @@ const PKEEP: Record<string, Partial<Record<keyof Params, [number, number]>>> = {
   green: { tint: [-0.6, 0.6] },
   blue: { vibrance: [-0.3, 0.8] }, // a deep-water preset should not wash colour out
 };
-console.log('\npresets (on their own scene; auto = full auto on that scene)');
-for (const [key, sceneName] of Object.entries(PRESET_SCENE)) {
+if (!PIPELINE_ONLY) console.log('\npresets (on their own scene; auto = full auto on that scene)');
+for (const [key, sceneName] of Object.entries(PIPELINE_ONLY ? {} : PRESET_SCENE)) {
   const sc = byName(sceneName);
   // candidate keys a preset does not lock yet (dropped again if auto does as well)
   const TRY: Record<string, Record<string, number>> = {
@@ -420,13 +425,13 @@ const PROFILE_AMOUNT: Record<string, keyof Params> = {
   '全自動-T77701': 'meanPull',
   '全自動-warplab': 'physicalMix',
 };
-console.log('\nimported profiles (suite score; lower is better; full auto for reference)');
+if (!PIPELINE_ONLY) console.log('\nimported profiles (suite score; lower is better; full auto for reference)');
 const autoSuite = suiteOf(AUTO());
 const scoreParts = (st: Setting) =>
   `synthetic ΔE ${f3(mean(SCENES.filter((s) => !s.clean), st, (b) => b.dE))}` +
   (REAL.length ? `, real ΔE ${f3(mean(REAL, st, (b) => b.dE))}` : '');
-console.log(`  全自動              suite ${f3(autoSuite)}  ${scoreParts(AUTO())}`);
-for (const [name, amtKey] of Object.entries(PROFILE_AMOUNT)) {
+if (!PIPELINE_ONLY) console.log(`  全自動              suite ${f3(autoSuite)}  ${scoreParts(AUTO())}`);
+for (const [name, amtKey] of Object.entries(PIPELINE_ONLY ? {} : PROFILE_AMOUNT)) {
   const set = { ...(PRESETS[name].set as Record<string, number>) };
   const start = suiteOf(fromSet(set));
   let bestS = start;
@@ -447,4 +452,90 @@ for (const [name, amtKey] of Object.entries(PROFILE_AMOUNT)) {
       }
   }
   console.log(`  ${name.padEnd(18)} suite ${f3(start)} → ${f3(bestS)}  ${amtKey} ${set[amtKey as string]}  ${scoreParts(fromSet(set))}`);
+}
+
+/* --------------------------------------------- 4. 自動化流程 modules */
+// Each module locked on (the rest full auto), per scene against full auto;
+// then 自動判斷流程 (autoPipeline) with its rule gains searched on the suite.
+{
+  const per = (st: Setting) => SCENES.map((sc) => score(sc, st.params, st.locked));
+  const base = per(AUTO());
+  const realBase = REAL.length ? mean(REAL, AUTO(), (b) => b.dE) : 0;
+  const realLC = REAL.length ? mean(REAL, AUTO(), (b) => b.lc) : 0;
+  console.log('\n自動化流程 modules (Δ total per scene vs full auto; − = better)');
+  console.log('setting            ' + SCENES.map((s) => s.name.padStart(9)).join('') + '   suite' + (REAL.length ? '   real ΔE / LC' : ''));
+  const row = (label: string, st: Setting) => {
+    const r = per(st);
+    const suiteS = r.reduce((a, b) => a + b.total, 0) / r.length;
+    const real = REAL.length ? `   ${f3(mean(REAL, st, (b) => b.dE))} / ${f3(mean(REAL, st, (b) => b.lc))}` : '';
+    console.log(label.padEnd(19) + r.map((b, i) => (b.total - base[i].total >= 0 ? '+' : '') + (b.total - base[i].total).toFixed(3)).map((v) => v.padStart(9)).join('') + `   ${f3(suiteS)}` + real);
+    return suiteS;
+  };
+  console.log('full auto'.padEnd(19) + SCENES.map(() => '        0').join('') + `   ${f3(base.reduce((a, b) => a + b.total, 0) / base.length)}` + (REAL.length ? `   ${f3(realBase)} / ${f3(realLC)}` : ''));
+  for (const k of ['fusion', 'labCast', 'seathru', 'localWB'])
+    for (const a of [0.5, 1]) row(`${k} ${a}`, fromSet({ [k]: a }));
+  // modules that do an existing stage's job: in its place instead of on top
+  row('labCast 1 −deCast', fromSet({ labCast: 1, deCast: 0 }));
+  row('labCast .5 −deCast', fromSet({ labCast: 0.5, deCast: 0 }));
+  row('seathru 1 −dehaze', fromSet({ seathru: 1, dehaze: 0 }));
+  row('seathru .5 −dehaze', fromSet({ seathru: 0.5, dehaze: 0 }));
+  row('seathru 1 −dehz−dpth', fromSet({ seathru: 1, dehaze: 0, depthColor: 0 }));
+  row('qaGuard', fromSet({ qaGuard: 1 }));
+  const ap = () => fromSet({ autoPipeline: 1 });
+  // 自動判斷流程 is the natural mode: tuned on half of the real photographs
+  // (even), reported on the other half (odd) and on the ground-truth suite
+  const TRAIN = REAL.filter((_, i) => i % 2 === 0), HOLD = REAL.filter((_, i) => i % 2 === 1);
+  const natural = (st: Setting) => (TRAIN.length ? mean(TRAIN, st) : suiteOf(st));
+  const report = (label: string, st: Setting) =>
+    console.log(`  ${label.padEnd(16)} real ΔE train ${f3(mean(TRAIN, st, (b) => b.dE))} / hold-out ${f3(mean(HOLD, st, (b) => b.dE))}, LC ${f3(mean(REAL, st, (b) => b.lc))}, synthetic suite ${f3(suiteOf(st))}`);
+  row('autoPipeline', ap());
+  if (REAL.length) {
+    report('full auto', AUTO());
+    report('自動判斷 (start)', ap());
+  }
+  let bestAP = natural(ap());
+  if (!REPORT && REAL.length) {
+    const GR: Partial<Record<TKey, [number, number]>> = { fuseGain: [0, 1], labGain: [0, 1.5], stGain: [0, 1], lwbGain: [0, 1] };
+    const QR: Partial<Record<keyof typeof QA_LIMITS, [number, number]>> = { clip: [0.002, 0.05], noiseAmp: [1.5, 3.5], lcRatio: [1.2, 3.5] };
+    for (let pass = 0; pass < 2; pass++)
+      for (const k of Object.keys(QR) as (keyof typeof QA_LIMITS)[]) {
+        const [lo, hi] = QR[k]!;
+        const step = (hi - lo) * (pass === 0 ? 0.2 : 0.1);
+        for (const dir of [1, -1])
+          for (;;) {
+            const old = QA_LIMITS[k];
+            const v = Math.min(hi, Math.max(lo, +(old + dir * step).toFixed(4)));
+            if (v === old) break;
+            QA_LIMITS[k] = v;
+            const sc = natural(ap());
+            if (sc < bestAP - 1e-4) bestAP = sc;
+            else {
+              QA_LIMITS[k] = old;
+              break;
+            }
+          }
+      }
+    console.log(`\n品質把關 limits: ${JSON.stringify(QA_LIMITS)}`);
+    for (let pass = 0; pass < 2; pass++)
+      for (const k of Object.keys(GR) as TKey[]) {
+        const [lo, hi] = GR[k]!;
+        const step = (hi - lo) * (pass === 0 ? 0.2 : 0.1);
+        for (const dir of [1, -1])
+          for (;;) {
+            const old = TUNING[k];
+            const v = Math.min(hi, Math.max(lo, +(old + dir * step).toFixed(3)));
+            if (v === old) break;
+            TUNING[k] = v;
+            const sc = natural(ap());
+            if (sc < bestAP - 1e-4) bestAP = sc;
+            else {
+              TUNING[k] = old;
+              break;
+            }
+          }
+      }
+    console.log(`\n自動判斷流程 gains: ${(['fuseGain', 'labGain', 'stGain', 'lwbGain'] as TKey[]).map((k) => `${k} ${TUNING[k]}`).join(', ')}`);
+    row('autoPipeline*', ap());
+    report('自動判斷 (tuned)', ap());
+  }
 }

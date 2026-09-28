@@ -673,3 +673,48 @@ footer {
   background: rgba(0, 0, 0, 0.55);
   color: var(--dim);
 }
+
+/* 自動化流程 */
+.autoflow h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+.autoflow h3 small {
+  font-weight: 400;
+  color: var(--dim);
+  font-size: 0.74rem;
+  margin-left: 6px;
+}
+.flow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.flowbtn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.82rem;
+  padding: 7px 9px;
+  min-width: 0;
+}
+.flowbtn.wide {
+  grid-column: 1 / -1;
+}
+.flowbtn small {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: var(--dim);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.flowbtn[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(52, 211, 238, 0.1);
+}
+.flowbtn.engaged:not([aria-pressed='true']) {
+  border-color: rgba(255, 209, 102, 0.6);
+}

@@ -67,6 +67,40 @@ amount is *measured per frame*:
 
 ![豐富色彩 on — split before/after](docs/screenshots/studio-vivid.png)
 
+### 🧠 自動化流程: the adaptive underwater pipeline
+
+![自動化流程 — 自動判斷流程 on a sunlit scene, split before/after](docs/screenshots/studio-flow.png)
+
+Six one-tap automations after the "analyse → correct → check quality" approach
+of the underwater-enhancement literature. No neural network runs in the
+browser: each is the algorithmic idea (WaterNet / Ancuti fusion, UIEC²-Net's
+separate colour axes, Sea-thru, local white balance, UIQM / UCIQE quality
+control), analysed on the frame and applied on the GPU, with a CPU twin so it
+is measured like everything else. A module button locks a measured-good
+strength; pressing it again hands it back to auto.
+
+| Button | What it does | Measured against full auto |
+|---|---|---|
+| 🧠 自動判斷流程 | **Natural mode.** Analyses the frame and switches modules on by need; turns 品質把關 on. On real photographs only Sea-thru helped, so that is what it engages (the other rule gains searched to 0 on half the photos) | real photos, hold-out half: ΔE **0.122 → 0.084**, local contrast 1.50× → 1.14×; sunlit scene colour error 0.163 → 0.140. Heavily degraded ground-truth scenes get less restoration (suite 0.794 → 0.947) |
+| 🔀 多分支融合 | White-balanced, gamma (0.7) and histogram-equalised (CLAHE) branches of the luminance, blended per pixel by local contrast × well-exposedness; weights smoothed (the coarse levels of a fusion pyramid), so no halos | green water −0.098, murky −0.091, clean photo −0.041; blue water and strobe worse; GPU green water colour error 0.175 → 0.169 |
+| 🎨 Lab 分軸校正 | Residual green / blue cast of pale surfaces removed along OKLab a (green↔red) and b (blue↔yellow), only toward red / yellow; saturated colours and open water protected | sunlit −0.059; blue scenes +0.03…+0.08 — full auto already neutralises the cast there, so this is for footage where some remains |
+| 🌊 Sea-thru 深度感知 | Backscatter fitted per channel from the darkest pixels at each pseudo-depth, attenuation from how the rest falls with depth; depth from the transmission map; takes over from dehaze instead of stacking on it | strobe colour error 0.188 → **0.140** (GPU), sunlit 0.185 → 0.145; real photos ΔE 0.136 → 0.114 |
+| 💡 補光區域白平衡 | A strobe or torch lights near subjects white while the rest stays in water light: the light is read from near-neutral surfaces on a 4 × 4 grid and the difference corrected | green water colour error 0.175 → **0.164** (GPU), shallow blue −0.02…−0.04; far part of the strobe scene 0.224 → 0.169 |
+| ✅ 品質把關 | UIQM and UCIQE, plus over-processing checks against the source: newly blown highlights, grain amplification in flat areas, local-contrast overshoot. For a still, the strongest enhancement that stays within the limits is found by bisection (dehaze, CLAHE, fusion, 豐富色彩, sharpening, exposure lift and the white point scale together); video eases toward it | real photos ΔE 0.136 → **0.089**; strobe newly blown 0.3 % → 0.0 % and colour error 0.188 → 0.152 (GPU) |
+
+Limits were calibrated on what true restoration needs on the ground-truth
+scenes (local contrast legitimately rises 1.3–3.8×, grain 1.0–1.9×) and
+clipping is held tightest: full auto clipped 5–38 % of the pixels of real
+frames against 0–24 % in their references. UIQM / UCIQE show in the analysis
+card whenever quality is measured.
+
+**Why two targets.** Heavily degraded ground-truth scenes reward full
+restoration (full auto); mild real footage rewards natural, gentle processing
+(自動判斷流程). The table shows both honestly; neither mode wins everywhere.
+Not included: GAN, transformer and diffusion enhancers (FUnIE-GAN, U-Shape,
+UIEDP, AquaDiff) — they need trained networks and model weights, which this
+real-time, in-browser engine does not run.
+
 ### ☀ Light: beams and surface highlights, with on-image control points
 
 ![光線控制點: ☀ light source (dragged), surface gradient A → B; split before/after](docs/screenshots/studio-light.png)
@@ -223,7 +257,7 @@ the engine's own correction (ΔE 0.150–0.205 vs 0.129).
 SwiftShader, WebCodecs VP9) against scenes with **known ground truth**: a reef
 rendered in true colour, then degraded with the Jaffe–McGlamery image-formation
 model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
-(73 / 73 passing):
+(83 / 83 passing):
 
 | Check | Result |
 |---|---|
@@ -249,17 +283,24 @@ model (`I = J·E·t + B·(1−t)`, wavelength-dependent β and K). Latest run
 | ☀ 光束 +0.8 / −0.8 | beam − gap luminance 63.8 → 92.6 / 25.3; at a wrong source only 64.0 |
 | 水面高光壓制 | clipped top band 37.1 % → 0.0 %, lower frame unchanged (Δ 0.0) |
 | Control points (mouse drag) | ☀ lands at (0.250, 0.050), B at y 0.450, both lock; 自動定位 unlocks all |
+| 自動化流程 buttons | each engages its module, changes the picture, press again returns to full auto (Δ 0.0) |
+| Sea-thru / 品質把關 on a strobe close-up | colour error 0.188 → 0.140 / 0.152; newly blown 0.3 % → 0.0 % |
+| 多分支融合 / 區域白平衡 in green water | colour error 0.175 → 0.169 / 0.164 |
+| 自動判斷流程 on sunlit shallows | colour error 0.163 → 0.140, no new clipping |
 | Imported profiles | each applies only its own method, replaces the engine colour stages, beats the source (colour error 0.544 → 0.23–0.33; 全自動 0.085), red 37 → 83–176; switching does not stack |
 | Export speed | 2×: 2.5 s, 75 frames, rotated 360×640 · 0.5×: 9.9 s, all 150 frames |
 | Phone layout (390 px) | no horizontal scroll |
 
-`test/engine.test.ts` (56 checks) covers the colour math, LUTs, guided
+`test/engine.test.ts` (70 checks) covers the colour math, LUTs, guided
 filter, recovery goals on the CPU mirror, manual overrides, EMA tracking,
 scene cuts, the eyedropper, 豐富色彩 (mild in auto, richer when locked, not
 darker, greys stay grey, gamut fit keeps hue), 「原始」 as an exact identity,
 curves, HSL, the light module (beam and surface detection, source position,
 grain σ within 15 %, surface mask and recovery, 光線去洋紅 keeping coral
-pink, sun beams near-white, open water not violet on a sandy bottom), and the
+pink, sun beams near-white, open water not violet on a sandy bottom), the
+自動化流程 modules (fusion weights, Lab direction and protection, Sea-thru
+fit recovering known parameters, local white balance, the quality measures,
+品質把關 ending within its limits, the natural mode on a land photo), and the
 analysis time budget. `test/methods.test.ts` (50 checks) covers the imported methods
 (published coefficient tables, the matrix's blue row, the GLSL twins, one
 method per profile, profiles replacing the engine's colour stages, warplab
@@ -286,6 +327,7 @@ source ─────────────▶ GRADE ─mips─▶ BLUR H ─
 | `src/engine/color.ts`, `filters.ts`, `luts.ts` | Colour math, guided / box / min filters, CLAHE & tone-curve LUTs |
 | `src/engine/params.ts` | Every control: range, default, auto or manual, presets |
 | `src/engine/look.ts` | Curves (monotone cubic → LUT) and the 8-band OKLCh HSL mixer |
+| `src/engine/pipeline.ts` | 自動化流程: fusion weights, Lab cast, Sea-thru fit, local white balance, UIQM / UCIQE and over-processing measures |
 | `src/engine/light.ts` | Beam / surface detection, grain σ, JS twins of the light shader maths |
 | `src/ui/lightPoints.ts` | Draggable ☀ / A / B control points over the viewer |
 | `scripts/optimize.ts` | Ground-truth scene suite + coordinate descent that tuned auto, the presets and the profiles |

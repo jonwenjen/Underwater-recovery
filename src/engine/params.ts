@@ -54,6 +54,19 @@ export interface Params {
   surfaceWarm: number;
   /** 光線去洋紅: take the pink out of pale sunlight (auto from light presence). */
   lightNeutral: number;
+  // --- 自動化流程 (src/engine/pipeline.ts) ------------------------------
+  /** 多分支融合: WB / gamma / histogram-equalised branches, per-pixel weights. */
+  fusion: number;
+  /** Lab 分軸校正: residual green / blue cast removed along OKLab a / b. */
+  labCast: number;
+  /** Sea-thru 深度感知: fitted backscatter + attenuation per pseudo-depth. */
+  seathru: number;
+  /** 補光區域白平衡: local white balance where artificial light is detected. */
+  localWB: number;
+  /** 品質把關: 1 = measure quality and back off over-processing. */
+  qaGuard: number;
+  /** 自動判斷流程: 1 = the modules above are switched on by the frame's needs. */
+  autoPipeline: number;
   surfAx: number;
   surfAy: number;
   surfBx: number;
@@ -101,6 +114,10 @@ export const AUTO_KEYS = [
   'surfBx',
   'surfBy',
   'lightNeutral',
+  'fusion',
+  'labCast',
+  'seathru',
+  'localWB',
   'restore',
   'denoise',
   'threshold',
@@ -149,6 +166,12 @@ export const DEFAULT_PARAMS: Params = {
   surfaceTone: 0,
   surfaceWarm: 0,
   lightNeutral: 0,
+  fusion: 0,
+  labCast: 0,
+  seathru: 0,
+  localWB: 0,
+  qaGuard: 0,
+  autoPipeline: 0,
   surfAx: 0.5,
   surfAy: 0,
   surfBx: 0.5,
@@ -240,6 +263,17 @@ export const GROUPS: Group[] = [
     ],
   },
   {
+    title: '自動化流程（分析 → 校正 → 品質把關）',
+    sliders: [
+      { key: 'fusion', label: '多分支融合', min: 0, max: 1, step: 0.01, hint: 'WaterNet／Ancuti 思路：白平衡、Gamma、直方圖等化三個分支，依每個像素的局部對比與曝光良好度加權融合' },
+      { key: 'labCast', label: 'Lab 分軸校正', min: 0, max: 1, step: 0.01, hint: 'UIEC² 思路：在 OKLab 的 a（綠↔紅）、b（藍↔黃）軸移除殘留水色，只往紅／黃方向；飽和色（珊瑚、魚）與水體受保護' },
+      { key: 'seathru', label: 'Sea-thru 深度感知', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz：以最暗像素擬合各深度的後向散射，再依距離補回衰減；深度取自去霧的穿透率圖' },
+      { key: 'localWB', label: '補光區域白平衡', min: 0, max: 1, step: 0.01, hint: '閃燈／手電筒只照亮近處：偵測到畫面中光源色溫不一致時，分區修正白平衡' },
+      { key: 'qaGuard', label: '品質把關', min: 0, max: 1, step: 1, hint: '1 ＝計算 UIQM／UCIQE 並檢查過曝、雜訊放大、局部對比過度；超標時自動降低增強強度' },
+      { key: 'autoPipeline', label: '自動判斷流程', min: 0, max: 1, step: 1, hint: '1 ＝依畫面分析自動決定要開哪些模組（綠／藍偏 → Lab、深度差大 → Sea-thru、補光 → 區域白平衡、平淡 → 融合），並開啟品質把關' },
+    ],
+  },
+  {
     title: '外部演算法（全自動 profiles）',
     sliders: [
       { key: 'matrixMix', label: '直方圖間隙矩陣', min: 0, max: 1, step: 0.01, hint: 'bornfree / nikolajbech：在去霧後的畫面上以最寬直方圖空隙定黑白點，再套 3×3 sRGB 色彩矩陣' },
@@ -277,12 +311,13 @@ const RAW: Partial<Record<NumKey, number>> = {
   clahe: 0, clarity: 0, sharpen: 0, denoise: 0, restore: 0,
   vibrance: 0, saturation: 1, deCast: 0, vivid: 0,
   beams: 0, surfaceHL: 0, surfaceTone: 0, surfaceWarm: 0, lightNeutral: 0,
+  fusion: 0, labCast: 0, seathru: 0, localWB: 0,
 };
 
 /** Only one imported method at a time: switching profiles cannot stack two. */
 const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0 } as const;
 /** The engine's own colour correction, off while a profile does that job. */
-const ENGINE_COLOUR_OFF = { redComp: 0, blueComp: 0, depthColor: 0, wbStrength: 0, deCast: 0 } as const;
+const ENGINE_COLOUR_OFF = { redComp: 0, blueComp: 0, depthColor: 0, wbStrength: 0, deCast: 0, labCast: 0, localWB: 0, seathru: 0 } as const;
 
 export const PRESETS: Record<string, Preset> = {
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },

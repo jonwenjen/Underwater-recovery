@@ -711,6 +711,83 @@ try {
     check('profiles do not stack when switched', drift < 0.6, `drift ${f3(drift)}`);
   }
 
+  console.log('\n— 自動化流程: 自動判斷 / 融合 / Lab / Sea-thru / 區域白平衡 / 品質把關');
+  {
+    const flow = await page.evaluate(async () => {
+      const S = window.__scene, U = window.__uw;
+      const W = 600, H = 400;
+      const btn = (k) => document.querySelector(`#flow button[data-flow="${k}"]`);
+      // newly blown: clipped in the output but not already in the source
+      let cur = null;
+      const blown = (o) => {
+        const src = S.degrade(S.truth(o.w, o.h, cur.pan, cur.seed), cur.water, cur.depth, 3, cur.opts);
+        let b = 0;
+        for (let i = 0; i < o.px.length; i += 4)
+          if (Math.max(o.px[i], o.px[i + 1], o.px[i + 2]) >= 254 && Math.max(src[i], src[i + 1], src[i + 2]) < 254) b++;
+        return b / (o.px.length / 4);
+      };
+      const mean = (o) => { const a = [0, 0, 0]; for (let i = 0; i < o.px.length; i += 4) for (let c = 0; c < 3; c++) a[c] += o.px[i + c]; return a.map((v) => v / (o.px.length / 4)); };
+      const load = async (name, water, depth, opts, pan = 0, seed = 7) => {
+        cur = { water, depth, opts, pan, seed };
+        const t = S.truth(W, H, pan, seed);
+        await U.addFiles([await S.toFile(S.degrade(t, water, depth, 3, opts), W, H, name + '.png')]);
+        U.setView({ mode: 0 });
+        U.preset('auto');
+      };
+      const measure = (pan = 0, seed = 7) => {
+        const r = U.render();
+        const o = U.outputPixels();
+        const ts = S.truth(o.w, o.h, pan, seed);
+        return { err: S.chromaError(o.px, o.w, o.h, ts).err, slate: S.chromaError(o.px, o.w, o.h, ts, 'slate').err, blown: blown(o), mean: mean(o), flow: r.flow, note: '' };
+      };
+      const press = (k, pan, seed) => { btn(k).click(); const m = measure(pan, seed); m.pressed = btn(k).getAttribute('aria-pressed'); m.note = btn(k).querySelector('[data-note]').textContent; btn(k).click(); m.back = measure(pan, seed).mean; return m; };
+      const out = {};
+      await load('flow-blue8', 'blue', 8, {});
+      out.blue8 = { auto: measure() };
+      for (const k of ['autoPipeline', 'fusion', 'labCast', 'seathru', 'localWB', 'qaGuard']) out.blue8[k] = press(k);
+      await load('flow-strobe', 'blue', 10, { strobe: 3 }, 0.35, 11);
+      out.strobe = { auto: measure(0.35, 11), seathru: press('seathru', 0.35, 11), qaGuard: press('qaGuard', 0.35, 11) };
+      await load('flow-green', 'green', 6, {}, 0.35, 11);
+      out.green = { auto: measure(0.35, 11), fusion: press('fusion', 0.35, 11), localWB: press('localWB', 0.35, 11) };
+      await load('flow-sunny', 'blue', 2.5, { beams: true, surface: true });
+      out.sunny = { auto: measure(), autoPipeline: press('autoPipeline'), seathru: press('seathru') };
+      U.preset('auto');
+      return out;
+    });
+    const d = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+    const own = { autoPipeline: 'seathru', fusion: 'fusion', labCast: 'lab', seathru: 'seathru', localWB: 'localWB' };
+    for (const k of ['autoPipeline', 'fusion', 'labCast', 'seathru', 'localWB', 'qaGuard']) {
+      const m = flow.blue8[k];
+      const engaged = k === 'qaGuard' ? m.flow.quality !== null : m.flow[own[k]] > 0.05;
+      check(`${k}: button engages its module, changes the picture, press again = full auto`,
+        m.pressed === 'true' && engaged && d(m.mean, flow.blue8.auto.mean) > 0.5 && d(m.back, flow.blue8.auto.mean) < 0.5,
+        `${m.note} · Δ${f1(d(m.mean, flow.blue8.auto.mean))}, back Δ${f1(d(m.back, flow.blue8.auto.mean))}`);
+    }
+    check('Sea-thru 深度感知 on a strobe close-up: truer colour (in place of dehaze)', flow.strobe.seathru.err < flow.strobe.auto.err,
+      `colour error ${f3(flow.strobe.auto.err)} → ${f3(flow.strobe.seathru.err)}`);
+    check('品質把關 on the strobe close-up: far fewer newly blown highlights, truer colour',
+      flow.strobe.qaGuard.blown < 0.5 * flow.strobe.auto.blown && flow.strobe.qaGuard.err < flow.strobe.auto.err,
+      `newly blown ${f1(flow.strobe.auto.blown * 100)} % → ${f1(flow.strobe.qaGuard.blown * 100)} %, colour error ${f3(flow.strobe.auto.err)} → ${f3(flow.strobe.qaGuard.err)} (${flow.strobe.qaGuard.note})`);
+    check('多分支融合 / 補光區域白平衡 in green water: truer colour', flow.green.fusion.err <= flow.green.auto.err && flow.green.localWB.err < flow.green.auto.err,
+      `colour error ${f3(flow.green.auto.err)} → fusion ${f3(flow.green.fusion.err)}, local WB ${f3(flow.green.localWB.err)}`);
+    // screenshot: the sunlit scene with 自動判斷流程 on, split before/after
+    await page.evaluate(() => {
+      document.querySelector('#flow button[data-flow="autoPipeline"]').click();
+      window.__uw.setView({ mode: 1, split: 0.5 });
+      window.__uw.render();
+      document.querySelector('.autoflow').scrollIntoView();
+    });
+    await page.screenshot({ path: join(OUT, 'studio-flow.png') });
+    await page.evaluate(() => {
+      document.querySelector('#flow button[data-flow="autoPipeline"]').click();
+      window.__uw.preset('auto');
+      window.scrollTo(0, 0);
+    });
+    check('自動判斷流程 on sunlit shallows: truer colour and fewer blown highlights',
+      flow.sunny.autoPipeline.err < flow.sunny.auto.err && flow.sunny.autoPipeline.blown <= flow.sunny.auto.blown,
+      `colour error ${f3(flow.sunny.auto.err)} → ${f3(flow.sunny.autoPipeline.err)}, newly blown ${f1(flow.sunny.auto.blown * 100)} % → ${f1(flow.sunny.autoPipeline.blown * 100)} %`);
+  }
+
   console.log('\n— video: 5 s clip — pan + descent in blue water, cut to green water at 3.0 s');
   const clip = await page.evaluate(async () => {
     const S = window.__scene;

@@ -11,6 +11,7 @@ import { guidedCoefficients } from '../src/engine/filters.ts';
 import { buildClahe, buildCurve, sampleCurve } from '../src/engine/luts.ts';
 import { applyHsl, buildCurveLut, curveFn, hslWeights, identityCurves, identityHsl, sampleCurveLut, type Pt } from '../src/engine/look.ts';
 import { applySurface, detectBeams, detectSurface, estimateNoise, neutralLight, surfaceMask } from '../src/engine/light.ts';
+import { applyLabShift, fitSeaThru, fuseL, fusionWeights, localWhiteBalance, LWB_GRID, quality, seaThruChannel } from '../src/engine/pipeline.ts';
 import { DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
 
 let failures = 0;
@@ -465,6 +466,120 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
     }
   check('sun beams render near-white, not pink', Math.hypot(ba / bn, bb / bn) < 0.025, `beam chroma ${Math.hypot(ba / bn, bb / bn).toFixed(3)}`);
   check('sunlit sandy frame: open water stays blue–cyan (de-cast guard)', hueDeg > 150 && hueDeg < 275, `water hue ${hueDeg.toFixed(0)}°, de-cast ${st.effective.deCast.toFixed(2)}`);
+}
+
+/* ------------------------------------------------ 自動化流程 modules */
+
+{
+  // 多分支融合: weights are a partition of unity; amount 0 is an identity
+  const w = 64, h = 48, n = w * h;
+  const L = new Float32Array(n).map((_, i) => 0.1 + 0.8 * (((i % w) / w) * 0.5 + 0.5 * Math.sin(i / 97) ** 2));
+  const he = L.map((v) => Math.min(1, v * 1.2));
+  const w2 = new Float32Array(n), w3 = new Float32Array(n);
+  fusionWeights(L, he, w, h, w2, w3);
+  let ok = true;
+  for (let i = 0; i < n; i++) if (w2[i] < 0 || w3[i] < 0 || w2[i] + w3[i] > 1 + 1e-6) ok = false;
+  check('融合: branch weights are non-negative and sum to at most 1', ok);
+  check('融合: amount 0 leaves the luminance alone', fuseL(0.37, 0.8, 0.3, 0.3, 0) === 0.37);
+
+  // Lab: only toward red / yellow; saturated colours and open water spared
+  const pale = [0.55, 0.62, 0.64], sat = [0.9, 0.2, 0.25];
+  const p1 = pale.slice(), s1 = sat.slice(), pw = pale.slice();
+  applyLabShift(p1, 0, [0.02, 0.03], 1, 1);
+  applyLabShift(s1, 0, [0.02, 0.03], 1, 1);
+  applyLabShift(pw, 0, [0.02, 0.03], 1, 0.05);
+  const lab = (c: number[]) => toOklab(srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2]));
+  const d = (a: number[], b: number[]) => [lab(a)[1] - lab(b)[1], lab(a)[2] - lab(b)[2]];
+  check('Lab: a pale bluish surface moves toward red / yellow',
+    d(p1, pale)[0] > 0.01 && d(p1, pale)[1] > 0.015, `Δa ${d(p1, pale)[0].toFixed(3)} Δb ${d(p1, pale)[1].toFixed(3)}`);
+  check('Lab: saturated coral untouched; open water shifted less than a surface',
+    Math.abs(d(s1, sat)[0]) < 1e-4 && Math.hypot(...d(pw, pale)) < 0.5 * Math.hypot(...d(p1, pale)));
+
+  // Sea-thru: fitted on data made with the model, the parameters come back
+  const N = 6000, lin = new Float32Array(N * 3), tt = new Float32Array(N);
+  const B = [0.02, 0.15, 0.3], bb = [1.2, 0.9, 0.8], beta = [0.9, 0.3, 0.2];
+  let sd = 3;
+  const rnd = () => ((sd = (sd * 1664525 + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < N; i++) {
+    const z = 0.1 + 2.4 * rnd();
+    tt[i] = Math.exp(-z);
+    const J = rnd() < 0.05 ? 0 : 0.2 + 0.6 * rnd(); // some black pixels, as real scenes have
+    for (let c = 0; c < 3; c++) lin[i * 3 + c] = J * Math.exp(-beta[c] * z) + B[c] * (1 - Math.exp(-bb[c] * z));
+  }
+  const fit = fitSeaThru(lin, tt, N);
+  check('Sea-thru: backscatter fitted from the darkest pixels (within 25 %)',
+    fit.B.every((v, c) => Math.abs(v - B[c]) <= 0.25 * B[c] + 0.01), `B ${fit.B.map((v) => v.toFixed(3)).join(',')}`);
+  check('Sea-thru: attenuation differences recovered (red most, blue least)',
+    fit.beta[0] > fit.beta[1] && fit.beta[1] >= fit.beta[2] && Math.abs(fit.beta[0] - (beta[0] - beta[2])) < 0.25, `β ${fit.beta.map((v) => v.toFixed(2)).join(',')}`);
+  check('Sea-thru: restoration of a model pixel returns its radiance (relative to blue)',
+    Math.abs(seaThruChannel(0.4 * Math.exp(-0.9) + 0.02 * (1 - Math.exp(-1.2)), Math.exp(-1), 0.02, 1.2, 0.7) / (0.4 * Math.exp(-0.2)) - 1) < 0.05);
+
+  // local white balance: one light → no correction; a warm-lit half → cooled
+  const lw = 64, lh = 64, bal = new Float32Array(lw * lh * 3);
+  const fill = (warm: boolean) => {
+    for (let y = 0; y < lh; y++)
+      for (let x = 0; x < lw; x++) {
+        const q = (y * lw + x) * 3, v = 0.3 + 0.2 * Math.sin(x / 5) * Math.cos(y / 7);
+        const k = warm && y >= lh / 2 ? [1.25, 1, 0.8] : [1, 1, 1];
+        bal[q] = v * k[0]; bal[q + 1] = v * k[1]; bal[q + 2] = v * k[2];
+      }
+  };
+  fill(false);
+  const one = localWhiteBalance(bal, lw, lh);
+  fill(true);
+  const two = localWhiteBalance(bal, lw, lh);
+  const G = LWB_GRID, bottom = (G - 1) * G * 3;
+  check('區域白平衡: one light → gains ≈ 1, no spread', one.spread < 0.002 && one.gains.every((v) => Math.abs(v - 1) < 0.02), `spread ${one.spread.toFixed(4)}`);
+  check('區域白平衡: a warm-lit half is cooled, the spread is detected',
+    two.spread > 0.02 && two.gains[bottom] < 0.97 && two.gains[bottom + 2] > 1.03, `spread ${two.spread.toFixed(3)}, bottom gain ${Array.from(two.gains.slice(bottom, bottom + 3)).map((v) => v.toFixed(2))}`);
+
+  // quality: an untouched output is not over-processed; a crunchy one is
+  const qw = 96, qh = 64, qsrc = new Uint8ClampedArray(qw * qh * 4), same = new Float32Array(qw * qh * 3), crunchy = new Float32Array(qw * qh * 3);
+  let sq = 5;
+  const rq = () => ((sq = (sq * 1664525 + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < qw * qh; i++) {
+    const v = 90 + 40 * Math.sin(i / 300) + (rq() - 0.5) * 6;
+    qsrc[i * 4] = v * 0.6; qsrc[i * 4 + 1] = v; qsrc[i * 4 + 2] = v * 1.1; qsrc[i * 4 + 3] = 255;
+    for (let c = 0; c < 3; c++) same[i * 3 + c] = qsrc[i * 4 + c] / 255;
+  }
+  for (let i = 0; i < qw * qh; i++) for (let c = 0; c < 3; c++) {
+    const x = i % qw, y = (i / qw) | 0, j = (Math.min(qh - 1, y + 1) * qw + x) * 3 + c;
+    crunchy[i * 3 + c] = Math.min(1, Math.max(0, same[i * 3 + c] + 4 * (same[i * 3 + c] - same[j])));
+  }
+  const q0 = quality(same, qsrc, qw, qh), q1 = quality(crunchy, qsrc, qw, qh);
+  check('品質: the source itself is not over-processed', Math.abs(q0.noiseAmp - 1) < 0.05 && Math.abs(q0.lcRatio - 1) < 0.05 && q0.clip === 0,
+    `noise ×${q0.noiseAmp.toFixed(2)}, LC ×${q0.lcRatio.toFixed(2)}`);
+  check('品質: over-sharpening is measured as noise amplification', q1.noiseAmp > 2, `noise ×${q1.noiseAmp.toFixed(2)}, UIQM ${q1.uiqm.toFixed(2)} vs ${q0.uiqm.toFixed(2)}`);
+}
+{
+  // engine: 品質把關 keeps a still within its limits (or at its floor), and
+  // 自動判斷流程 turns on Sea-thru + 品質把關 but leaves a land photo alone
+  (globalThis as unknown as { window: unknown }).window ??= globalThis;
+  await import('../scripts/verify-scene.js');
+  type Scene = { truth(w: number, h: number): unknown; degrade(t: unknown, water: string, depth: number, seed?: number, opts?: Record<string, number | boolean>): Uint8ClampedArray };
+  const SC = (globalThis as unknown as { __scene: Scene }).__scene;
+  const w = 192, h = 108;
+  const sunny = SC.degrade(SC.truth(w, h), 'blue', 2.5, 3, { beams: true, surface: true });
+  const qa = new AutoEngine().step(sunny, w, h, { params: { ...DEFAULT_PARAMS, qaGuard: 1 }, locked: none, dt: 0 });
+  const q = qa.stats.quality!;
+  check('品質把關: a still ends within every limit, or at the strongest back-off',
+    (q.clip <= 0.002 && q.noiseAmp <= 2.5 && q.lcRatio <= 3) || qa.stats.qaScale <= 0.41,
+    `scale ×${qa.stats.qaScale.toFixed(2)}, clip ${(q.clip * 100).toFixed(2)} %, noise ×${q.noiseAmp.toFixed(2)}, LC ×${q.lcRatio.toFixed(2)}`);
+  const ap = new AutoEngine().step(SC.degrade(SC.truth(w, h), 'blue', 8), w, h, { params: { ...DEFAULT_PARAMS, autoPipeline: 1 }, locked: none, dt: 0 });
+  check('自動判斷流程: Sea-thru on (in place of part of dehaze) and quality measured',
+    ap.seathru.amount > 0.05 && ap.stats.quality !== null, `Sea-thru ${ap.seathru.amount.toFixed(2)}, scale ×${ap.stats.qaScale.toFixed(2)}`);
+  const g = grey();
+  const g0 = mirrorRender(g, W, H, new AutoEngine().step(g, W, H, { params: DEFAULT_PARAMS, locked: none, dt: 0 }));
+  const g1 = mirrorRender(g, W, H, new AutoEngine().step(g, W, H, { params: { ...DEFAULT_PARAMS, autoPipeline: 1 }, locked: none, dt: 0 }));
+  // natural mode on a land frame: at most as much change as full auto makes
+  let c0 = 0, c1 = 0;
+  for (let i = 0; i < W * H; i++)
+    for (let c = 0; c < 3; c++) {
+      c0 += Math.abs(g0[i * 3 + c] * 255 - g[i * 4 + c]);
+      c1 += Math.abs(g1[i * 3 + c] * 255 - g[i * 4 + c]);
+    }
+  check('自動判斷流程 changes a non-underwater frame no more than full auto does', c1 <= c0 + 1e-6,
+    `mean change ${(c0 / (W * H * 3)).toFixed(2)} → ${(c1 / (W * H * 3)).toFixed(2)} levels`);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {
