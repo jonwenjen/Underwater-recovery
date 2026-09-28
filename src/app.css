@@ -416,7 +416,6 @@ details.group summary {
   font-weight: 600;
   list-style: none;
   display: flex;
-  justify-content: space-between;
 }
 details.group summary::after {
   content: '▾';
@@ -473,9 +472,96 @@ details.group:not([open]) summary::after {
 .nobadge {
   width: 1px;
 }
-.export h3 {
+.export h3,
+.analysis h3,
+.mode h3 {
   margin: 0 0 8px;
   font-size: 0.95rem;
+}
+
+/* movable panel blocks (src/ui/blocks.ts) */
+.card[data-block] > h3,
+details.group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.card[data-block] > h3 > small {
+  flex: 0 1 auto;
+}
+.blk-ctl {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-weight: 400;
+}
+.blk-btn,
+.blk-grip {
+  display: inline-grid;
+  place-items: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--dim);
+  font-size: 0.8rem;
+  line-height: 1;
+  opacity: 0.55;
+}
+.blk-grip {
+  cursor: grab;
+  touch-action: none;
+  font-size: 1rem;
+}
+.blk-btn:hover,
+.blk-grip:hover,
+.blk-grip:focus-visible,
+.blk-btn:focus-visible {
+  opacity: 1;
+  color: var(--accent);
+  border-color: var(--line);
+}
+.blk-sorting,
+.blk-sorting * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+.blk-drag {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  position: relative;
+  z-index: 5;
+}
+.blk-drag .blk-grip {
+  opacity: 1;
+  color: var(--accent);
+}
+.blk-moved {
+  animation: blk-moved 0.7s ease-out;
+}
+@keyframes blk-moved {
+  from {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  to {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+.blk-reset {
+  align-self: center;
+  font-size: 0.8rem;
+  color: var(--dim);
+  background: none;
+  border-color: transparent;
+}
+@media (prefers-reduced-motion: reduce) {
+  .blk-moved {
+    animation: none;
+  }
 }
 .row {
   display: flex;

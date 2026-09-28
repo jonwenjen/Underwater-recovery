@@ -85,7 +85,8 @@
         </section>
 
         <aside class="panel" id="panel">
-          <div class="card analysis">
+          <div class="card analysis" data-block="analysis">
+            <h3>畫面分析</h3>
             <div class="meter">
               <div class="score"><b id="uwScore">—</b><span id="uwLabel">等待畫面</span></div>
               <canvas id="histo" width="256" height="72" aria-label="輸出直方圖"></canvas>
@@ -103,7 +104,8 @@
             </dl>
           </div>
 
-          <div class="card">
+          <div class="card mode" data-block="mode">
+            <h3>模式與預設</h3>
             <label class="master">
               <input type="checkbox" id="auto" checked />
               <span><b>全自動模式</b><small>每個畫面自動分析；滑桿動過即改為手動，按 A 交還自動</small></span>
@@ -114,7 +116,7 @@
             </button>
           </div>
 
-          <div class="card autoflow">
+          <div class="card autoflow" data-block="flow">
             <h3>自動化流程 <small>分析 → 校正 → 品質把關</small></h3>
             <div class="flow" id="flow">
               <button data-flow="autoPipeline" class="flowbtn wide" aria-pressed="false" title="自然還原：依畫面分析自動決定要開哪些模組，並開啟品質把關（真實照片上最接近參考影像）">
@@ -143,16 +145,16 @@
 
           <div id="groups"></div>
 
-          <details class="group" id="curvesGroup">
+          <details class="group" id="curvesGroup" data-block="curves">
             <summary>曲線（RGB／R／G／B）</summary>
             <div class="lookbox" id="curves"></div>
           </details>
-          <details class="group" id="hslGroup">
+          <details class="group" id="hslGroup" data-block="hsl">
             <summary>HSL（各色 色相／飽和度／明亮度）</summary>
             <div class="lookbox" id="hsl"></div>
           </details>
 
-          <div class="card export">
+          <div class="card export" data-block="export">
             <h3>輸出</h3>
             <div id="photoExport">
               <label class="row"><span>格式</span>
@@ -201,6 +203,8 @@
             </div>
             <p class="note" id="note"></p>
           </div>
+
+          <button type="button" id="resetBlocks" class="blk-reset hidden" title="區塊恢復預設順序">↺ 重設區塊順序</button>
         </aside>
       </main>
 

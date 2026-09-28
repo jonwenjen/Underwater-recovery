@@ -974,6 +974,44 @@ try {
   await mobile.screenshot({ path: join(OUT, 'studio-mobile.png') });
   check('phone layout has no horizontal scroll', mob.scroll <= mob.inner, `${mob.scroll} ≤ ${mob.inner}`);
 
+  console.log('\n— panel blocks: drag any block anywhere, order remembered, reset');
+  {
+    const lay = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    lay.on('pageerror', (e) => errors.push(String(e)));
+    await lay.goto(BASE);
+    await lay.waitForFunction(() => !!window.__uw);
+    const order = () => lay.evaluate(() => window.__uw.blocks());
+    const def = await order();
+    // mouse drag of 輸出's ⠿ handle to the top of the panel (the page scrolls while held near the edge)
+    const grip = lay.locator('[data-block="export"] .blk-grip');
+    await grip.scrollIntoViewIfNeeded();
+    const g = await grip.boundingBox();
+    await lay.mouse.move(g.x + g.width / 2, g.y + g.height / 2);
+    await lay.mouse.down();
+    for (let i = 1; i <= 20; i++) await lay.mouse.move(g.x + g.width / 2, Math.max(4, g.y - i * 60));
+    await lay.waitForFunction(() => scrollY === 0);
+    await lay.mouse.move(g.x + g.width / 2, 4);
+    await lay.mouse.up();
+    const dragged = await order();
+    await lay.screenshot({ path: join(OUT, 'studio-blocks.png') });
+    await lay.reload();
+    await lay.waitForFunction(() => !!window.__uw);
+    const reloaded = await order();
+    // ↑ on a slider group moves it without opening / closing it
+    const grp = reloaded.find((k) => k.startsWith('group:'));
+    const open0 = await lay.evaluate((k) => document.querySelector(`[data-block="${k}"]`).open, grp);
+    await lay.locator(`[data-block="${grp}"] .blk-btn[data-dir="-1"]`).click();
+    const up = await order();
+    const open1 = await lay.evaluate((k) => document.querySelector(`[data-block="${k}"]`).open, grp);
+    await lay.click('#resetBlocks');
+    const reset = await order();
+    await lay.close();
+    check('輸出 dragged to the top of the panel', dragged[0] === 'export' && dragged.length === def.length, dragged.slice(0, 3).join(' → '));
+    check('block order remembered after reload', reloaded.join() === dragged.join());
+    check('↑ moves a slider group one place, without toggling it', up.indexOf(grp) === reloaded.indexOf(grp) - 1 && open0 === open1, `${grp} ${reloaded.indexOf(grp)} → ${up.indexOf(grp)}`);
+    check('重設區塊順序 restores the default', reset.join() === def.join());
+  }
+
   check('no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
   writeFileSync(join(OUT, 'video-trace.json'), JSON.stringify(play, null, 1));
 } catch (err) {

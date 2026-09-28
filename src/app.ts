@@ -19,6 +19,7 @@ import { cloneLook, identityLook, type Look } from './engine/look.ts';
 import { NO_ORIENT, orientedSize, Processor, type Orient, type View } from './engine/renderer.ts';
 import { curveEditor } from './ui/curves.ts';
 import { hslPanel } from './ui/hsl.ts';
+import { movableBlocks } from './ui/blocks.ts';
 import { lightPoints, type PointId } from './ui/lightPoints.ts';
 
 import { Funie } from './engine/funie.ts';
@@ -227,6 +228,7 @@ function buildControls() {
   GROUPS.forEach((g, gi) => {
     const det = document.createElement('details');
     det.className = 'group';
+    det.dataset.block = `group:${g.title}`;
     det.open = gi < 3;
     det.innerHTML = `<summary>${g.title}</summary>`;
     const box = document.createElement('div');
@@ -288,6 +290,8 @@ function buildControls() {
     det.append(box);
     host.append(det);
   });
+  // each slider group is its own movable panel block
+  host.replaceWith(...host.children);
   refreshControls(null);
 }
 
@@ -1047,7 +1051,7 @@ function showLightPoints(on: boolean) {
   togglePressed('lightPts', on);
   lp.show(on && current >= 0);
   if (on) {
-    const g = [...document.querySelectorAll<HTMLDetailsElement>('#groups details')].find((d) => d.textContent?.includes('光束'));
+    const g = [...document.querySelectorAll<HTMLDetailsElement>('#panel details.group')].find((d) => d.textContent?.includes('光束'));
     if (g) g.open = true;
   }
 }
@@ -1058,6 +1062,7 @@ $('lightPts').addEventListener('click', () => showLightPoints($('lightPts').getA
 buildControls();
 buildPresets();
 updateLabels();
+const blockUi = movableBlocks($('panel'), $('resetBlocks'));
 
 /* --------------------------------------------------- automation test hook */
 
@@ -1238,6 +1243,9 @@ Object.assign(window as unknown as Record<string, unknown>, {
       return { size: blob.size, type: blob.type, w: bmp.width, h: bmp.height, stats: outputStats(new Uint8Array(px)) };
     },
     state: () => ({ params: { ...params }, locked: [...locked], preset: activePreset, view: { ...view } }),
+    /** Panel block order (keys), and moving one (test hooks). */
+    blocks: () => blockUi.order(),
+    moveBlock: (key: string, to: number) => blockUi.move(key, to),
     /** 🤖 AI 風格: press the button (awaits model load + first guide). */
     pressAi: () => pressAi(),
     aiState: () => ({

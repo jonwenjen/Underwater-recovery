@@ -326,6 +326,11 @@ the engine's own correction (ΔE 0.150–0.205 vs 0.129).
 - Split / result / original views, clipping warning overlay, live RGB
   histogram, water-light & illuminant swatches, grain σ, detected light
   (光束 / 水面), per-frame timing.
+- **Your own panel layout.** Every block of the side panel — analysis, mode
+  and presets, 自動化流程, each slider group, curves, HSL, 輸出 — can go
+  anywhere: drag its ⠿ handle (mouse or touch), or use ↑ / ↓ (or the arrow keys
+  on the handle). The order is remembered on the device (website and apps);
+  ↺ 重設區塊順序 at the bottom restores the default.
 - **Export at full resolution** (JPEG / PNG / WebP) and video to MP4 or WebM,
   optionally streamed straight to disk; the exporter runs the *same* processor
   and tracker as the preview, so what you see is what you get.
