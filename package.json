@@ -17,12 +17,10 @@
     "profiles:real": "node scripts/real-photo-profiles.mjs",
     "profiles:bench": "node scripts/bench-profiles.mjs",
     "fetch:zip": "node scripts/fetch-drive-zip.mjs",
-    "build:app": "tsc -b && APP_BUILD=1 vite build",
-    "android:sync": "npm run build:app && cap sync android"
+    "analyze": "node scripts/analyze-transfer.mjs",
+    "analyze:selftest": "node scripts/analyze-transfer.mjs --selftest"
   },
   "devDependencies": {
-    "@capacitor/android": "^8.5.2",
-    "@capacitor/cli": "^8.5.2",
     "@types/node": "^26.6.3",
     "playwright": "^1.63.0",
     "typescript": "~6.0.2",
@@ -30,10 +28,6 @@
   },
   "description": "Underwater Recovery Studio: GPU real-time recovery of underwater photos and video, with scene-tracking auto mode and pro controls, fully in the browser",
   "dependencies": {
-    "@capacitor/core": "^8.5.2",
-    "@capacitor/filesystem": "^8.1.3",
-    "@capacitor/share": "^8.0.2",
-    "mediabunny": "^1.60.0",
-    "onnxruntime-web": "^1.30.0"
+    "mediabunny": "^1.60.0"
   }
 }
