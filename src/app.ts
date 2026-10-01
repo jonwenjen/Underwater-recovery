@@ -1240,7 +1240,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
         const i = (y * bmp.width + x) * 4;
         px.push(d[i], d[i + 1], d[i + 2], 255);
       }
-      return { size: blob.size, type: blob.type, w: bmp.width, h: bmp.height, stats: outputStats(new Uint8Array(px)) };
+      return { size: blob.size, type: blob.type, w: bmp.width, h: bmp.height, step: s, px, stats: outputStats(new Uint8Array(px)) };
     },
     state: () => ({ params: { ...params }, locked: [...locked], preset: activePreset, view: { ...view } }),
     /** Panel block order (keys), and moving one (test hooks). */

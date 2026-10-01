@@ -20,7 +20,9 @@
     "analyze": "node scripts/analyze-transfer.mjs",
     "analyze:selftest": "node scripts/analyze-transfer.mjs --selftest",
     "build:app": "tsc -b && APP_BUILD=1 vite build",
-    "android:sync": "npm run build:app && cap sync android"
+    "android:sync": "npm run build:app && cap sync android",
+    "probes": "node --experimental-strip-types scripts/probes.ts",
+    "probe-kit": "node --experimental-strip-types scripts/probe-kit.ts"
   },
   "devDependencies": {
     "@capacitor/android": "^8.5.2",

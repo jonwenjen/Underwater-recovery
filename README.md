@@ -22,6 +22,16 @@ node --experimental-strip-types scripts/optimize.ts [--report] [--real]   # re-t
 npm run build      # typecheck + production bundle
 ```
 
+## Comparing with other apps (Diverout)
+
+[`docs/diverout-review.md`](docs/diverout-review.md) reviews a proposed
+reverse-engineering plan for the Diverout app, runs its six black-box probes
+(colour chart under water, depth ramp, grey wedge / land photo, impulse,
+dropped video frame, flips) on this engine, and lists what to improve. The
+probe kit in [`docs/probe-kit/`](docs/probe-kit) runs any other app on the same
+files; `npm run probe-kit -- compare docs/probe-kit <its outputs>` scores both
+with the same metrics, and `npm run probes` scores this engine alone.
+
 ## Android and macOS apps
 
 The same Studio as installable apps — **Android** (`.apk`, Capacitor) and
