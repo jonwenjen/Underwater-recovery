@@ -1,4 +1,5 @@
 import { FUSE_GAMMA, SEATHRU_MAX_GAIN } from './pipeline.ts';
+import { DIVEROUT_PLUS } from './diverout.ts';
 
 /**
  * GLSL for the three full-resolution passes. The maths mirrors `auto.ts`
@@ -119,6 +120,31 @@ uniform vec4 u_pull[3];        // 全自動-T77701: (mean, min, max, darkFractio
 uniform float u_pullAmt;
 uniform vec3 u_physA;          // 全自動-warplab: per-channel attenuation
 uniform float u_physBack, u_physAmt, u_physMaxGain;
+uniform float u_dvK, u_dvSoft, u_dvAmt;  // 全自動-Diverout / Diverout+ (diverout.ts)
+uniform vec3 u_dvLo, u_dvHi;
+uniform vec3 u_dvWater;                  // Diverout+: open water colour (sRGB) kept
+uniform float u_dvKeep;
+const float DV_KEEP_WIDTH = ${DIVEROUT_PLUS.keepWidth.toFixed(3)};
+
+// mirrors softRange() / applyDiverout() in diverout.ts
+float dvSoft(float y) {
+  const float T = 0.06, K = 0.82;
+  if (y > K) return K + (1.0 - K) * tanh((y - K) / (1.0 - K));
+  if (y < T) return T * exp((y - T) / T);
+  return y;
+}
+vec3 diverout(vec3 e) {
+  float amt = u_dvAmt;
+  if (u_dvKeep > 0.0) {
+    vec3 cp = e / (e.r + e.g + e.b + 1e-4), cw = u_dvWater / (u_dvWater.r + u_dvWater.g + u_dvWater.b + 1e-4);
+    float d = length(cp - cw) / DV_KEEP_WIDTH;
+    amt *= 1.0 - u_dvKeep * exp(-d * d);
+  }
+  vec3 t = vec3(clamp(e.r + u_dvK * (1.0 - e.r) * e.g, 0.0, 1.0), e.g, e.b);
+  vec3 y = (t - u_dvLo) / (u_dvHi - u_dvLo);
+  y = u_dvSoft > 0.5 ? vec3(dvSoft(y.r), dvSoft(y.g), dvSoft(y.b)) : clamp(y, 0.0, 1.0);
+  return clamp(e + (y - e) * amt, 0.0, 1.0);
+}
 
 // 直方圖間隙色彩矩陣 — src/engine/matrix.ts, applied per pixel in sRGB.
 // The upstream method computes gains with a 256 numerator and a 255 offset,
@@ -207,6 +233,7 @@ void main() {
   if (u_mixAmt > 0.0001) c = mixMatrix(c);
   if (u_pullAmt > 0.0001) c = vec3(meanPull(c.r, u_pull[0]), meanPull(c.g, u_pull[1]), meanPull(c.b, u_pull[2]));
   if (u_physAmt > 0.0001) c = mix(c, physical(c), u_physAmt);
+  if (u_dvAmt > 0.0001) c = diverout(c);
   c = toLin(c);
   // Ancuti compensation: borrow signal from green where the scene has it
   c.r = min(1.0, c.r + u_aR * u_dR * (1.0 - c.r) * c.g);

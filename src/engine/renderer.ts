@@ -327,6 +327,15 @@ export class Renderer {
         gl.uniform1f(g.u.u_physBack, s.physBack);
       }
       gl.uniform1f(g.u.u_physAmt, s.physAmt);
+      if (s.dv.amount > 0.0001) {
+        gl.uniform1f(g.u.u_dvK, s.dv.k);
+        gl.uniform3fv(g.u.u_dvLo, s.dv.lo);
+        gl.uniform3fv(g.u.u_dvHi, s.dv.hi);
+        gl.uniform1f(g.u.u_dvSoft, s.dv.soft);
+        gl.uniform3fv(g.u.u_dvWater, s.dv.water);
+        gl.uniform1f(g.u.u_dvKeep, s.dv.keep);
+      }
+      gl.uniform1f(g.u.u_dvAmt, s.dv.amount);
       gl.uniform1f(g.u.u_physMaxGain, MAX_GAIN);
       this.bind(1, this.coef!, 'u_coef', g);
       this.bind(2, this.lut!, 'u_lut', g);

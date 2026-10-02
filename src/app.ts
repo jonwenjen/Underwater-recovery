@@ -217,7 +217,7 @@ interface RowRefs {
 const rows = new Map<NumKey, RowRefs>();
 
 const fmt = (d: SliderDef, v: number) =>
-  d.key === 'exposure' ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}` : d.step >= 1 ? v.toFixed(0) : d.step < 0.01 ? v.toFixed(3) : v.toFixed(2);
+  d.key === 'diverout' ? `${Math.round(v * 100)}%` : d.key === 'exposure' ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}` : d.step >= 1 ? v.toFixed(0) : d.step < 0.01 ? v.toFixed(3) : v.toFixed(2);
 
 function isFollowingAuto(k: NumKey): boolean {
   return params.auto && isAutoKey(k) && !locked.has(k);
@@ -296,6 +296,7 @@ function buildControls() {
 }
 
 function refreshControls(st: FrameState | null) {
+  syncDv();
   syncVivid();
   syncFlow();
   syncAi();
@@ -354,6 +355,21 @@ function applyPreset(key: string) {
   refreshControls(lastState);
   requestRender();
 }
+
+/* 色彩校正強度 0–200 %: the Diverout modes' amount, under the presets while one is on */
+const dvAmt = $<HTMLInputElement>('dvAmt');
+function syncDv() {
+  const on = params.diverout > 0.0001 || activePreset.startsWith('全自動-Diverout');
+  $('dvRow').classList.toggle('hidden', !on);
+  const pct = Math.round(params.diverout * 100);
+  if (document.activeElement !== dvAmt) dvAmt.value = String(pct);
+  $('dvOut').textContent = `${pct}%`;
+}
+dvAmt.addEventListener('input', () => {
+  params.diverout = Number(dvAmt.value) / 100;
+  refreshControls(lastState);
+  requestRender();
+});
 
 function markPreset(key: string | null) {
   activePreset = key ?? '';
@@ -1092,7 +1108,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
         src: outputStats(proc.renderer.readSmall()),
         stats: st.stats,
         effective: st.effective,
-        profile: { mix: st.mixAmt, pull: st.pullAmt, phys: st.physAmt },
+        profile: { mix: st.mixAmt, pull: st.pullAmt, phys: st.physAmt, dv: st.dv },
         flow: { fusion: st.fusion, lab: st.lab.amount, seathru: st.seathru.amount, localWB: st.lwb.amount, qaScale: st.stats.qaScale, quality: st.stats.quality },
         ms: proc.lastFrameMs,
         size: [proc.renderer.pw, proc.renderer.ph],

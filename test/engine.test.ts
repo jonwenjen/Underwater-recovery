@@ -14,6 +14,7 @@ import { applySurface, detectBeams, detectSurface, estimateNoise, neutralLight, 
 import { applyLabShift, fitSeaThru, fuseL, fusionWeights, localWhiteBalance, LWB_GRID, quality, seaThruChannel } from '../src/engine/pipeline.ts';
 import { AI_STYLE, DEFAULT_PARAMS, isAutoKey, PRESETS, type AutoKey, type Params } from '../src/engine/params.ts';
 import { applyGuide, blendGuide, fitGuide, gridFor, identityGuide, netSize } from '../src/engine/ai.ts';
+import { analyzeDiverout, applyDiverout, softRange } from '../src/engine/diverout.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -649,6 +650,67 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   const mH = mean((i, c) => half[i * 3 + c] * 255), m0 = mean((i, c) => none[i * 3 + c] * 255);
   check('AI 風格強度 0.5 lands halfway', mH.every((v, c) => Math.abs(v - (mS[c] + m0[c]) / 2) < 2),
     `${mH.map((v) => v.toFixed(1)).join('/')}`);
+}
+
+/* ------------------------------------------- 全自動-Diverout / Diverout+ */
+
+{
+  console.log('\n— 全自動-Diverout / Diverout+ (diverout.ts)');
+  const px = new Float32Array(3);
+  const st = { k: 0.1, lo: [0.1, 0.2, 0.2] as Vec3, hi: [0.6, 0.8, 0.9] as Vec3, soft: 0, amount: 1, water: [0, 0, 0] as Vec3, keep: 0 };
+  px.set([0.6, 0.8, 0.9]);
+  applyDiverout(px, { ...st, k: 0 });
+  check('Diverout: white points map to 1, the stretch is per channel', near(px[0], 1, 1e-6) && near(px[1], 1, 1e-6) && near(px[2], 1, 1e-6));
+  px.set([0.3, 0.5, 0.5]);
+  const p0 = Array.from(px);
+  applyDiverout(px, { ...st, amount: 0 });
+  check('strength 0 % leaves the picture alone', px.every((v, i) => v === p0[i]));
+  const one = new Float32Array([0.3, 0.4, 0.45]), two = new Float32Array([0.3, 0.4, 0.45]);
+  applyDiverout(one, { ...st, k: 0 });
+  applyDiverout(two, { ...st, k: 0, amount: 2 });
+  check('strength 200 % doubles the change (until it clips)', [0, 1, 2].every((c) => near(two[c] - 0.3 * 0 - [0.3, 0.4, 0.45][c], 2 * (one[c] - [0.3, 0.4, 0.45][c]), 1e-5) || two[c] === 0 || two[c] === 1),
+    `${Array.from(one).map((v) => v.toFixed(3))} → ${Array.from(two).map((v) => v.toFixed(3))}`);
+  let mono = true, prev = -1;
+  for (let y = -0.5; y <= 1.6; y += 0.01) {
+    const v = softRange(y);
+    if (v <= prev || v <= 0 || v >= 1) mono = false;
+    prev = v;
+  }
+  check('Diverout+ soft toe / shoulder: monotonic, never clips', mono && near(softRange(0.5), 0.5, 1e-9));
+  const red = new Float32Array([0.1, 0.6, 0.5]);
+  applyDiverout(red, { ...st, k: 0.2, lo: [0, 0, 0], hi: [1, 1, 1] });
+  check('red is compensated from green', red[0] > 0.1 + 0.2 * 0.9 * 0.6 - 1e-6 && near(red[1], 0.6, 1e-6), red[0].toFixed(3));
+  // the underwater gate: a land frame is left alone by Diverout+, not by Diverout
+  const land = grey();
+  const gPlus = analyzeDiverout(land, W, H, true).gate, gDv = analyzeDiverout(land, W, H, false);
+  const uw = underwater('blue');
+  check('Diverout+ gate: off on a land frame, on under water', gPlus < 0.05 && analyzeDiverout(uw, W, H, true).gate > 0.5,
+    `land ${gPlus.toFixed(2)}, under water ${analyzeDiverout(uw, W, H, true).gate.toFixed(2)} (Diverout itself always applies, k ${gDv.k.toFixed(3)})`);
+  // presets through the engine
+  const run = (name: string) => {
+    const set = PRESETS[name].set;
+    const locked = new Set(Object.keys(set).filter(isAutoKey)) as Set<AutoKey>;
+    const s2 = new AutoEngine().step(uw, W, H, { params: { ...DEFAULT_PARAMS, ...set }, locked, dt: 0 });
+    return { s2, out: mirrorRender(uw, W, H, s2) };
+  };
+  const dv = run('全自動-Diverout'), dvp = run('全自動-Diverout+');
+  const blown = (o: Float32Array) => { let b = 0; for (let i = 0; i < o.length; i += 3) if (Math.max(o[i], o[i + 1], o[i + 2]) >= 250 / 255) b++; return b / (o.length / 3); };
+  // red relative to green (the water took red): the balance both modes restore
+  const rg = (o: Float32Array) => { let r = 0, g = 0; for (let i = 0; i < o.length; i += 3) { r += o[i]; g += o[i + 1]; } return r / g; };
+  const raw = rg(Float32Array.from(uw.filter((_, i) => i % 4 !== 3), (v) => v / 255));
+  check('全自動-Diverout and Diverout+ both bring red back (R/G)', rg(dv.out) > raw * 1.15 && rg(dvp.out) > raw * 1.15 && dv.s2.dv.amount > 0.99 && dvp.s2.dv.soft === 1,
+    `R/G ${raw.toFixed(2)} → Diverout ${rg(dv.out).toFixed(2)}, Diverout+ ${rg(dvp.out).toFixed(2)}`);
+  // water keep: a pixel with the water's own colour is stretched less (it stays blue)
+  const water = [0.1, 0.45, 0.6] as Vec3;
+  const a = new Float32Array(water), b2 = new Float32Array(water);
+  applyDiverout(a, { ...st, k: 0, water, keep: 0 });
+  applyDiverout(b2, { ...st, k: 0, water, keep: 0.4 });
+  const coral = new Float32Array([0.5, 0.3, 0.3]), coral2 = new Float32Array([0.5, 0.3, 0.3]);
+  applyDiverout(coral, { ...st, k: 0, water, keep: 0 });
+  applyDiverout(coral2, { ...st, k: 0, water, keep: 0.4 });
+  check('Diverout+ water keep: open water changes 40 % less, other colours not at all',
+    [0, 1, 2].every((c) => near(b2[c] - water[c], 0.6 * (a[c] - water[c]), 1e-4)) && [0, 1, 2].every((c) => near(coral[c], coral2[c], 1e-4)));
+  check('Diverout+ clips no more than Diverout', blown(dvp.out) <= blown(dv.out), `blown ${(blown(dv.out) * 100).toFixed(1)} % → ${(blown(dvp.out) * 100).toFixed(1)} %`);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

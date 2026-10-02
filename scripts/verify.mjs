@@ -711,6 +711,55 @@ try {
     check('profiles do not stack when switched', drift < 0.6, `drift ${f3(drift)}`);
   }
 
+  console.log('\n— 全自動-Diverout / Diverout+ and the 色彩校正強度 slider (0–200 %)');
+  {
+    const dv = await page.evaluate(async () => {
+      const S = window.__scene, U = window.__uw;
+      const W = 600, H = 400;
+      const stats = (o) => {
+        let r = 0, g = 0, blown = 0;
+        for (let i = 0; i < o.px.length; i += 4) {
+          r += o.px[i]; g += o.px[i + 1];
+          if (Math.max(o.px[i], o.px[i + 1], o.px[i + 2]) >= 250) blown++;
+        }
+        return { rg: r / g, blown: blown / (o.px.length / 4) };
+      };
+      const diff = (a, b) => { let d = 0; for (let i = 0; i < a.px.length; i += 4) for (let c = 0; c < 3; c++) d += Math.abs(a.px[i + c] - b.px[i + c]); return d / ((a.px.length / 4) * 3); };
+      const shot = (preset, strength) => {
+        U.preset(preset);
+        if (strength !== undefined) U.setParam('diverout', strength);
+        U.render();
+        return U.outputPixels();
+      };
+      const t = S.truth(W, H, 0.35, 11);
+      await U.addFiles([await S.toFile(S.degrade(t, 'blue', 8, 3), W, H, 'dv-blue.png')]);
+      U.setView({ mode: 0 });
+      U.render(); // upload the new file before reading its source pixels
+      const src = { px: U.sourcePixels().px };
+      const d1 = shot('全自動-Diverout'), d0 = shot('全自動-Diverout', 0), d2 = shot('全自動-Diverout', 2);
+      const p1 = shot('全自動-Diverout+');
+      const slider = document.querySelector('[data-block^="group:外部演算法"] input[type=range]');
+      const label = [...document.querySelectorAll('.srow')].find((r) => r.textContent.includes('色彩校正強度'))?.textContent ?? '';
+      await U.addFiles([await S.toFile(S.clean(S.truth(W, H, 0.2, 21)), W, H, 'dv-land.png')]);
+      U.render();
+      const lsrc = { px: U.sourcePixels().px };
+      const l1 = shot('全自動-Diverout'), lp = shot('全自動-Diverout+');
+      U.preset('auto');
+      return {
+        src: stats(src), d1: stats(d1), p1: stats(p1),
+        zero: diff(d0, src), ch1: diff(d1, src), ch2: diff(d2, src),
+        landDv: diff(l1, lsrc), landPlus: diff(lp, lsrc), label: label.replace(/\s+/g, ' ').slice(0, 60), hasSlider: !!slider,
+      };
+    });
+    check('全自動-Diverout / Diverout+ restore red under water', dv.d1.rg > dv.src.rg * 1.15 && dv.p1.rg > dv.src.rg * 1.15,
+      `R/G ${f3(dv.src.rg)} → Diverout ${f3(dv.d1.rg)}, Diverout+ ${f3(dv.p1.rg)}`);
+    check('Diverout+ clips less than Diverout', dv.p1.blown <= dv.d1.blown, `pixels ≥ 250: ${f1(dv.d1.blown * 100)} % → ${f1(dv.p1.blown * 100)} %`);
+    check('色彩校正強度: 0 % is the untouched picture, 200 % changes more than 100 %', dv.zero < 1 && dv.ch2 > dv.ch1 * 1.3,
+      `change 0 % ${f1(dv.zero)} · 100 % ${f1(dv.ch1)} · 200 % ${f1(dv.ch2)} levels · "${dv.label}"`);
+    check('Diverout+ leaves a land photo alone (Diverout does not)', dv.landPlus < 2 && dv.landDv > dv.landPlus * 3,
+      `change: Diverout ${f1(dv.landDv)}, Diverout+ ${f1(dv.landPlus)} levels`);
+  }
+
   console.log('\n— 自動化流程: 自動判斷 / 融合 / Lab / Sea-thru / 區域白平衡 / 品質把關');
   {
     const flow = await page.evaluate(async () => {

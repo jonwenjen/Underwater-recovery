@@ -294,6 +294,40 @@ time — while dehaze, exposure, detail and light stay automatic. On the
 ground-truth scenes each moves the colour toward the truth, and none beats
 the engine's own correction (ΔE 0.150–0.205 vs 0.129).
 
+### 全自動-Diverout and 全自動-Diverout+
+
+Two modes after the Diverout app's **measured** behaviour
+([`docs/diverout-review.md`](docs/diverout-review.md); nothing of the app's
+code or models is used — the form and constants were fitted to its outputs on
+the probe kit):
+
+- **全自動-Diverout** keeps Diverout's own settings: red compensated from green,
+  then each channel stretched on its own between its 1.2 % and 96 % levels and
+  clipped, everything else off. It reproduces Diverout on the realistic probe
+  scenes to 34 / 10 levels mean error (81 / 14 for no change) and inherits its
+  traits: punchy, red back on near subjects, but clipped highlights, amplified
+  grain and land photos recoloured.
+- **全自動-Diverout+** keeps the idea and adds the protections: black / white
+  points at 0.5 / 99.5 %, a per-channel gain cap that tightens with grain, a
+  soft toe and shoulder instead of clipping, an amount gated by how much red
+  the water took (a land photo is left alone), and open water kept near its own
+  colour (40 % less stretch on the water's chromaticity — a per-channel stretch
+  otherwise turns blue water grey); noise reduction, sharpening and 畫質修復 stay
+  on auto.
+- **色彩校正強度 0–200 %** (外部演算法 group) sets how much of either is
+  applied: 0 % is the untouched picture, 100 % the default, 200 % doubles it.
+
+| | 1 m red object ΔE | 5 m | land photo change | pixels ≥ 250 (blue scene) | EUVP real ΔE |
+|---|---|---|---|---|---|
+| 全自動 (engine) | 0.211 | 0.224 | 0.039 | 2.9 % | 0.139 |
+| 自動判斷流程 | 0.213 | 0.232 | 0.044 | 0.2 % | 0.089 |
+| 全自動-Diverout | 0.124 (the app: 0.122) | 0.216 | 0.103 | 7.6 % | 0.105 |
+| **全自動-Diverout+** | **0.023** | **0.184** | **0.000** | **0.2 %** | **0.077** |
+
+(CPU mirror on the probe kit and the 23 EUVP pairs.) Stacked on the engine's own
+colour and tone stages, Diverout+ double-corrects (1 m object 0.238), so the
+mode runs it alone.
+
 ### Presets, curves, HSL, rotation, speed, restoration
 
 ![Curves, HSL and the 淺水／陽光 preset](docs/screenshots/studio-controls.png)

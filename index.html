@@ -111,6 +111,11 @@
               <span><b>全自動模式</b><small>每個畫面自動分析；滑桿動過即改為手動，按 A 交還自動</small></span>
             </label>
             <div class="presets" id="presets"></div>
+            <label class="dvrow hidden" id="dvRow" title="全自動-Diverout／Diverout+ 的色彩校正量：0 % 不校正、100 % 預設、200 % 加倍">
+              <span>色彩校正強度</span>
+              <input type="range" id="dvAmt" min="0" max="200" step="1" value="100" />
+              <output id="dvOut">100%</output>
+            </label>
             <button id="vivid" class="vivid" aria-pressed="false" title="依畫面實測彩度自動補足色彩、暖色、亮度與水色；強度可在「色彩」群組微調">
               ✨ 豐富色彩<small id="vividNote">自動把光線與色彩算得更飽滿</small>
             </button>

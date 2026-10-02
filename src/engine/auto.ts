@@ -29,6 +29,7 @@ import {
   LUMA_R,
   clamp,
   encodeFast,
+  linearToSrgb,
   luma,
   mix,
   shoulder,
@@ -45,6 +46,7 @@ import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetec
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 import { analyzeColorMatrix, applyMixGL } from './matrix.ts';
 import { analyzeMeanPull, meanPullGL } from './twostep.ts';
+import { analyzeDiverout, applyDiverout, DIVEROUT_OFF, DIVEROUT_PLUS, type DiveroutState } from './diverout.ts';
 import { JERLOV, physicalGL } from './physical.ts';
 import { applyGuide, type AiGuide } from './ai.ts';
 import {
@@ -185,6 +187,8 @@ export interface FrameState {
   physA: Vec3;
   physBack: number;
   physAmt: number;
+  /** 全自動-Diverout / Diverout+ (diverout.ts), applied after the other profiles. */
+  dv: DiveroutState;
   /** 自動化流程: per analysis pixel (depth guided coefficients a, b; fusion w2, w3). */
   aux: Float32Array;
   fusion: number;
@@ -410,7 +414,9 @@ export class AutoEngine {
     // source, in place of the engine's compensation and white balance (its
     // preset locks those off). Everything below — dehaze, exposure, CLAHE —
     // then works on the method's output, as the GRADE pass does.
-    const prof = this.profiles(rgba, w, h, p, rawWater.colour, S);
+    // grain σ (also used by Diverout+ to cap its stretch)
+    const sigma = S('noise', o.noise ? estimateNoise(o.noise.rgba, o.noise.w, o.noise.h) : 1);
+    const prof = this.profiles(rgba, w, h, p, rawWater.colour, S, sigma);
     if (prof.rgba) rgba = prof.rgba;
 
     /* 1. linearise + scene statistics ------------------------------- */
@@ -885,7 +891,6 @@ export class AutoEngine {
     const neutralAmt = E('lightNeutral', 0.85 * Math.max(bd.presence, sd.presence) * gate);
 
     /* 9. grain → 畫質修復, 降噪, 銳化門檻, 銳化 ------------------------ */
-    const sigma = S('noise', o.noise ? estimateNoise(o.noise.rgba, o.noise.w, o.noise.h) : 1);
     const restore = E('restore', 0.85 * smoothstep(2.5, 9, sigma));
     const denoise = E('denoise', 0.15 + 0.5 * smoothstep(1.5, 7, sigma));
     const threshold = E('threshold', clamp(0.012 + (2.2 * sigma) / 255, 0.015, 0.08));
@@ -900,7 +905,7 @@ export class AutoEngine {
       seathru: { B: stB, b: stb, beta: stBeta, amount: stAmt },
       lwb: { gains: lwbGains, amount: lwbAmt },
       mixMat: prof.mixMat, mixOff: prof.mixOff, mixAmt: prof.mixAmt, pull: prof.pull, pullAmt: prof.pullAmt,
-      physA: prof.physA, physBack: prof.physBack, physAmt: prof.physAmt,
+      physA: prof.physA, physBack: prof.physBack, physAmt: prof.physAmt, dv: prof.dv,
       aR, aB, dR, dB,
       A, Aout, post, k, dehazeOn, coef, coefW: w, coefH: h,
       wb, expMul,
@@ -1024,6 +1029,7 @@ export class AutoEngine {
     p: Params,
     waterColour: Vec3,
     S: (key: string, target: number) => number,
+    sigma = 1,
   ) {
     const n = w * h;
     const out = {
@@ -1035,9 +1041,10 @@ export class AutoEngine {
       physA: [0, 0, 0] as Vec3,
       physBack: 0,
       physAmt: 0,
+      dv: DIVEROUT_OFF as DiveroutState,
       rgba: null as Uint8ClampedArray | null,
     };
-    if (p.matrixMix <= 0.0001 && p.meanPull <= 0.0001 && p.physicalMix <= 0.0001) return out;
+    if (p.matrixMix <= 0.0001 && p.meanPull <= 0.0001 && p.physicalMix <= 0.0001 && p.diverout <= 0.0001) return out;
     const src = rgba as Uint8ClampedArray;
     if (p.matrixMix > 0.0001) {
       const cm = analyzeColorMatrix(src, w, h, { analysis: p.matrixGrid >= 0.5 ? 'fixed256' : 'full', hueLimit: p.matrixHue });
@@ -1074,6 +1081,20 @@ export class AutoEngine {
       out.physA = [S('phA', Math.max(0, wt.ar - wt.ag) * depth), 0, 0];
       out.physBack = S('phB', 0.08 * (0.5 + 0.5 * haze) * wt.beta); // β folded in: CPU and GPU agree
       out.physAmt = S('phM', p.physicalMix * smoothstep(0.12, 0.55, starvation));
+    }
+    if (p.diverout > 0.0001) {
+      // measured on the source like the other profiles (they are off in its presets)
+      const plus = p.diveroutPlus >= 0.5;
+      const dv = analyzeDiverout(src, w, h, plus, sigma);
+      out.dv = {
+        k: S('dvK', dv.k),
+        lo: dv.lo.map((v, c) => S(`dvLo${c}`, v)) as Vec3,
+        hi: dv.hi.map((v, c) => S(`dvHi${c}`, v)) as Vec3,
+        soft: plus ? 1 : 0,
+        amount: clamp(p.diverout, 0, 2) * (plus ? S('dvGate', dv.gate) : 1),
+        water: waterColour.map((v) => linearToSrgb(v)) as Vec3,
+        keep: plus ? DIVEROUT_PLUS.keep : 0,
+      };
     }
     // the corrected copy, exactly as the GRADE pass computes it
     if (!this.g8 || this.g8.length !== n * 4) this.g8 = new Uint8ClampedArray(n * 4);
@@ -1196,16 +1217,17 @@ export function seaThruGL(I: number, t: number, B: number, b: number, beta: numb
 }
 
 /** Imported profile state, as the GRADE pass takes it. */
-type ProfileState = { [K in 'mixMat' | 'mixOff' | 'mixAmt' | 'pull' | 'pullAmt' | 'physA' | 'physBack' | 'physAmt']: FrameState[K] };
+type ProfileState = { [K in 'mixMat' | 'mixOff' | 'mixAmt' | 'pull' | 'pullAmt' | 'physA' | 'physBack' | 'physAmt' | 'dv']: FrameState[K] };
 
 /**
  * The imported 全自動 profile on one sRGB-encoded 0..1 colour, in place.
- * Mirrors the head of GRADE_FS (mixMatrix → meanPull → physical).
+ * Mirrors the head of GRADE_FS (mixMatrix → meanPull → physical → diverout).
  */
 export function applyProfile(px: Float32Array, s: ProfileState): void {
   if (s.mixAmt > 0.0001) applyMixGL(px, 0, s.mixMat, s.mixOff, s.mixAmt);
   if (s.pullAmt > 0.0001) for (let c = 0; c < 3; c++) px[c] = meanPullGL(px[c], s.pull, c * 4, s.pullAmt);
   if (s.physAmt > 0.0001) for (let c = 0; c < 3; c++) px[c] += (physicalGL(px[c], s.physA[c], s.physBack) - px[c]) * s.physAmt;
+  if (s.dv.amount > 0.0001) applyDiverout(px, s.dv);
 }
 
 /**
@@ -1216,7 +1238,7 @@ export function mirrorRender(rgba: Uint8Array | Uint8ClampedArray, w: number, h:
   const n = w * h;
   const out = new Float32Array(n * 3);
   const px3 = new Float32Array(3);
-  const profile = s.mixAmt > 0.0001 || s.pullAmt > 0.0001 || s.physAmt > 0.0001;
+  const profile = s.mixAmt > 0.0001 || s.pullAmt > 0.0001 || s.physAmt > 0.0001 || s.dv.amount > 0.0001;
   const lwbOn = s.lwb.amount > 0.001;
   const aiOn = !!s.ai.guide && s.ai.amount > 0.001;
   const t12 = new Float32Array(12);

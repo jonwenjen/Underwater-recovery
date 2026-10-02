@@ -84,6 +84,10 @@ export interface Params {
   matrixGrid: number;
   /** 全自動-T77701: strength of the Fu et al. Eq. 1/2 per-channel mean pull. */
   meanPull: number;
+  /** 全自動-Diverout: 色彩校正強度 0..2 (shown as 0–200 %). */
+  diverout: number;
+  /** 1 = Diverout+ (percentile points, gain cap, soft shoulder, underwater gate). */
+  diveroutPlus: number;
   /** 上限 for the hue-shift search, degrees (published limit is 121). */
   matrixHue: number;
   /** 全自動-warplab: strength of the depth-guided physical restoration. */
@@ -184,6 +188,8 @@ export const DEFAULT_PARAMS: Params = {
   matrixGrid: 0,
   matrixHue: 121,
   meanPull: 0,
+  diverout: 0,
+  diveroutPlus: 0,
   physicalMix: 0,
   physicalDepth: 0.6,
 };
@@ -283,6 +289,8 @@ export const GROUPS: Group[] = [
       { key: 'matrixMix', label: '直方圖間隙矩陣', min: 0, max: 1, step: 0.01, hint: 'bornfree / nikolajbech：在去霧後的畫面上以最寬直方圖空隙定黑白點，再套 3×3 sRGB 色彩矩陣' },
       { key: 'matrixHue', label: '色相位移上限', min: 0, max: 121, step: 1, hint: '綠轉紅的上限（度）。原法為 121；調低可避免重度偏紅的畫面被推成洋紅' },
       { key: 'matrixGrid', label: '分析取樣', min: 0, max: 1, step: 1, hint: '0 ＝以分析畫面本身的像素數定門檻（nikolajbech）；1 ＝固定 256×256 取樣（bornfree，門檻固定）' },
+      { key: 'diverout', label: '色彩校正強度（Diverout）', min: 0, max: 2, step: 0.01, hint: '全自動-Diverout／Diverout+ 的色彩校正量：0 % 不校正、100 % 預設、200 % 加倍' },
+      { key: 'diveroutPlus', label: 'Diverout+ 保護', min: 0, max: 1, step: 1, hint: '1 ＝ Diverout+：黑白點取 0.5／99.5 %、每通道增益上限（雜訊越多越低）、柔性肩部不裁切、依紅光流失判斷是否為水下' },
       { key: 'meanPull', label: '兩段式色調拉抬', min: 0, max: 1, step: 0.01, hint: 'Fu 等 ISPACS 2017 Eq.2：通道均值拉回 128；通道被壓到全黑時改平移、不拉伸，避免雜訊爆開' },
       { key: 'physicalMix', label: '深度導向物理還原', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz 成像模型：先扣後向散射再除以衰減，還原被水吸收的紅色' },
       { key: 'physicalDepth', label: '虛擬深度', min: 0, max: 1, step: 0.01, hint: '整張畫面共用的距離尺度（由水霧量 × 紅色流失量推估）：0 不補、1 以最大距離補紅' },
@@ -319,7 +327,7 @@ const RAW: Partial<Record<NumKey, number>> = {
 };
 
 /** Only one imported method at a time: switching profiles cannot stack two. */
-const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0 } as const;
+const BORROWED_PROFILES = { matrixMix: 0, matrixGrid: 0, meanPull: 0, physicalMix: 0, diverout: 0, diveroutPlus: 0 } as const;
 /** The engine's own colour correction, off while a profile does that job. */
 const ENGINE_COLOUR_OFF = { redComp: 0, blueComp: 0, depthColor: 0, wbStrength: 0, deCast: 0, labCast: 0, localWB: 0, seathru: 0 } as const;
 
@@ -337,6 +345,15 @@ export const AI_STYLE: Partial<Record<NumKey, number>> = {
   contrast: 0, highlights: 0, clarity: 0,
   vibrance: 0, lightNeutral: 0, beams: 0, surfaceHL: 0, aiStyle: 1,
 };
+
+/**
+ * 全自動-Diverout+: the Diverout+ transform alone for colour and tone (on top
+ * of the engine's own stages it double-corrects: measured 1 m object ΔE
+ * 0.238 vs 0.023 alone), with noise reduction, sharpening and 畫質修復 left
+ * on auto — they matter on real footage and do not change colour.
+ */
+const { sharpen: _s, denoise: _d, restore: _r, threshold: _t, ...RAW_COLOUR } = RAW;
+const DIVEROUT_PLUS_SET: Partial<Record<NumKey, number>> = { ...RAW_COLOUR, ...BORROWED_PROFILES, diverout: 1, diveroutPlus: 1, qaGuard: 1 };
 
 export const PRESETS: Record<string, Preset> = {
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
@@ -384,5 +401,16 @@ export const PRESETS: Record<string, Preset> = {
     label: '全自動-warplab',
     hint: 'Akkaynak–Treibitz 物理模型取代引擎的紅色補償：扣後向散射、再依距離補回被吸收的紅色',
     set: { ...BORROWED_PROFILES, ...ENGINE_COLOUR_OFF, physicalMix: 1, physicalDepth: 0.45 },
+  },
+  '全自動-Diverout': {
+    label: '全自動-Diverout',
+    hint: '仿 Diverout App 的實測行為（docs/diverout-review.md）：從綠色補紅、每個通道各自拉伸到 1.2–96 % 百分位、超出即裁切；其餘步驟全關。鮮豔有力，但亮部容易裁切、雜訊放大，非水下畫面也照樣套用',
+    set: { ...RAW, ...BORROWED_PROFILES, diverout: 1, diveroutPlus: 0 },
+    raw: true,
+  },
+  '全自動-Diverout+': {
+    label: '全自動-Diverout+',
+    hint: 'Diverout 的對比與彩度，加上保護：黑白點取 0.5／99.5 %、每通道增益上限（雜訊越多越低）、柔性肩部不裁切、依紅光流失判斷是否為水下（陸地照片不動）；其餘色彩與影調步驟關閉，降噪／銳化／畫質修復仍自動',
+    set: DIVEROUT_PLUS_SET,
   },
 };

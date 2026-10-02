@@ -814,3 +814,18 @@ footer {
   opacity: 0.75;
   cursor: progress;
 }
+
+/* 色彩校正強度 (Diverout modes) under the presets */
+.dvrow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 3.2em;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  font-size: 0.85rem;
+}
+.dvrow output {
+  text-align: right;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
