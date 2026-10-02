@@ -5,5 +5,5 @@
     "types": ["node", "vite/client"],
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },
-  "include": ["src", "test", "bench", "scripts/optimize.ts", "scripts/probes.ts", "scripts/probe-materials.ts", "scripts/probe-kit.ts", "scripts/verify-scene.d.ts"]
+  "include": ["src", "test", "bench", "scripts/optimize.ts", "scripts/probes.ts", "scripts/probe-materials.ts", "scripts/probe-kit.ts", "scripts/probe-sheet.ts", "scripts/verify-scene.d.ts"]
 }

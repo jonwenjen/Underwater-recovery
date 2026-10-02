@@ -135,6 +135,10 @@ function exportKit(dir: string) {
     '',
     ...Object.keys(stills).map((n) => `${n}.png  ${(P[n.replace(/-(vflip|hflip|bg)$/, '')] ?? P[n])?.purpose ?? ''}${n.endsWith('flip') ? '（翻轉版）' : n.endsWith('-bg') ? '（無白點的背景，對照用）' : ''}`),
     `5-clip.mp4 / 5-clip-black.mp4 / 5-clip-land.mp4  ${P['5-clip'].purpose}`,
+    '',
+    '0-sheet.png  一次辨識用：12 種探針拼成一張（試用次數有限時先做這張）',
+    '  node --experimental-strip-types scripts/probe-sheet.ts compare <App 輸出>',
+    'sheet-tiles/  同 12 格的單張版；判定為「全域」時再逐張處理（compare-tile <1–12> <App 輸出>）',
   ];
   writeFileSync(join(dir, 'README.txt'), lines.join('\n') + '\n');
   console.log(`kit → ${dir}: ${Object.keys(stills).length} images, ${Object.keys(clips).length} clips${ff ? ' (MP4)' : ' (PNG frame folders: no ffmpeg)'}`);

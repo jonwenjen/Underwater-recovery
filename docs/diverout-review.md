@@ -139,7 +139,38 @@ Diverout 的測試包（`scripts/probe-kit.ts`），兩者用同一套指標比�
 | 全自動-Diverout | 0.124（App 本身 0.122） | 0.216 | 0.103 | 7.6 % | 0.105 |
 | **全自動-Diverout+** | **0.023** | **0.184** | **0.000** | **0.2 %** | **0.077** |
 
-## 八、工具
+## 八、一次辨識：拼圖探針 `0-sheet.png`（AI 照片增強試用次數有限時）
+
+`docs/probe-kit/0-sheet.png`（3080×1960）把 12 種探針拼成一張，一次處理就能量：
+
+| 格 | 內容 | 量什麼 |
+|---|---|---|
+| ①藍水 8 m ②綠水 6 m ③混濁 5 m ④閃燈 10 m ⑤淺水陽光 2.5 m（光束＋水面）⑥深水 15 m | 同一場景、六種水況（已知真值） | 每種水況的色彩誤差、裁切；若 App 依內容處理，可看出它對不同場景的判斷 |
+| ⑦ 水下色卡 | Macbeth 24 色，6 m／2 m 藍水 | 色卡 ΔE、灰塊彩度 |
+| ⑧ 深度階梯 | 同一紅色物體 1／5／10／20 m | 遠處紅色是否補更多（深度感知） |
+| ⑨ 灰階＋純色漸層 | 無色灰階、R/G/B/C/灰漸層 | 中性是否保持、斷階 |
+| ⑩ 陸地照片 | 非水下 | 應幾乎不改 |
+| ⑪ 脈衝 | 青底 3×3 白點 | 影響半徑（感受野） |
+| ⑫ ＝ ①，放在另一個位置 | 重複格 | 輸出不同 ⇒ App 有位置先驗 |
+
+**限制（重要）：** 如果 App 對整張圖只判斷一次場景、套一個全域轉換（Diverout 照片增強實測就是這樣），
+12 格都會得到同一個處理，拼圖只能證明「它是全域的」，看不到各場景的個別反應。
+所以報告第一步先判定：
+
+- **情境相依度**：同一個輸入顏色在不同格是否被改得一樣（leave-one-out，每格對 32³ 色彩格的平均變化 vs 其他格）。
+  < 1.5 ⇒ 全域逐點轉換；1.5–4 ⇒ 部分依內容；> 4 ⇒ 依內容／局部處理（每格是獨立量測）。
+- **重複格 ①／⑫ 差異**：位置先驗。
+
+自我測試：不改 0.0、全自動-Diverout 0.7（全域）、本 App 全自動 2.7（部分依內容：局部對比與去霧）、逐格不同處理 9.0。
+
+用法：
+
+1. 用 App 的 AI 照片增強處理 `0-sheet.png` 一次，用最高畫質存檔，不要裁切、不要截圖。
+2. `npm run probe-sheet -- compare <輸出檔>`（需要 Chrome 解碼；找不到時設 `CHROME_PATH`）。
+3. 若判定為「全域」，依報告建議的順序（②綠水 → ④閃燈 → ⑤淺水陽光 → ⑥深水 → ③混濁）
+   逐張處理 `docs/probe-kit/sheet-tiles/NN-*.png`，用 `npm run probe-sheet -- compare-tile <格號> <輸出檔>` 量測。
+
+## 九、工具
 
 | 指令 | 用途 |
 |---|---|
@@ -147,3 +178,6 @@ Diverout 的測試包（`scripts/probe-kit.ts`），兩者用同一套指標比�
 | `node --experimental-strip-types scripts/probe-kit.ts export <dir>` | 重新產生測試包 |
 | `node --experimental-strip-types scripts/probe-kit.ts compare <kit> <app輸出>` | 另一個 App 與本 App 並列比較 |
 | `npm run analyze <dir>` | 由實拍 before/after 推出轉換函數 |
+| `npm run probe-sheet -- export <file>` / `tiles <dir>` | 重新產生拼圖探針／單格版 |
+| `npm run probe-sheet -- compare <輸出>` / `compare-tile <格> <輸出>` | 拼圖或單格的報告 |
+| `npm run probe-sheet -- selftest` | 驗證判定（不改／全域／本 App／逐格） |

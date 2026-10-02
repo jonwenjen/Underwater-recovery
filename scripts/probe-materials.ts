@@ -22,7 +22,7 @@ type Scene = {
   clean(t: unknown): Uint8ClampedArray;
   WATER: Record<string, { beta: number[]; K: number[]; B: number[] }>;
 };
-const S = (globalThis as unknown as { __scene: Scene }).__scene;
+export const S = (globalThis as unknown as { __scene: Scene }).__scene;
 
 const toLin = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
 const toSrgb = (l: number) => {
@@ -51,7 +51,7 @@ export function oracle(px: Uint8ClampedArray, d: number, water: string, depth: n
  * Put a scene (sRGB J and distance d per pixel) under water at `depth`, with
  * the camera's auto-exposure to a mid-grey mean, 8-bit with ±1.5 dither.
  */
-function underwater(J: Float32Array, d: Float32Array, w: number, h: number, water = 'blue', depth = 6, seed = 5) {
+export function underwater(J: Float32Array, d: Float32Array, w: number, h: number, water = 'blue', depth = 6, seed = 5) {
   const W = S.WATER[water];
   const E = W.K.map((k) => Math.exp(-k * depth));
   const n = w * h;

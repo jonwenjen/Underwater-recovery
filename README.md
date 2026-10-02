@@ -31,6 +31,11 @@ dropped video frame, flips) on this engine, and lists what to improve. The
 probe kit in [`docs/probe-kit/`](docs/probe-kit) runs any other app on the same
 files; `npm run probe-kit -- compare docs/probe-kit <its outputs>` scores both
 with the same metrics, and `npm run probes` scores this engine alone.
+For apps with few trial runs (an "AI enhance" mode), `docs/probe-kit/0-sheet.png`
+packs twelve probes (six water types, chart, depth ladder, grey wedge, land,
+impulse, a repeated tile) into one image; `npm run probe-sheet -- compare <output>`
+first tells whether the app treats the sheet globally or tile by tile, then
+scores each tile.
 
 ## Android and macOS apps
 

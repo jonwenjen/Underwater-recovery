@@ -22,7 +22,8 @@
     "build:app": "tsc -b && APP_BUILD=1 vite build",
     "android:sync": "npm run build:app && cap sync android",
     "probes": "node --experimental-strip-types scripts/probes.ts",
-    "probe-kit": "node --experimental-strip-types scripts/probe-kit.ts"
+    "probe-kit": "node --experimental-strip-types scripts/probe-kit.ts",
+    "probe-sheet": "node --experimental-strip-types scripts/probe-sheet.ts"
   },
   "devDependencies": {
     "@capacitor/android": "^8.5.2",

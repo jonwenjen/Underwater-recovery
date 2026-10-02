@@ -16,3 +16,7 @@ Underwater probe kit — 用另一個 App 處理這些檔案，存成同名（�
 4-impulse.png  青色背景中央 3×3 白點：影響範圍＝有效感受野（0 ＝逐像素 LUT）
 4-impulse-bg.png  青色背景中央 3×3 白點：影響範圍＝有效感受野（0 ＝逐像素 LUT）（無白點的背景，對照用）
 5-clip.mp4 / 5-clip-black.mp4 / 5-clip-land.mp4  1 秒水下影片；第 15 幀換成全黑或陸地畫面：第 16 幀起多快恢復（跨幀記憶）
+
+0-sheet.png  一次辨識用：12 種探針拼成一張（試用次數有限時先做這張）
+  node --experimental-strip-types scripts/probe-sheet.ts compare <App 輸出>
+sheet-tiles/  同 12 格的單張版；判定為「全域」時再逐張處理（compare-tile <1–12> <App 輸出>）
