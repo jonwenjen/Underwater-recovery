@@ -92,7 +92,9 @@ export function chartMetrics(p: Probe, out: Img, raw: Img) {
  */
 export function rampMetrics(p: Probe, out: Img) {
   const m = p.meta as { ramps: { y: number; h: number }[] };
-  let rowSpread = 0, reversals = 0, maxJump = 0;
+  let reversals = 0, maxJump = 0;
+  // per column; the 90th percentile, so an app's logo in a corner does not count
+  const spreads: number[] = [];
   for (const r of m.ramps) {
     for (let x = 0; x < out.w; x++) {
       let lo = 1, hi = 0;
@@ -102,7 +104,7 @@ export function rampMetrics(p: Probe, out: Img) {
         lo = Math.min(lo, L);
         hi = Math.max(hi, L);
       }
-      rowSpread = Math.max(rowSpread, (hi - lo) * 255);
+      spreads.push((hi - lo) * 255);
     }
     const y = r.y + (r.h >> 1);
     let prev = -1, steps = 0, total = 0;
@@ -120,8 +122,9 @@ export function rampMetrics(p: Probe, out: Img) {
     }
     maxJump = Math.max(0, maxJump - total / Math.max(1, steps)); // above the ramp's own slope
   }
+  spreads.sort((a, b) => a - b);
   return {
-    rampRowSpreadLevels: rowSpread,
+    rampRowSpreadLevels: spreads[Math.floor(spreads.length * 0.9)] ?? 0,
     rampReversals: reversals,
     rampMaxExtraJumpLevels: maxJump,
   };

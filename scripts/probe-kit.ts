@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join } from 'node:path';
 import { crc32, deflateSync } from 'node:zlib';
 import { PROBES, type Probe } from './probe-materials.ts';
-import { chartMetrics, depthMetrics, impulseMetrics, oodMetrics, rampMetrics, runAll } from './probes.ts';
+import { chartMetrics, depthMetrics, impulseMetrics, oodMetrics, rampMetrics, runAll, runClip } from './probes.ts';
 
 type Img = { px: Uint8ClampedArray; w: number; h: number };
 const SCALE = 4;
@@ -219,6 +219,8 @@ async function compare(kitDir: string, appDir: string) {
     const a = get('4-impulse')!, b = get('4-impulse-bg')!;
     const i = impulseMetrics({ meta: { cx: Math.round((a.w * 384) / 768), cy: Math.round((a.h * 384) / 768) } } as Probe, a, b.w === a.w ? b : down(b, a.w, a.h));
     row('4 impulse spread radius (px of 768)', ((i.spreadRadiusPx * 768) / a.w).toFixed(1), `${((ours.impulse.spreadRadiusPx * 768) / 192).toFixed(1)} (scaled from 192)`);
+    if (files['4-impulse'] && /\.jpe?g$/i.test(files['4-impulse']) || readFileSync(files['4-impulse']).subarray(0, 2).equals(Buffer.from([0xff, 0xd8])))
+      console.log('  (the app saved JPEG: block ringing alone spreads a sharp dot ~8–16 px, so only a much larger radius means spatial filtering)');
   }
   for (const s of ['6-scene', '6-scene-surface']) {
     const o = at(s), v = at(`${s}-vflip`), h = at(`${s}-hflip`);
@@ -233,10 +235,21 @@ async function compare(kitDir: string, appDir: string) {
     for (const k of ['black', 'land']) {
       const c = clip(`5-clip-${k}`);
       if (!c) continue;
+      if (c.length !== ref.length) console.warn(`warning: 5-clip-${k} has ${c.length} frames, 5-clip ${ref.length} — the comparison is misaligned`);
+      // frames 0–14 are identical inputs: their difference is the codec's noise floor
+      const floor = c.slice(0, 15).reduce((a, fr, i) => a + meanAbs(fr, ref[i]), 0) / 15;
       const d = c.slice(16, 24).map((fr, i) => (ref[16 + i] ? meanAbs(fr, ref[16 + i]) : NaN));
-      row(`5 ${k} frame: frames 16–23 vs clean clip`, d.map((x) => x.toFixed(1)).join(' '), `${ours[`temporal_${k}`].diffs.slice(0, 8).map((x: number) => x.toFixed(1)).join(' ')}`);
+      row(`5 ${k} frame: frames 16–23 vs clean clip`, `${d.map((x) => x.toFixed(1)).join(' ')} (floor ${floor.toFixed(1)})`, `${ours[`temporal_${k}`].diffs.slice(0, 8).map((x: number) => x.toFixed(1)).join(' ')}`);
     }
-    console.log('  (0 from frame 16 on ⇒ frames graded independently or the tracker snaps on cuts; a slowly decaying difference ⇒ temporal memory)');
+    console.log('  (at the floor from frame 16 on ⇒ frames graded independently or the tracker snaps on cuts; a slowly decaying excess ⇒ temporal memory.');
+    console.log('   ours: the clean clip itself lags the scene by the tracker\'s smoothing, so ours decays even though frame 16 equals frame 16 graded alone)');
+    // clipping in the app's clean clip (frame 5) vs the input
+    const clipPct = (im: Img) => {
+      let n = 0;
+      for (let i = 0; i < im.px.length; i += 4) if (Math.max(im.px[i], im.px[i + 1], im.px[i + 2]) >= 250) n++;
+      return (100 * n) / (im.px.length / 4);
+    };
+    row('5 clean clip: pixels ≥ 250 (frame 5)', `${clipPct(ref[5]).toFixed(1)} %`, `${clipPct(runClip(P['5-clip'].frames!)[5]).toFixed(1)} %`);
   }
 }
 
