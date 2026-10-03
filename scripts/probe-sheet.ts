@@ -336,6 +336,8 @@ export function analyze(out: Img) {
   const ctx = contextDependence(insK, outsK, tw, th);
   const str = T.map((_, i) => structure(insK[i], outsK[i]));
   const rows: Record<string, unknown>[] = T.map((t, i) => ({ ...tileRow(t, ins[i], outs[i], out.w / SHEET_W, ctx[i].context), pointwise: +str[i].pointwise.toFixed(1), edges: +str[i].edges.toFixed(2), redrawn: Number.isNaN(str[i].redrawn) ? NaN : Math.round(100 * str[i].redrawn) }));
+  // a redrawn tile has no ground truth any more: its colour error compares different content
+  rows.forEach((r, i) => { if (r.colourErr && str[i].redrawn > 0.2) r.colourErr += '（內容已重繪，僅供參考）'; });
   // the water scenes ①–⑥ and ⑫: the mode's look and how much it redraws
   const scenes = T.map((_, i) => i).filter((i) => T[i].truth);
   const avg = (f: (i: number) => number) => scenes.reduce((a, i) => a + f(i), 0) / scenes.length;
@@ -376,6 +378,7 @@ function print(R: ReturnType<typeof analyze>) {
   const m = R.summary;
   console.log(`  輸出 ${m.size}（${m.mp.toFixed(1)} MP；輸入 ${SHEET_W}×${SHEET_H}）${m.mp < 0.6 * (SHEET_W * SHEET_H) / 1e6 ? ' — 解析度被降低' : ''}`);
   console.log(`  結構（水下 7 格）：重繪區塊 ${(100 * m.redrawn).toFixed(0)}%（最多一格 ${(100 * m.redrawnMax).toFixed(0)}%）、邊緣相關 ${m.edges.toFixed(2)}、非逐點變化 ${m.pointwise.toFixed(1)} 階 → ${redrawVerdict(m)}`);
+  if (m.redrawn > 0.2) console.log('  注意：水下格的內容已被重畫，對真值的色差只是參考；看「風格」一行判斷它的色調。');
   console.log(`  風格：亮度 ${m.dL >= 0 ? '+' : ''}${m.dL.toFixed(3)}、彩度 ×${m.chroma.toFixed(2)}、反差 ×${m.contrast.toFixed(2)}、色相 ${m.hueOut.toFixed(0)}°、紅 ${m.redIn.toFixed(0)}→${m.red.toFixed(0)}；色差 ${m.errIn.toFixed(3)}→${m.errOut.toFixed(3)}`);
   for (const r of R.rows) console.log(`  ${String(r.tile).padEnd(18)} 平均 ${r.in} → ${r.out} · 裁切 ${r.clip}% · 情境 ${r.context} · 非逐點 ${r.pointwise}${Number.isNaN(r.redrawn) ? '' : ` · 重繪 ${r.redrawn}%`}${r.colourErr ? ` · 色差 ${r.colourErr}` : ''}${r.detail ? ` · ${r.detail}` : ''}`);
   if (R.contextMean < 1.5)
@@ -464,8 +467,9 @@ else if (cmd === 'tiles' && arg) {
     const R = analyze(await decode(f)), m = R.summary;
     rows.push([f.replace(/^.*\//, '').replace(/\.[^.]+$/, ''), R.verdict.split('：')[0], R.contextMean.toFixed(1), `${(100 * m.redrawn).toFixed(0)}%`,
       (m.dL >= 0 ? '+' : '') + m.dL.toFixed(3), '×' + m.chroma.toFixed(2), '×' + m.contrast.toFixed(2), m.hueOut.toFixed(0) + '°',
-      `${m.redIn.toFixed(0)}→${m.red.toFixed(0)}`, `${m.errIn.toFixed(2)}→${m.errOut.toFixed(2)}`, `${m.chartIn.toFixed(3)}→${m.chartOut.toFixed(3)}`, m.greyChroma.toFixed(3), m.land.toFixed(3)]);
+      `${m.redIn.toFixed(0)}→${m.red.toFixed(0)}`, `${m.errIn.toFixed(2)}→${m.errOut.toFixed(2)}${m.redrawn > 0.2 ? '*' : ''}`, `${m.chartIn.toFixed(3)}→${m.chartOut.toFixed(3)}`, m.greyChroma.toFixed(3), m.land.toFixed(3)]);
   }
   for (const r of rows) console.log('| ' + r.join(' | ') + ' |');
+  if (rows.some((r) => r[9].endsWith('*'))) console.log('* 內容已重繪：色差比較的是不同的內容，僅供參考');
 } else if (cmd === 'selftest') selftest();
 else console.log('usage: probe-sheet.ts export <file.png> | compare <app-output> | modes <out1> <out2> … | tiles <dir> | compare-tile <1-12|key> <app-output> | selftest');
