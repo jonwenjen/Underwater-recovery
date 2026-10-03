@@ -738,6 +738,7 @@ try {
       const src = { px: U.sourcePixels().px };
       const d1 = shot('全自動-Diverout'), d0 = shot('全自動-Diverout', 0), d2 = shot('全自動-Diverout', 2);
       const p1 = shot('全自動-Diverout+');
+      const w1 = shot('全自動-Diverout+水色重生'), c1 = shot('全自動-Diverout+晶瑩極致');
       const slider = document.querySelector('[data-block^="group:外部演算法"] input[type=range]');
       const label = [...document.querySelectorAll('.srow')].find((r) => r.textContent.includes('色彩校正強度'))?.textContent ?? '';
       await U.addFiles([await S.toFile(S.clean(S.truth(W, H, 0.2, 21)), W, H, 'dv-land.png')]);
@@ -746,13 +747,15 @@ try {
       const l1 = shot('全自動-Diverout'), lp = shot('全自動-Diverout+');
       U.preset('auto');
       return {
-        src: stats(src), d1: stats(d1), p1: stats(p1),
+        src: stats(src), d1: stats(d1), p1: stats(p1), w1: stats(w1), c1: stats(c1),
         zero: diff(d0, src), ch1: diff(d1, src), ch2: diff(d2, src),
         landDv: diff(l1, lsrc), landPlus: diff(lp, lsrc), label: label.replace(/\s+/g, ' ').slice(0, 60), hasSlider: !!slider,
       };
     });
     check('全自動-Diverout / Diverout+ restore red under water', dv.d1.rg > dv.src.rg * 1.15 && dv.p1.rg > dv.src.rg * 1.15,
       `R/G ${f3(dv.src.rg)} → Diverout ${f3(dv.d1.rg)}, Diverout+ ${f3(dv.p1.rg)}`);
+    check('全自動-Diverout+水色重生 / +晶瑩極致 restore red and do not blow out', [dv.w1, dv.c1].every((x) => x.rg > dv.src.rg * 1.15 && x.blown < 0.01),
+      `R/G 水色重生 ${f3(dv.w1.rg)}, 晶瑩極致 ${f3(dv.c1.rg)} · pixels ≥ 250: ${f1(dv.w1.blown * 100)} %, ${f1(dv.c1.blown * 100)} %`);
     check('Diverout+ clips less than Diverout', dv.p1.blown <= dv.d1.blown, `pixels ≥ 250: ${f1(dv.d1.blown * 100)} % → ${f1(dv.p1.blown * 100)} %`);
     check('色彩校正強度: 0 % is the untouched picture, 200 % changes more than 100 %', dv.zero < 1 && dv.ch2 > dv.ch1 * 1.3,
       `change 0 % ${f1(dv.zero)} · 100 % ${f1(dv.ch1)} · 200 % ${f1(dv.ch2)} levels · "${dv.label}"`);

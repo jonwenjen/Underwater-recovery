@@ -441,7 +441,7 @@ function selftest() {
   }
 }
 
-const [cmd, arg, arg2] = process.argv.slice(2);
+const [cmd, arg, arg2] = process.argv[1]?.endsWith('probe-sheet.ts') ? process.argv.slice(2) : [];
 const fileOf = (t: Tile) => `${String(t.id).padStart(2, '0')}-${t.key}.png`;
 if (cmd === 'export' && arg) {
   writeFileSync(arg, png(sheet().img));
@@ -472,4 +472,4 @@ else if (cmd === 'tiles' && arg) {
   for (const r of rows) console.log('| ' + r.join(' | ') + ' |');
   if (rows.some((r) => r[9].endsWith('*'))) console.log('* 內容已重繪：色差比較的是不同的內容，僅供參考');
 } else if (cmd === 'selftest') selftest();
-else console.log('usage: probe-sheet.ts export <file.png> | compare <app-output> | modes <out1> <out2> … | tiles <dir> | compare-tile <1-12|key> <app-output> | selftest');
+else if (process.argv[1]?.endsWith('probe-sheet.ts')) console.log('usage: probe-sheet.ts export <file.png> | compare <app-output> | modes <out1> <out2> … | tiles <dir> | compare-tile <1-12|key> <app-output> | selftest');

@@ -333,6 +333,26 @@ the probe kit):
 colour and tone stages, Diverout+ double-corrects (1 m object 0.238), so the
 mode runs it alone.
 
+Two more take Diverout+ and add the **learnable part** of a Diverout AI mode.
+Those modes are generative (they redraw content); their look was measured on
+the probe sheet and fitted by `scripts/style-fit.ts`, with the colour chart
+kept near Diverout+ and nothing clipping:
+
+- **全自動-Diverout+水色重生** — brighter, more colourful, open water kept
+  vivid instead of stretched to grey (new slider **Diverout+ 水色保留**, 1),
+  light dehaze. The mode itself also empties red; that part is left out.
+- **全自動-Diverout+晶瑩極致** — more global and local contrast (contrast,
+  CLAHE, clarity), slightly clearer water, colour as Diverout+. Its re-rendered
+  photographic textures are not reproduced.
+
+| water scenes vs input | lightness | chroma | contrast | open-water chroma | chart ΔE |
+|---|---|---|---|---|---|
+| Diverout 水色重生 (AI) | +0.042 | ×1.31 | ×1.69 | ×1.39 | 0.124 |
+| 全自動-Diverout+ | +0.019 | ×0.83 | ×1.65 | ×0.62 | 0.103 |
+| **全自動-Diverout+水色重生** | +0.025 | ×1.12 | ×1.64 | ×1.04 | 0.095 |
+| Diverout 晶瑩極致 (AI) | −0.003 | ×0.90 | ×2.17 | ×1.01 | 0.121 |
+| **全自動-Diverout+晶瑩極致** | −0.002 | ×0.96 | ×1.90 | ×0.85 | 0.118 |
+
 ### Presets, curves, HSL, rotation, speed, restoration
 
 ![Curves, HSL and the 淺水／陽光 preset](docs/screenshots/studio-controls.png)

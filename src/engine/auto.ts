@@ -46,7 +46,7 @@ import { detectBeams, detectSurface, estimateNoise, neutralLight, type BeamDetec
 import { AUTO_KEYS, type AutoKey, type Params } from './params.ts';
 import { analyzeColorMatrix, applyMixGL } from './matrix.ts';
 import { analyzeMeanPull, meanPullGL } from './twostep.ts';
-import { analyzeDiverout, applyDiverout, DIVEROUT_OFF, DIVEROUT_PLUS, type DiveroutState } from './diverout.ts';
+import { analyzeDiverout, applyDiverout, DIVEROUT_OFF, type DiveroutState } from './diverout.ts';
 import { JERLOV, physicalGL } from './physical.ts';
 import { applyGuide, type AiGuide } from './ai.ts';
 import {
@@ -1093,7 +1093,7 @@ export class AutoEngine {
         soft: plus ? 1 : 0,
         amount: clamp(p.diverout, 0, 2) * (plus ? S('dvGate', dv.gate) : 1),
         water: waterColour.map((v) => linearToSrgb(v)) as Vec3,
-        keep: plus ? DIVEROUT_PLUS.keep : 0,
+        keep: plus ? clamp(p.diveroutWater, 0, 1) : 0,
       };
     }
     // the corrected copy, exactly as the GRADE pass computes it

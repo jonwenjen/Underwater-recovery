@@ -711,6 +711,16 @@ const run = (img: Uint8ClampedArray, params: Params = DEFAULT_PARAMS, eng = new 
   check('Diverout+ water keep: open water changes 40 % less, other colours not at all',
     [0, 1, 2].every((c) => near(b2[c] - water[c], 0.6 * (a[c] - water[c]), 1e-4)) && [0, 1, 2].every((c) => near(coral[c], coral2[c], 1e-4)));
   check('Diverout+ clips no more than Diverout', blown(dvp.out) <= blown(dv.out), `blown ${(blown(dv.out) * 100).toFixed(1)} % → ${(blown(dvp.out) * 100).toFixed(1)} %`);
+  // the style presets: Diverout+ underneath (same correction, its water keep from 水色保留), plus their own stages
+  const wr = run('全自動-Diverout+水色重生'), cr = run('全自動-Diverout+晶瑩極致');
+  const chromaOf = (o: Float32Array) => { let c = 0; for (let i = 0; i < o.length; i += 3) c += Math.max(o[i], o[i + 1], o[i + 2]) - Math.min(o[i], o[i + 1], o[i + 2]); return c / (o.length / 3); };
+  const lsd = (o: Float32Array) => { let s = 0, s2 = 0; const n = o.length / 3; for (let i = 0; i < o.length; i += 3) { const l = 0.2126 * o[i] + 0.7152 * o[i + 1] + 0.0722 * o[i + 2]; s += l; s2 += l * l; } return Math.sqrt(s2 / n - (s / n) ** 2); };
+  check('Diverout+ style presets keep the Diverout+ correction and its water keep',
+    wr.s2.dv.soft === 1 && cr.s2.dv.soft === 1 && wr.s2.dv.keep === PRESETS['全自動-Diverout+水色重生'].set.diveroutWater && rg(wr.out) > raw * 1.15 && rg(cr.out) > raw * 1.15,
+    `R/G ${raw.toFixed(2)} → 水色重生 ${rg(wr.out).toFixed(2)}, 晶瑩極致 ${rg(cr.out).toFixed(2)}; keep ${wr.s2.dv.keep}`);
+  check('水色重生 is more colourful than Diverout+, 晶瑩極致 has more contrast',
+    chromaOf(wr.out) > chromaOf(dvp.out) * 1.05 && lsd(cr.out) > lsd(dvp.out) * 1.05,
+    `chroma ${chromaOf(dvp.out).toFixed(3)} → ${chromaOf(wr.out).toFixed(3)} · lightness σ ${lsd(dvp.out).toFixed(3)} → ${lsd(cr.out).toFixed(3)}`);
 }
 
 function fmt(x: { r: number; g: number; b: number; contrast: number }) {

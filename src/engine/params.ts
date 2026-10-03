@@ -88,6 +88,8 @@ export interface Params {
   diverout: number;
   /** 1 = Diverout+ (percentile points, gain cap, soft shoulder, underwater gate). */
   diveroutPlus: number;
+  /** Diverout+: how much open water keeps its own colour (0 = stretched to grey). */
+  diveroutWater: number;
   /** 上限 for the hue-shift search, degrees (published limit is 121). */
   matrixHue: number;
   /** 全自動-warplab: strength of the depth-guided physical restoration. */
@@ -190,6 +192,7 @@ export const DEFAULT_PARAMS: Params = {
   meanPull: 0,
   diverout: 0,
   diveroutPlus: 0,
+  diveroutWater: 0.4,
   physicalMix: 0,
   physicalDepth: 0.6,
 };
@@ -291,6 +294,7 @@ export const GROUPS: Group[] = [
       { key: 'matrixGrid', label: '分析取樣', min: 0, max: 1, step: 1, hint: '0 ＝以分析畫面本身的像素數定門檻（nikolajbech）；1 ＝固定 256×256 取樣（bornfree，門檻固定）' },
       { key: 'diverout', label: '色彩校正強度（Diverout）', min: 0, max: 2, step: 0.01, hint: '全自動-Diverout／Diverout+ 的色彩校正量：0 % 不校正、100 % 預設、200 % 加倍' },
       { key: 'diveroutPlus', label: 'Diverout+ 保護', min: 0, max: 1, step: 1, hint: '1 ＝ Diverout+：黑白點取 0.5／99.5 %、每通道增益上限（雜訊越多越低）、柔性肩部不裁切、依紅光流失判斷是否為水下' },
+      { key: 'diveroutWater', label: 'Diverout+ 水色保留', min: 0, max: 1, step: 0.01, hint: '開放水域保留多少原本的藍綠色：0 拉成灰、0.4 預設、1 水色完全不動（只校正主體）' },
       { key: 'meanPull', label: '兩段式色調拉抬', min: 0, max: 1, step: 0.01, hint: 'Fu 等 ISPACS 2017 Eq.2：通道均值拉回 128；通道被壓到全黑時改平移、不拉伸，避免雜訊爆開' },
       { key: 'physicalMix', label: '深度導向物理還原', min: 0, max: 1, step: 0.01, hint: 'Akkaynak–Treibitz 成像模型：先扣後向散射再除以衰減，還原被水吸收的紅色' },
       { key: 'physicalDepth', label: '虛擬深度', min: 0, max: 1, step: 0.01, hint: '整張畫面共用的距離尺度（由水霧量 × 紅色流失量推估）：0 不補、1 以最大距離補紅' },
@@ -355,6 +359,27 @@ export const AI_STYLE: Partial<Record<NumKey, number>> = {
 const { sharpen: _s, denoise: _d, restore: _r, threshold: _t, ...RAW_COLOUR } = RAW;
 const DIVEROUT_PLUS_SET: Partial<Record<NumKey, number>> = { ...RAW_COLOUR, ...BORROWED_PROFILES, diverout: 1, diveroutPlus: 1, qaGuard: 1 };
 
+/**
+ * Diverout+ with the learnable part of a Diverout AI mode on top
+ * (docs/diverout-review.md §八). Those modes are generative (they redraw
+ * content); what carries over is the look, measured on the probe sheet and
+ * fitted by scripts/style-fit.ts with the chart's colour no worse than
+ * Diverout+ and nothing clipping:
+ *  - 水色重生: brighter, more colourful, open water kept vivid instead of
+ *    stretched to grey, light dehaze. (The mode also empties red; that part is
+ *    left out — subjects keep the Diverout+ correction.)
+ *  - 晶瑩極致: more global and local contrast (×2.17 measured), clear water,
+ *    colour about as Diverout+. The fit's CLAHE 0.4 grained flat water and
+ *    haloed the surface line, so CLAHE is lower and global contrast higher.
+ *    (Its re-rendered textures are not reproducible.)
+ */
+const DIVEROUT_PLUS_WATER: Partial<Record<NumKey, number>> = {
+  ...DIVEROUT_PLUS_SET, diveroutWater: 1, vivid: 0.7, exposure: 0.15, contrast: -0.1, dehaze: 0.2,
+};
+const DIVEROUT_PLUS_CRYSTAL: Partial<Record<NumKey, number>> = {
+  ...DIVEROUT_PLUS_SET, diveroutWater: 0.85, contrast: 0.3, clarity: 0.3, clahe: 0.2, dehaze: 0.1, vibrance: 0.1,
+};
+
 export const PRESETS: Record<string, Preset> = {
   auto: { label: '全自動', hint: '每個畫面自動分析與追蹤', set: {} },
   raw: { label: '原始', hint: '所有校正歸零、顯示原圖，從這裡手動調整（曲線／HSL 也重設）', set: RAW, raw: true },
@@ -412,5 +437,15 @@ export const PRESETS: Record<string, Preset> = {
     label: '全自動-Diverout+',
     hint: 'Diverout 的對比與彩度，加上保護：黑白點取 0.5／99.5 %、每通道增益上限（雜訊越多越低）、柔性肩部不裁切、依紅光流失判斷是否為水下（陸地照片不動）；其餘色彩與影調步驟關閉，降噪／銳化／畫質修復仍自動',
     set: DIVEROUT_PLUS_SET,
+  },
+  '全自動-Diverout+水色重生': {
+    label: '全自動-Diverout+水色重生',
+    hint: 'Diverout+ 加上 Diverout「水色重生」可學的部分：畫面提亮、色彩更豐富、開放水域保留鮮明的藍綠色（不被拉成灰）、輕度去霧；主體的紅色仍照 Diverout+ 校正（原模式會把紅色清空，這點不學）',
+    set: DIVEROUT_PLUS_WATER,
+  },
+  '全自動-Diverout+晶瑩極致': {
+    label: '全自動-Diverout+晶瑩極致',
+    hint: 'Diverout+ 加上 Diverout「晶瑩極致」可學的部分：更強的整體與局部對比（CLAHE、清晰度）、輕度去霧讓水更透、色彩維持 Diverout+；原模式重畫出的寫實紋理無法也不應以演算法仿造',
+    set: DIVEROUT_PLUS_CRYSTAL,
   },
 };
